@@ -1,0 +1,10 @@
+[package]
+name = "hearth"
+version = "0.1.0"
+edition = "2021"
+description = "Session-first kernel for local and distributed agent hosts"
+license = "MIT"
+
+[dependencies]
+thiserror = "2"
+uuid = { version = "1", features = ["v4"] }

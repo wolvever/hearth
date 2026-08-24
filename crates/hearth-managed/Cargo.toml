@@ -1,0 +1,9 @@
+[package]
+name = "hearth-managed"
+version = "0.1.0"
+edition = "2021"
+description = "Thin name-mapping adapter from Claude Managed Agents onto hearth"
+license = "MIT"
+
+[dependencies]
+hearth = { path = "../hearth" }

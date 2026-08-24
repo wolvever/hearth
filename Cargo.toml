@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/hearth",
+    "crates/hearth-paseo",
+    "crates/hearth-managed",
+    "crates/hearth-service",
+]

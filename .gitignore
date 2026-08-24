@@ -1,0 +1,10 @@
+/target
+**/target/
+*.pem
+*.key
+.env
+.env.*
+!.env.example
+gh-login.log
+gh-auth.pid
+gh-device-login.py

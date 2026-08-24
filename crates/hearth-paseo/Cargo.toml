@@ -1,0 +1,9 @@
+[package]
+name = "hearth-paseo"
+version = "0.1.0"
+edition = "2021"
+description = "Thin name-mapping adapter from Paseo terms onto hearth"
+license = "MIT"
+
+[dependencies]
+hearth = { path = "../hearth" }
