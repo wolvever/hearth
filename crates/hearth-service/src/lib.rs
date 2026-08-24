@@ -11,7 +11,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use hearth::{
-    Event, EventBody, InMemory, Member, Place, PlaceAttach, PlaceOs, PlaceProvider, SessionId,
+    Event, EventBody, InMemory, Member, Place, PlaceAttach, SessionId,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
@@ -75,12 +75,13 @@ struct CreateBody {
 #[derive(Serialize)]
 struct SessionView {
     id: String,
-    place: Option<PlaceView>,
+    places: Vec<PlaceView>,
     members: usize,
 }
 
 #[derive(Serialize)]
 struct PlaceView {
+    id: String,
     provider: String,
     instance: String,
     os: String,
@@ -89,14 +90,15 @@ struct PlaceView {
 
 fn place_view(p: &Place) -> PlaceView {
     PlaceView {
+        id: p.id.0.to_string(),
         provider: match &p.provider {
-            PlaceProvider::LocalDir => "LocalDir".into(),
-            PlaceProvider::Aws => "Aws".into(),
-            PlaceProvider::Azure => "Azure".into(),
-            PlaceProvider::Gcp => "Gcp".into(),
-            PlaceProvider::CursorVm => "CursorVm".into(),
-            PlaceProvider::GrokBox => "GrokBox".into(),
-            PlaceProvider::Other(s) => format!("Other:{s}"),
+            hearth::PlaceProvider::LocalDir => "LocalDir".into(),
+            hearth::PlaceProvider::Aws => "Aws".into(),
+            hearth::PlaceProvider::Azure => "Azure".into(),
+            hearth::PlaceProvider::Gcp => "Gcp".into(),
+            hearth::PlaceProvider::CursorVm => "CursorVm".into(),
+            hearth::PlaceProvider::GrokBox => "GrokBox".into(),
+            hearth::PlaceProvider::Other(s) => format!("Other:{s}"),
         },
         instance: p.instance.clone(),
         os: format!("{:?}", p.os),
@@ -117,12 +119,7 @@ async fn create_session(
     let session = st.store.create_session();
     if let Some(folder) = body.folder {
         if Path::new(&folder).exists() {
-            let _ = session.attach_place(Place {
-                provider: PlaceProvider::LocalDir,
-                instance: folder,
-                os: PlaceOs::Linux,
-                attach: PlaceAttach::MustExist,
-            });
+            let _ = session.attach_place(Place::local_dir(folder, PlaceAttach::MustExist));
         }
     }
     Ok(Json(view(&session)))
@@ -131,7 +128,13 @@ async fn create_session(
 fn view(session: &hearth::Session) -> SessionView {
     SessionView {
         id: session.id().0.to_string(),
-        place: session.place().ok().flatten().as_ref().map(place_view),
+        places: session
+            .places()
+            .ok()
+            .unwrap_or_default()
+            .iter()
+            .map(place_view)
+            .collect(),
         members: session.members().map(|m| m.len()).unwrap_or(0),
     }
 }
@@ -201,7 +204,7 @@ struct EventIn {
 
 #[derive(Clone, Serialize)]
 struct EventOut {
-    seq: u64,
+    seq: Option<u64>,
     body: String,
 }
 
@@ -393,7 +396,7 @@ mod tests {
         assert_eq!(st, StatusCode::OK);
         let v: serde_json::Value = serde_json::from_str(&txt).unwrap();
         let id = v["id"].as_str().unwrap().to_string();
-        assert_eq!(v["place"]["provider"], "LocalDir");
+        assert_eq!(v["places"][0]["provider"], "LocalDir");
 
         let (st, txt) = call(
             app.clone(),
@@ -461,7 +464,7 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::OK);
         let v: serde_json::Value = serde_json::from_str(&txt).unwrap();
-        assert!(v["place"].is_null());
+        assert_eq!(v["places"].as_array().map(|a| a.len()), Some(0));
     }
 
     #[tokio::test]

@@ -4,7 +4,7 @@
 //! [`Provisioner`] to record a binding without starting a CLI. Occupancy is session
 //! membership; ask/decide and config live as events or identity maps, not extra
 //! types. Channel, Thread, Issue, and Squad stay out of the kernel.
-//! One optional [`Place`] is attached to a Session (not Environment). Bindings may share `sandbox_id`. Claude Tag channels and Multica issues are sessions in adapters. [`FakeSandbox`] is host-side demo state.
+//! A Session may hold many [`Place`] locators (not Environment). Bindings may share `sandbox_id`. Claude Tag channels and Multica issues are sessions in adapters. [`FakeSandbox`] is host-side demo state.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -43,6 +43,8 @@ id_type!(UserId);
 id_type!(AgentId);
 id_type!(SessionId);
 id_type!(BindingId);
+id_type!(EventId);
+id_type!(PlaceId);
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub enum Member {
@@ -111,7 +113,11 @@ pub struct Binding {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Event {
-    pub seq: u64,
+    pub id: EventId,
+    /// Optional last-read / compact position. NOT assigned on append.
+    pub seq: Option<u64>,
+    /// Turn this event was appended under, if a turn is open.
+    pub turn: Option<u64>,
     pub ts: u64,
     pub body: EventBody,
 }
@@ -133,8 +139,8 @@ pub enum EventBody {
     TurnEnd { agent: AgentId },
     BindingAttached { binding: BindingId },
     BindingReleased { binding: BindingId },
-    /// Replaces `[start, end]` (inclusive seq) in [`Session::surface`]. Full log keeps both.
-    Compact { start: u64, end: u64, summary: String },
+    /// Replaces `[start, end]` (inclusive EventId range in log order) in [`Session::surface`]. Full log keeps both.
+    Compact { start: EventId, end: EventId, summary: String },
 }
 
 #[derive(Debug, Error)]
@@ -159,6 +165,8 @@ pub enum Error {
     PlaceProviderMismatch,
     #[error("cannot migrate place provider")]
     PlaceProviderSwap,
+    #[error("unknown place {0:?}")]
+    UnknownPlace(PlaceId),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -182,19 +190,26 @@ pub fn is_model_visible(body: &EventBody) -> bool {
     )
 }
 
-/// Project the model-visible view. Compacted seq ranges are omitted; the Compact event remains.
+/// Project the model-visible view. Compacted EventId ranges (log order) are omitted; the Compact event remains.
 pub fn surface_of(events: &[Event]) -> Vec<Event> {
-    let mut hidden: HashSet<u64> = HashSet::new();
+    let mut hidden: HashSet<EventId> = HashSet::new();
     for e in events {
         if let EventBody::Compact { start, end, .. } = e.body {
-            for seq in start..=end {
-                hidden.insert(seq);
+            let start_idx = events.iter().position(|x| x.id == start);
+            let end_idx = events.iter().position(|x| x.id == end);
+            match (start_idx, end_idx) {
+                (Some(s), Some(en)) if s <= en => {
+                    for ev in &events[s..=en] {
+                        hidden.insert(ev.id);
+                    }
+                }
+                _ => {}
             }
         }
     }
     events
         .iter()
-        .filter(|e| !hidden.contains(&e.seq) && is_model_visible(&e.body))
+        .filter(|e| !hidden.contains(&e.id) && is_model_visible(&e.body))
         .cloned()
         .collect()
 }
@@ -205,8 +220,11 @@ struct SessionData {
     members: HashSet<Member>,
     events: Vec<Event>,
     bindings: HashMap<BindingId, Binding>,
-    place: Option<Place>,
-    next_seq: u64,
+    places: HashMap<PlaceId, Place>,
+    next_turn_id: u64,
+    next_seq_id: u64,
+    last_read: Option<u64>,
+    current_turn: Option<u64>,
 }
 
 impl SessionData {
@@ -215,18 +233,22 @@ impl SessionData {
             members: HashSet::new(),
             events: Vec::new(),
             bindings: HashMap::new(),
-            place: None,
-            next_seq: 1,
+            places: HashMap::new(),
+            next_turn_id: 1,
+            next_seq_id: 1,
+            last_read: None,
+            current_turn: None,
         }
     }
 
     fn push(&mut self, body: EventBody) -> Event {
         let event = Event {
-            seq: self.next_seq,
+            id: EventId::new(),
+            seq: None,
+            turn: self.current_turn,
             ts: now_ts(),
             body,
         };
-        self.next_seq += 1;
         self.events.push(event.clone());
         event
     }
@@ -615,13 +637,75 @@ impl Session {
         }))
     }
 
-    /// Append a compaction marker. Replaced seqs stay in [`Self::events`], drop from [`Self::surface`].
-    pub fn compact(&self, start: u64, end: u64, summary: impl Into<String>) -> Result<Event> {
+    /// Append a compaction marker. Replaced EventIds stay in [`Self::events`], drop from [`Self::surface`].
+    pub fn compact(&self, start: EventId, end: EventId, summary: impl Into<String>) -> Result<Event> {
         self.append(EventBody::Compact {
             start,
             end,
             summary: summary.into(),
         })
+    }
+
+    pub fn turn_start(&self, agent: AgentId) -> Result<Event> {
+        let mut g = self.store.lock()?;
+        let data = g
+            .sessions
+            .get_mut(&self.id)
+            .ok_or(Error::UnknownSession(self.id))?;
+        let turn = data.next_turn_id;
+        data.next_turn_id += 1;
+        data.current_turn = Some(turn);
+        Ok(data.push(EventBody::TurnStart { agent }))
+    }
+
+    pub fn turn_end(&self, agent: AgentId) -> Result<Event> {
+        let mut g = self.store.lock()?;
+        let data = g
+            .sessions
+            .get_mut(&self.id)
+            .ok_or(Error::UnknownSession(self.id))?;
+        let event = data.push(EventBody::TurnEnd { agent });
+        data.current_turn = None;
+        Ok(event)
+    }
+
+    pub fn mark_read(&self) -> Result<u64> {
+        let mut g = self.store.lock()?;
+        let data = g
+            .sessions
+            .get_mut(&self.id)
+            .ok_or(Error::UnknownSession(self.id))?;
+        let seq = data.next_seq_id;
+        data.next_seq_id += 1;
+        data.last_read = Some(seq);
+        Ok(seq)
+    }
+
+    pub fn last_read(&self) -> Result<Option<u64>> {
+        let g = self.store.lock()?;
+        let data = g
+            .sessions
+            .get(&self.id)
+            .ok_or(Error::UnknownSession(self.id))?;
+        Ok(data.last_read)
+    }
+
+    pub fn next_turn_id(&self) -> Result<u64> {
+        let g = self.store.lock()?;
+        let data = g
+            .sessions
+            .get(&self.id)
+            .ok_or(Error::UnknownSession(self.id))?;
+        Ok(data.next_turn_id)
+    }
+
+    pub fn next_seq_id(&self) -> Result<u64> {
+        let g = self.store.lock()?;
+        let data = g
+            .sessions
+            .get(&self.id)
+            .ok_or(Error::UnknownSession(self.id))?;
+        Ok(data.next_seq_id)
     }
 
     pub fn events(&self) -> Result<Vec<Event>> {
@@ -656,31 +740,62 @@ impl Session {
         Ok(data.bindings.values().cloned().collect())
     }
 
-    /// Zero or one attached [`Place`]. Survives unbind of all Bindings.
-    pub fn place(&self) -> Result<Option<Place>> {
+    /// All attached [`Place`] locators. Survive unbind of all Bindings.
+    pub fn places(&self) -> Result<Vec<Place>> {
         let g = self.store.lock()?;
         let data = g
             .sessions
             .get(&self.id)
             .ok_or(Error::UnknownSession(self.id))?;
-        Ok(data.place.clone())
+        Ok(data.places.values().cloned().collect())
     }
 
-    /// Fail-closed attach. LocalDir MustExist requires the path. Providers do not migrate.
+    /// Lookup one attached [`Place`] by id.
+    pub fn place(&self, id: PlaceId) -> Result<Option<Place>> {
+        let g = self.store.lock()?;
+        let data = g
+            .sessions
+            .get(&self.id)
+            .ok_or(Error::UnknownSession(self.id))?;
+        Ok(data.places.get(&id).cloned())
+    }
+
+    /// Fail-closed attach, keyed by [`PlaceId`]. Same provider+instance reuses that row.
+    /// Provider swap is only when rewriting an existing id. New ids may differ in provider.
     pub fn attach_place(&self, place: Place) -> Result<Place> {
         place.validate()?;
+        let mut place = place;
         let mut g = self.store.lock()?;
         let data = g
             .sessions
             .get_mut(&self.id)
             .ok_or(Error::UnknownSession(self.id))?;
-        if let Some(existing) = &data.place {
+        if let Some(existing) = data.places.get(&place.id) {
             if existing.provider != place.provider {
                 return Err(Error::PlaceProviderSwap);
             }
+            data.places.insert(place.id, place.clone());
+            return Ok(place);
         }
-        data.place = Some(place.clone());
+        if let Some((&eid, _)) = data.places.iter().find(|(_, p)| {
+            p.provider == place.provider && p.instance == place.instance
+        }) {
+            place.id = eid;
+            data.places.insert(eid, place.clone());
+            return Ok(place);
+        }
+        data.places.insert(place.id, place.clone());
         Ok(place)
+    }
+
+    /// Remove one locator. Session, log, and other places remain.
+    pub fn detach_place(&self, id: PlaceId) -> Result<Place> {
+        let mut g = self.store.lock()?;
+        let data = g
+            .sessions
+            .get_mut(&self.id)
+            .ok_or(Error::UnknownSession(self.id))?;
+        data.places.remove(&id).ok_or(Error::UnknownPlace(id))
     }
 
     /// Distinct live sandbox ids on current Bindings. Empty after last unbind
@@ -880,7 +995,7 @@ mod tests {
                 text: "keep".into(),
             })
             .unwrap();
-        session.compact(m1.seq, m2.seq, "earlier chat").unwrap();
+        session.compact(m1.id, m2.id, "earlier chat").unwrap();
 
         let log = session.events().unwrap();
         assert!(log.iter().any(|e| matches!(
@@ -908,7 +1023,7 @@ mod tests {
             &e.body,
             EventBody::UserMessage { text, .. } if text == "keep"
         )));
-        assert_eq!(m3.seq, 3);
+        assert_eq!(m3.seq, None);
     }
 
     #[test]
@@ -1024,6 +1139,116 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn append_does_not_bump_next_seq_id() {
+        let store = InMemory::new();
+        let session = store.create_session();
+        assert_eq!(session.next_seq_id().unwrap(), 1);
+        let a = session
+            .append(EventBody::UserMessage {
+                user: UserId::new(),
+                text: "one".into(),
+            })
+            .unwrap();
+        let b = session
+            .append(EventBody::UserMessage {
+                user: UserId::new(),
+                text: "two".into(),
+            })
+            .unwrap();
+        assert_eq!(session.next_seq_id().unwrap(), 1);
+        assert_eq!(a.seq, None);
+        assert_eq!(b.seq, None);
+        assert_ne!(a.id, b.id);
+    }
+
+    #[test]
+    fn turn_start_stamps_and_turn_end_clears() {
+        let store = InMemory::new();
+        let agent = store.create_agent("cli", "");
+        let session = store.create_session();
+        assert_eq!(session.next_turn_id().unwrap(), 1);
+        let start = session.turn_start(agent.id).unwrap();
+        assert_eq!(session.next_turn_id().unwrap(), 2);
+        assert_eq!(start.turn, Some(1));
+        assert!(matches!(start.body, EventBody::TurnStart { .. }));
+        let mid = session
+            .append(EventBody::AgentMessage {
+                agent: agent.id,
+                text: "during".into(),
+            })
+            .unwrap();
+        assert_eq!(mid.turn, Some(1));
+        let end = session.turn_end(agent.id).unwrap();
+        assert_eq!(end.turn, Some(1));
+        assert!(matches!(end.body, EventBody::TurnEnd { .. }));
+        let later = session
+            .append(EventBody::AgentMessage {
+                agent: agent.id,
+                text: "after".into(),
+            })
+            .unwrap();
+        assert_eq!(later.turn, None);
+        assert_eq!(session.next_turn_id().unwrap(), 2);
+    }
+
+    #[test]
+    fn mark_read_only_bumps_seq_cursor() {
+        let store = InMemory::new();
+        let session = store.create_session();
+        session
+            .append(EventBody::UserMessage {
+                user: UserId::new(),
+                text: "x".into(),
+            })
+            .unwrap();
+        assert_eq!(session.next_seq_id().unwrap(), 1);
+        assert_eq!(session.last_read().unwrap(), None);
+        let seq = session.mark_read().unwrap();
+        assert_eq!(seq, 1);
+        assert_eq!(session.last_read().unwrap(), Some(1));
+        assert_eq!(session.next_seq_id().unwrap(), 2);
+        assert_eq!(session.next_turn_id().unwrap(), 1);
+        let seq2 = session.mark_read().unwrap();
+        assert_eq!(seq2, 2);
+        assert_eq!(session.last_read().unwrap(), Some(2));
+        assert_eq!(session.next_seq_id().unwrap(), 3);
+    }
+
+    #[test]
+    fn compact_by_event_id_hides_range_on_surface() {
+        let store = InMemory::new();
+        let user = store.create_user("cheng");
+        let agent = store.create_agent("scribe", "");
+        let session = store.create_session();
+        let m1 = session
+            .append(EventBody::UserMessage {
+                user: user.id,
+                text: "old-a".into(),
+            })
+            .unwrap();
+        let m2 = session
+            .append(EventBody::AgentMessage {
+                agent: agent.id,
+                text: "old-b".into(),
+            })
+            .unwrap();
+        let m3 = session
+            .append(EventBody::UserMessage {
+                user: user.id,
+                text: "keep".into(),
+            })
+            .unwrap();
+        session.compact(m1.id, m2.id, "earlier chat").unwrap();
+        let surface = session.surface().unwrap();
+        assert!(!surface.iter().any(|e| e.id == m1.id || e.id == m2.id));
+        assert!(surface.iter().any(|e| e.id == m3.id));
+        assert!(surface.iter().any(|e| matches!(
+            &e.body,
+            EventBody::Compact { summary, .. } if summary == "earlier chat"
+        )));
     }
 }
 

@@ -44,6 +44,6 @@ fn main() {
     println!("live binding kind={} resume={:?}", second.kind, second.native_resume_id);
     println!("surface:");
     for e in session.surface().unwrap() {
-        println!("  seq={} {:?}", e.seq, e.body);
+        println!("  id={:?} seq={:?} {:?}", e.id, e.seq, e.body);
     }
 }
