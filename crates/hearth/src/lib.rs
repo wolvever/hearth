@@ -1,10 +1,11 @@
 //! Session-first kernel: hosts map onto six names — [`User`], [`Agent`],
 //! [`Session`], [`Binding`], [`Event`], [`Place`] — with [`Store`]/[`InMemory`] as persistence,
-//! [`Session::surface`] as a view of the same log (compacted ranges omitted), and
-//! [`Provisioner`] to record a binding without starting a CLI. Occupancy is session
-//! membership; ask/decide and config live as events or identity maps, not extra
-//! types. Channel, Thread, Issue, and Squad stay out of the kernel.
-//! A Session may hold many [`Place`] locators (not Environment). Bindings may share `sandbox_id`. Claude Tag channels and Multica issues are sessions in adapters. [`FakeSandbox`] is host-side demo state.
+//! [`Runtime`] as the keeper that remints Bindings, [`Session::surface`] as a view
+//! of the same log (compacted ranges omitted), and [`Provisioner`] to record a
+//! binding without starting a CLI. Occupancy is session membership; ask/decide
+//! and config live as events or identity maps, not extra types. Channel, Thread,
+//! Issue, and Squad stay out of the kernel.
+//! A Session may hold many [`Place`] locators (not Environment). Bindings may share `sandbox_id`. Claude Tag channels and Multica issues are sessions in adapters. [`FakeSandbox`] is host-side demo state. [`Runtime`] is the same class as Store / Provisioner / Host / FakeSandbox — not a seventh name.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -15,8 +16,15 @@ use uuid::Uuid;
 
 mod sandbox;
 mod place;
+mod host;
+mod runtime;
 pub use place::{Place, PlaceAttach, PlaceOs, PlaceProvider};
 pub use sandbox::FakeSandbox;
+pub use host::{
+    Host, ClaudeCode as ClaudeCodeHost, Codex as CodexHost, Dsh as DshHost, Fx as FxHost,
+    Pi as PiHost, OpenCode as OpenCodeHost, Goose as GooseHost,
+};
+pub use runtime::{KeepSpec, Liveness, Runtime, Wake};
 
 // --- identities ---
 
@@ -78,6 +86,8 @@ pub enum HostKind {
     Dsh,
     Fx,
     Pi,
+    OpenCode,
+    Goose,
 }
 
 impl HostKind {
@@ -88,6 +98,8 @@ impl HostKind {
             Self::Dsh => "dsh",
             Self::Fx => "fx",
             Self::Pi => "pi",
+            Self::OpenCode => "opencode",
+            Self::Goose => "goose",
         }
     }
 }
@@ -122,6 +134,15 @@ pub struct Event {
     pub body: EventBody,
 }
 
+/// Why a kept session woke. Not model-visible. Prefer Timer/Trigger on the log;
+/// UserQuery is recorded as [`EventBody::UserMessage`] alone.
+#[derive(Clone, Debug, PartialEq)]
+pub enum WakeSource {
+    UserQuery,
+    Timer,
+    Trigger { name: String },
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum EventBody {
     MemberJoin { member: Member },
@@ -141,6 +162,8 @@ pub enum EventBody {
     BindingReleased { binding: BindingId },
     /// Replaces `[start, end]` (inclusive EventId range in log order) in [`Session::surface`]. Full log keeps both.
     Compact { start: EventId, end: EventId, summary: String },
+    /// Runtime wake marker (Timer / Trigger). Not model-visible.
+    Wake { source: WakeSource },
 }
 
 #[derive(Debug, Error)]
@@ -167,11 +190,24 @@ pub enum Error {
     PlaceProviderSwap,
     #[error("unknown place {0:?}")]
     UnknownPlace(PlaceId),
+    #[error("session {0:?} is not kept")]
+    NotKept(SessionId),
+    #[error("prompt waiting ({0:?})")]
+    Waiting(WaitReason),
+}
+
+/// Why [`Error::Waiting`] — return value, not a Queue type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaitReason {
+    NoBinding,
+    TurnOpen,
+    LivenessUnknown,
+    AlreadyLive,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-fn now_ts() -> u64 {
+pub(crate) fn now_ts() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -496,13 +532,8 @@ impl Session {
         native_resume_id: Option<String>,
         sandbox_id: Option<String>,
     ) -> Result<Binding> {
-        self.attach_binding(Binding {
-            id: BindingId::new(),
-            kind: kind.into(),
-            native_resume_id,
-            sandbox_id,
-            agent: None,
-        })
+        let host = Host::from_bind(kind, native_resume_id, sandbox_id);
+        self.attach_binding(host.into_binding(None))
     }
 
     /// Bind a host runtime for one agent. Join does not call this.
@@ -513,13 +544,13 @@ impl Session {
         native_resume_id: Option<String>,
         sandbox_id: Option<String>,
     ) -> Result<Binding> {
-        self.attach_binding(Binding {
-            id: BindingId::new(),
-            kind: kind.into(),
-            native_resume_id,
-            sandbox_id,
-            agent: Some(agent),
-        })
+        let host = Host::from_bind(kind, native_resume_id, sandbox_id);
+        self.attach_binding(host.into_binding(Some(agent)))
+    }
+
+    /// Typed path: `session.bind_host(Some(id), HostKind::Goose.host(None, Some("box".into())))`.
+    pub fn bind_host(&self, agent: Option<AgentId>, host: Host) -> Result<Binding> {
+        self.attach_binding(host.into_binding(agent))
     }
 
     fn attach_binding(&self, binding: Binding) -> Result<Binding> {
@@ -706,6 +737,15 @@ impl Session {
             .get(&self.id)
             .ok_or(Error::UnknownSession(self.id))?;
         Ok(data.next_seq_id)
+    }
+
+    pub fn current_turn(&self) -> Result<Option<u64>> {
+        let g = self.store.lock()?;
+        let data = g
+            .sessions
+            .get(&self.id)
+            .ok_or(Error::UnknownSession(self.id))?;
+        Ok(data.current_turn)
     }
 
     pub fn events(&self) -> Result<Vec<Event>> {
@@ -1250,6 +1290,65 @@ mod tests {
             EventBody::Compact { summary, .. } if summary == "earlier chat"
         )));
     }
+
+    #[test]
+    fn host_kind_goose_is_typed_host() {
+        let host = HostKind::Goose.host(Some("resume".into()), Some("box".into()));
+        assert!(matches!(host, Host::Goose(_)));
+        assert_eq!(host.kind_str(), "goose");
+        assert_eq!(host.native_resume_id(), Some("resume"));
+        assert_eq!(host.sandbox_id(), Some("box"));
+    }
+
+    #[test]
+    fn bind_agent_goose_kind_string_goes_through_host() {
+        let store = InMemory::new();
+        let agent = store.create_agent("multi", "");
+        let session = store.create_session();
+        session.join(Member::Agent(agent.id)).unwrap();
+        let through = Host::from_bind(HostKind::Goose, None, Some("sb".into()));
+        assert!(matches!(through, Host::Goose(_)));
+        let binding = session
+            .bind_agent(agent.id, HostKind::Goose, None, Some("sb".into()))
+            .unwrap();
+        assert_eq!(binding.kind, "goose");
+        assert_eq!(binding.sandbox_id.as_deref(), Some("sb"));
+        assert_eq!(binding.agent, Some(agent.id));
+    }
+
+    #[test]
+    fn bind_host_opencode_works() {
+        let store = InMemory::new();
+        let agent = store.create_agent("oc", "");
+        let session = store.create_session();
+        session.join(Member::Agent(agent.id)).unwrap();
+        let binding = session
+            .bind_host(
+                Some(agent.id),
+                Host::OpenCode(OpenCodeHost {
+                    native_resume_id: None,
+                    sandbox_id: Some("box".into()),
+                }),
+            )
+            .unwrap();
+        assert_eq!(binding.kind, "opencode");
+        assert_eq!(binding.sandbox_id.as_deref(), Some("box"));
+        assert_eq!(binding.agent, Some(agent.id));
+    }
+
+    #[test]
+    fn unknown_string_becomes_host_other() {
+        let host = Host::from_bind("paseo-cli", Some("n".into()), None);
+        assert!(matches!(
+            &host,
+            Host::Other { kind, native_resume_id, sandbox_id: None }
+                if kind == "paseo-cli" && native_resume_id.as_deref() == Some("n")
+        ));
+        assert_eq!(host.kind_str(), "paseo-cli");
+        let binding = host.into_binding(None);
+        assert_eq!(binding.kind, "paseo-cli");
+        assert_eq!(binding.native_resume_id.as_deref(), Some("n"));
+    }
 }
 
 
@@ -1417,5 +1516,26 @@ mod environment {
         assert!(place.read(sid, "/keep.txt").is_none());
         assert!(store.session(session.id()).is_ok());
         let _ = (b1, b2);
+    }
+
+    #[test]
+    fn new_hosts_are_binding_kinds_not_agent_types() {
+        let store = InMemory::new();
+        let agent = store.create_agent("multi", "one identity");
+        let session = store.create_session();
+        session.join(Member::Agent(agent.id)).unwrap();
+        let dsh = session
+            .bind_agent(agent.id, HostKind::Dsh, None, None)
+            .unwrap();
+        let oc = session
+            .bind_agent(agent.id, HostKind::OpenCode, None, None)
+            .unwrap();
+        let goose = session
+            .bind_agent(agent.id, HostKind::Goose, None, None)
+            .unwrap();
+        assert_eq!(dsh.kind, "dsh");
+        assert_eq!(oc.kind, "opencode");
+        assert_eq!(goose.kind, "goose");
+        assert_eq!(dsh.agent, Some(agent.id));
     }
 }

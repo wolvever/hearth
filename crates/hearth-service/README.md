@@ -7,7 +7,7 @@ Local HTTP + WebSocket on 0.0.0.0:8787. Bind address only; no public URL is clai
 - POST /sessions {"folder":"/optional/existing/path"}
 - GET /sessions/:id
 - POST /sessions/:id/join {"user":"cheng"} or {"agent":"tag"}
-- POST /sessions/:id/events {"user":"cheng","message":"..."} (text is an alias)
+- POST /sessions/:id/events {"user":"cheng","message":"..."} (text is an alias). Goes through Runtime::wake. 409 if the turn is open; the log is unchanged.
 - GET /sessions/:id/events
 - GET /agents/local PATH lookup only. --version only if the binary exists. Missing CLIs have path null. No session CLI is spawned.
 
@@ -21,7 +21,7 @@ GET /sessions/:id/stream (upgrade). Log replay, then live events. Incoming JSON 
 
 HTTP-shaped bodies also work: user-only joins; user plus message or text steers. type aliases: user, steer (same as message).
 
-Outgoing JSON matches HTTP events: seq plus body (join or user:<text>). All connected clients see each others join and steer. HTTP join/events still work on the same log.
+Outgoing JSON matches HTTP events: seq plus body (join or user:<text>). Join an agent so the session is kept. HTTP and WS steer share admit. A second prompt while the turn is open is 409 and is not appended.
 
 ## Local CLI discovery
 GET /agents/local looks up names on PATH and runs --version only when a file is found.

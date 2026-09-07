@@ -11,7 +11,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use hearth::{
-    Event, EventBody, InMemory, Member, Place, PlaceAttach, SessionId,
+    Event, EventBody, HostKind, InMemory, Member, Place, PlaceAttach, Runtime, SessionId, Wake,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
@@ -28,7 +28,7 @@ struct LiveEvent {
 
 #[derive(Clone)]
 pub struct AppState {
-    store: InMemory,
+    runtime: Runtime,
     names: Arc<Mutex<NameMap>>,
     clis: Vec<CliStatus>,
     live: broadcast::Sender<LiveEvent>,
@@ -44,11 +44,15 @@ impl AppState {
     pub fn new(clis: Vec<CliStatus>) -> Self {
         let (live, _) = broadcast::channel(256);
         Self {
-            store: InMemory::new(),
+            runtime: Runtime::new(),
             names: Arc::new(Mutex::new(NameMap::default())),
             clis,
             live,
         }
+    }
+
+    fn store(&self) -> &InMemory {
+        self.runtime.store()
     }
 
     fn publish(&self, session: SessionId, event: EventOut) {
@@ -116,7 +120,7 @@ async fn create_session(
     State(st): State<AppState>,
     Json(body): Json<CreateBody>,
 ) -> Result<Json<SessionView>, StatusCode> {
-    let session = st.store.create_session();
+    let session = st.store().create_session();
     if let Some(folder) = body.folder {
         if Path::new(&folder).exists() {
             let _ = session.attach_place(Place::local_dir(folder, PlaceAttach::MustExist));
@@ -144,7 +148,7 @@ async fn get_session(
     AxPath(id): AxPath<String>,
 ) -> Result<Json<SessionView>, StatusCode> {
     let id = sid(&id)?;
-    let session = st.store.session(id).map_err(|_| StatusCode::NOT_FOUND)?;
+    let session = st.store().session(id).map_err(|_| StatusCode::NOT_FOUND)?;
     Ok(Json(view(&session)))
 }
 
@@ -161,24 +165,31 @@ fn apply_join(
     user: Option<String>,
     agent: Option<String>,
 ) -> Result<EventOut, StatusCode> {
-    let session = st.store.session(id).map_err(|_| StatusCode::NOT_FOUND)?;
+    let session = st.store().session(id).map_err(|_| StatusCode::NOT_FOUND)?;
     let mut names = st.names.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let keep_agent = agent.clone();
     let ev = if let Some(name) = user {
         let uid = *names
             .users
             .entry(name.clone())
-            .or_insert_with(|| st.store.create_user(name).id);
+            .or_insert_with(|| st.store().create_user(name).id);
         session.join(Member::User(uid)).map_err(|_| StatusCode::CONFLICT)?
     } else if let Some(name) = agent {
         let aid = *names
             .agents
             .entry(name.clone())
-            .or_insert_with(|| st.store.create_agent(name, String::new()).id);
+            .or_insert_with(|| st.store().create_agent(name, String::new()).id);
         session.join(Member::Agent(aid)).map_err(|_| StatusCode::CONFLICT)?
     } else {
         return Err(StatusCode::BAD_REQUEST);
     };
+    let aid = keep_agent.as_ref().and_then(|n| names.agents.get(n).copied());
     drop(names);
+    if let Some(aid) = aid {
+        st.runtime
+            .keep(id, aid, HostKind::Goose.host(None, None))
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
     let out = event_out(&ev);
     st.publish(id, out.clone());
     Ok(out)
@@ -191,7 +202,7 @@ async fn join_session(
 ) -> Result<Json<SessionView>, StatusCode> {
     let id = sid(&id)?;
     apply_join(&st, id, body.user, body.agent)?;
-    let session = st.store.session(id).map_err(|_| StatusCode::NOT_FOUND)?;
+    let session = st.store().session(id).map_err(|_| StatusCode::NOT_FOUND)?;
     Ok(Json(view(&session)))
 }
 
@@ -219,23 +230,68 @@ fn event_out(e: &Event) -> EventOut {
     }
 }
 
+fn ensure_kept(st: &AppState, id: SessionId) -> Result<(), StatusCode> {
+    if st.runtime.kept().contains(&id) {
+        return Ok(());
+    }
+    let session = st.store().session(id).map_err(|_| StatusCode::NOT_FOUND)?;
+    let agent = session
+        .members()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .into_iter()
+        .find_map(|m| match m {
+            Member::Agent(a) => Some(a),
+            Member::User(_) => None,
+        });
+    let Some(agent) = agent else {
+        return Err(StatusCode::CONFLICT);
+    };
+    st.runtime
+        .keep(id, agent, HostKind::Goose.host(None, None))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(())
+}
+
 /// Shared steer used by HTTP POST /events and WS `{"type":"message",...}`.
+/// Admit only through [`Runtime::wake`]. Wait is 409. Do not append on wait.
 fn apply_user_message(
     st: &AppState,
     id: SessionId,
     name: String,
     text: String,
 ) -> Result<EventOut, StatusCode> {
-    let session = st.store.session(id).map_err(|_| StatusCode::NOT_FOUND)?;
+    let _session = st.store().session(id).map_err(|_| StatusCode::NOT_FOUND)?;
     let names = st.names.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let uid = *names.users.get(&name).ok_or(StatusCode::NOT_FOUND)?;
     drop(names);
-    let ev = session
-        .user_message(uid, text)
-        .map_err(|_| StatusCode::FORBIDDEN)?;
-    let out = event_out(&ev);
-    st.publish(id, out.clone());
-    Ok(out)
+    ensure_kept(st, id)?;
+    match st.runtime.wake(
+        id,
+        Wake::UserQuery {
+            user: uid,
+            text,
+        },
+    ) {
+        Ok(evs) => {
+            for e in &evs {
+                st.publish(id, event_out(e));
+            }
+            let um = evs
+                .iter()
+                .rev()
+                .find(|e| matches!(e.body, EventBody::UserMessage { .. }))
+                .or(evs.last())
+                .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+            Ok(event_out(um))
+        }
+        Err(hearth::Error::Waiting(_)) | Err(hearth::Error::NotKept(_)) => {
+            Err(StatusCode::CONFLICT)
+        }
+        Err(hearth::Error::NotMember) | Err(hearth::Error::UnknownUser(_)) => {
+            Err(StatusCode::FORBIDDEN)
+        }
+        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+    }
 }
 
 async fn post_event(
@@ -254,7 +310,7 @@ async fn list_events(
     AxPath(id): AxPath<String>,
 ) -> Result<Json<Vec<EventOut>>, StatusCode> {
     let id = sid(&id)?;
-    let session = st.store.session(id).map_err(|_| StatusCode::NOT_FOUND)?;
+    let session = st.store().session(id).map_err(|_| StatusCode::NOT_FOUND)?;
     let out = session
         .events()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
@@ -303,13 +359,13 @@ async fn stream_session(
     AxPath(id): AxPath<String>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let id = sid(&id)?;
-    let _session = st.store.session(id).map_err(|_| StatusCode::NOT_FOUND)?;
+    let _session = st.store().session(id).map_err(|_| StatusCode::NOT_FOUND)?;
     Ok(ws.on_upgrade(move |socket| push_stream(socket, st, id)))
 }
 
 async fn push_stream(mut socket: WebSocket, st: AppState, id: SessionId) {
     let mut rx = st.live.subscribe();
-    if let Ok(session) = st.store.session(id) {
+    if let Ok(session) = st.store().session(id) {
         if let Ok(events) = session.events() {
             for e in events {
                 let txt = serde_json::to_string(&event_out(&e)).unwrap_or_default();
@@ -415,6 +471,15 @@ mod tests {
         )
         .await;
         assert_eq!(st, StatusCode::OK);
+        let (st, _) = call(
+            app.clone(),
+            Request::post(format!("/sessions/{id}/join"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"agent":"scribe"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
 
         let (st, _) = call(
             app.clone(),
@@ -426,6 +491,16 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::OK);
 
+        let (st, _) = call(
+            app.clone(),
+            Request::post(format!("/sessions/{id}/events"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"user":"cheng","message":"again"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CONFLICT);
+
         let (st, txt) = call(
             app.clone(),
             Request::get(format!("/sessions/{id}/events"))
@@ -435,6 +510,7 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::OK);
         assert!(txt.contains("hello"));
+        assert!(!txt.contains("again"));
 
         let (st, txt) = call(
             app,
@@ -483,6 +559,8 @@ mod tests {
         assert_eq!(j.0, 200);
         let j2 = http(addr, "POST", &format!("/sessions/{id}/join"), Some(r#"{"user":"guest"}"#)).await;
         assert_eq!(j2.0, 200);
+        let ja = http(addr, "POST", &format!("/sessions/{id}/join"), Some(r#"{"agent":"scribe"}"#)).await;
+        assert_eq!(ja.0, 200);
 
         let url = format!("ws://{addr}/sessions/{id}/stream");
         let (mut a, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
@@ -541,6 +619,12 @@ mod tests {
         expect_text(&mut a, "join").await;
         expect_text(&mut b, "join").await;
 
+        a.send(WsMsg::Text(r#"{"type":"join","agent":"scribe"}"#.into()))
+            .await
+            .unwrap();
+        expect_text(&mut a, "join").await;
+        expect_text(&mut b, "join").await;
+
         a.send(WsMsg::Text(
             r#"{"type":"message","user":"cheng","message":"steer-from-a"}"#.into(),
         ))
@@ -552,13 +636,12 @@ mod tests {
         b.send(WsMsg::Text(r#"{"user":"guest","message":"steer-from-b"}"#.into()))
             .await
             .unwrap();
-        expect_text(&mut a, "steer-from-b").await;
-        expect_text(&mut b, "steer-from-b").await;
+        expect_text(&mut b, "409").await;
 
         let listed = http(addr, "GET", &format!("/sessions/{id}/events"), None).await;
         assert_eq!(listed.0, 200);
         assert!(listed.1.contains("steer-from-a"));
-        assert!(listed.1.contains("steer-from-b"));
+        assert!(!listed.1.contains("steer-from-b"));
 
         let posted = http(
             addr,
@@ -567,9 +650,7 @@ mod tests {
             Some(r#"{"user":"cheng","message":"http-still"}"#),
         )
         .await;
-        assert_eq!(posted.0, 200);
-        expect_text(&mut a, "http-still").await;
-        expect_text(&mut b, "http-still").await;
+        assert_eq!(posted.0, 409);
 
         let _ = a.close(None).await;
         let _ = b.close(None).await;

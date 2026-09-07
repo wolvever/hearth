@@ -1,6 +1,6 @@
 # hearth
 
-Session-first kernel. Six product names: **User**, **Agent**, **Session**, **Binding**, **Event**, **Place**. `Store` / `InMemory` persist them; `Provisioner` records a `Binding` without spawning a CLI; `FakeSandbox` is a host-side file map keyed by `sandbox_id`. None of those three is a seventh concept.
+Session-first kernel. Six product names: **User**, **Agent**, **Session**, **Binding**, **Event**, **Place**. `Store` / `InMemory` persist them; `Provisioner` records a `Binding` without spawning a CLI; `FakeSandbox` is a host-side file map keyed by `sandbox_id`. None of those is a seventh concept. `Runtime` keeps Sessions so an Agent can wake on user queries, timers, and triggers — same class as Store / Provisioner / Host / FakeSandbox, not a seventh name.
 
 ## Six concepts
 
@@ -18,7 +18,7 @@ A member is `UserId` or `AgentId`. One agent may sit in many sessions; one sessi
 | Field | Role |
 | --- | --- |
 | `id` | `BindingId` |
-| `kind` | Host string (`claude_code`, `codex`, `dsh`, `fx`, `pi`, or adapter strings such as `paseo-cli` / `claude-managed`) |
+| `kind` | Host string (`claude_code`, `codex`, `dsh`, `fx`, `pi`, `opencode`, `goose`, or adapter strings such as `paseo-cli` / `claude-managed`) |
 | `native_resume_id` | Provider resume token |
 | `sandbox_id` | Shared host place key (string). Not `Place`. |
 | `agent` | Optional `AgentId` for leave-scoped unbind |
@@ -51,8 +51,9 @@ A member is `UserId` or `AgentId`. One agent may sit in many sessions; one sessi
 - `TurnStart { agent }` / `TurnEnd { agent }`
 - `BindingAttached { binding }` / `BindingReleased { binding }`
 - `Compact { start, end, summary }` — replaces `[start, end]` (inclusive `EventId` range in log order) in `surface`; full log keeps originals and the marker
+- `Wake { source }` — Runtime timer/trigger marker (`WakeSource`: `UserQuery` / `Timer` / `Trigger { name }`). Not model-visible. User queries are `UserMessage` alone so they are not doubled.
 
-`events()` is the full log. `surface()` / `surface_of` / `is_model_visible` keep only `UserMessage`, `AgentMessage`, `ToolCall`, `ToolResult`, `Compact`, and hide events whose `id` lies in any Compact's inclusive log-order range (`start`/`end` EventIds; missing ids hide nothing). Think, permission, bind, membership stay in `events()` only. `SessionData` holds `next_turn_id` and `next_seq_id` (next unused, start at 1), plus `last_read` and `current_turn`. `push`/`append` assign a new `EventId`, `seq: None`, and `turn: current_turn` without bumping those counters.
+`events()` is the full log. `surface()` / `surface_of` / `is_model_visible` keep only `UserMessage`, `AgentMessage`, `ToolCall`, `ToolResult`, `Compact`, and hide events whose `id` lies in any Compact's inclusive log-order range (`start`/`end` EventIds; missing ids hide nothing). Think, permission, bind, membership, turn, and `Wake` stay in `events()` only. `SessionData` holds `next_turn_id` and `next_seq_id` (next unused, start at 1), plus `last_read` and `current_turn`. `push`/`append` assign a new `EventId`, `seq: None`, and `turn: current_turn` without bumping those counters.
 
 There is no Place attach/detach event. `attach_place` / `detach_place` mutate session state only.
 
@@ -63,8 +64,9 @@ There is no Place attach/detach event. `attach_place` / `detach_place` mutate se
 | `id` | `SessionId` |
 | `join(member)` | Occupancy. Appends `MemberJoin`. Does **not** create Place or Binding. |
 | `leave(member)` | Occupancy. For `Member::Agent`, also unbinds Bindings whose `agent` is that id (`BindingReleased` then `MemberLeave`). Does not drop Session, log, Place, or `FakeSandbox` files. User leave does not unbind. |
-| `bind(kind, native_resume_id, sandbox_id)` | Binding with `agent: None`. |
-| `bind_agent(agent, kind, native_resume_id, sandbox_id)` | Binding with `agent: Some`. Join does not call this. |
+| `bind(kind, native_resume_id, sandbox_id)` | Binding with `agent: None`. Goes through `Host::from_bind` then `into_binding`. |
+| `bind_agent(agent, kind, native_resume_id, sandbox_id)` | Binding with `agent: Some`. Join does not call this. Goes through `Host::from_bind` then `into_binding`. |
+| `bind_host(agent, host)` | Typed path: attach a constructed `Host` (e.g. `HostKind::Goose.host(...)`). |
 | `unbind(binding_id)` | Drops that Binding. Session, log, and Places remain. |
 | `attach_place(place)` | Fail-closed (see below). Keyed by `PlaceId`. Same `provider`+`instance` overwrites that row (reuses its id). New id may use a different provider than other places. Provider swap only when rewriting an existing `PlaceId`. |
 | `places()` | `Vec<Place>`. Survive unbind of all Bindings. |
@@ -86,6 +88,22 @@ There is no Place attach/detach event. `attach_place` / `detach_place` mutate se
 `InMemory` also: `create_user` / `create_agent` / `create_session` / `session` / `user` / `agent` / `set_user_config` / `set_agent_config`. `Store` trait is the create/get subset.
 
 `NullProvisioner::provision` → `session.bind`. No process.
+
+## Runtime
+
+`Runtime` is the long-lived keeper that holds Sessions so an Agent can keep waking on user queries, timers, and triggers. Same class as `Store` / `Provisioner` / `Host` / `FakeSandbox` — **not** a seventh product name. Binding remains disposable.
+
+- `keep(session, agent, host)` records a Host recipe and occupancy (`Member::Agent` if needed). Does **not** bind. Overwrite updates the recipe (host/agent).
+- `release` stops keeping. Session, Agent, Places, and the log survive. Bindings are not deleted.
+- `classify` is find_server on the kept agent's Binding: `LiveIdle` / `LiveInTurn` / `PositivelyDead` / `Unknown` / `NeverBound`. Missing heartbeat is `Unknown`, not death. Wait is `Error::Waiting(WaitReason)`, not a Queue type.
+- `remint` is the idle path. Refused on `LiveIdle` / `LiveInTurn` (`AlreadyLive`) and on `Unknown`. Allowed on `NeverBound` / `PositivelyDead` (`BindingReleased` on the log, no live Binding).
+- `wake` requires a kept session (`Error::NotKept`). Ensures the agent is a member, then:
+  - `LiveInTurn` / `Unknown` → `Waiting`. No remint. No `turn_start`.
+  - `NeverBound` / `PositivelyDead` → remint from the stored Host (`session.bind_host`).
+  - `LiveIdle` (or after remint) → `UserQuery` is `user_message` (user must occupy the room). `Timer` / `Trigger` append `EventBody::Wake`. Then `turn_start(agent)`.
+  - Does **not** `turn_end` — the host runner ends the turn later. Does not spawn a CLI or invent `AgentMessage`.
+- `schedule(every_ms)` sets `next_due_ms = now + every_ms`. `tick(now)` wakes due sessions (`next_due_ms <= now`) then reschedules `now + every_ms`. Pass `now` (epoch ms, same clock as `Event.ts`) so tests drive the loop without sleeping.
+- `Wake` is not model-visible (`surface` omits it, like membership / turn / bind).
 
 ## Fail-closed Place
 
@@ -125,7 +143,7 @@ Claude Tag **channel** and Multica **Issue** are Sessions in adapters. MA **Sess
 ## Layout
 
 ```
-crates/hearth/           kernel (lib.rs, place.rs, sandbox.rs)
+crates/hearth/           kernel (lib.rs, host.rs, place.rs, sandbox.rs, runtime.rs)
 crates/hearth-paseo/     Paseo name map (no daemon / worktree supervisor)
 crates/hearth-managed/   MA / Tag name map
 crates/hearth-service/   local HTTP + WebSocket
@@ -202,7 +220,28 @@ No HTTP for bind, unbind, compact, ask/decide, or Place swap.
 - No public ingress, auth, or multi-node replication.
 - `PlaceAttach::RecreateFromGit` / `CopyThenMount` are enums only.
 - Cloud providers are labels + fail-closed checks, not provisioners.
-- `TurnStart` / `TurnEnd` exist on the enum and `turn_start` / `turn_end` allocate turn ids; no host turn runner.
+- `TurnStart` / `TurnEnd` exist on the enum and `turn_start` / `turn_end` allocate turn ids; no host turn runner. `Runtime::wake` calls `turn_start` only; the host runner would `turn_end` later.
+- `Runtime::tick` is a deterministic timer pump; no background thread.
 - `AskUser` is an event, not a blocking RPC.
 - `FakeSandbox` is an in-crate hashmap, not isolation.
 - Adapters (`hearth-paseo`, `hearth-managed`) convert names; they do not embed those products.
+
+
+## Three parts of a host bind
+
+Adding OpenCode, Goose, Dsh, and the others is three pieces. **Host is not a seventh kernel name.**
+
+1. **User params** — what `bind` / `bind_agent` already take: optional `agent`, `kind`, `native_resume_id`, `sandbox_id`.
+2. **Host type** — a real Rust type constructed when `HostKind::Goose` (etc.) is passed: `Host::Goose(Goose { … })`. `HostKind::host` and `Host::from_bind` build it. Adapter strings (`paseo-cli`, …) become `Host::Other`. Not an Agent subclass.
+3. **Binding** — the record stored on the Session. Product `kind` stays a string (`Goose` → `"goose"`). `Host::into_binding` mints the `BindingId` and copies fields.
+
+`bind` / `bind_agent` keep the same public signatures and go `(1) → (2) → (3)`. The typed path is `session.bind_host(Some(id), HostKind::Goose.host(None, Some("box".into())))`.
+
+## Adding a host
+
+OpenCode, Goose, DeepSeek Harness, and the others are **Binding kinds** (via a typed `Host` ticket), not new Agent types. One `Agent` identity can bind as `opencode` in one session and `goose` in another.
+
+1. Add a `HostKind` variant and `as_str`, plus a matching `Host` struct/variant (or pass a raw string → `Host::Other`). `dsh` is DeepSeek Harness.
+2. `store.create_agent(...)` then `join` then `bind_agent(id, HostKind::OpenCode, resume, sandbox)` or `bind_host(Some(id), HostKind::OpenCode.host(resume, sandbox))`.
+3. Spawn and resume stay in a host crate / `Provisioner`. The kernel only records the Binding.
+4. Do not add an Agent subclass or a seventh kernel name.
