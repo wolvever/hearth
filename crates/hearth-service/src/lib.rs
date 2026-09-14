@@ -158,6 +158,13 @@ struct JoinBody {
     agent: Option<String>,
 }
 
+/// Production keep stand-in. Grok is a test-only HostKind; do not replace this.
+fn keep_standin(st: &AppState, id: SessionId, agent: hearth::AgentId) -> Result<(), StatusCode> {
+    st.runtime
+        .keep(id, agent, HostKind::Goose.host(None, None))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
 /// Shared join used by HTTP POST /join and WS `{"type":"join",...}`.
 fn apply_join(
     st: &AppState,
@@ -167,28 +174,30 @@ fn apply_join(
 ) -> Result<EventOut, StatusCode> {
     let session = st.store().session(id).map_err(|_| StatusCode::NOT_FOUND)?;
     let mut names = st.names.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let keep_agent = agent.clone();
-    let ev = if let Some(name) = user {
+    let (ev, keep_agent) = if let Some(name) = user {
         let uid = *names
             .users
             .entry(name.clone())
             .or_insert_with(|| st.store().create_user(name).id);
-        session.join(Member::User(uid)).map_err(|_| StatusCode::CONFLICT)?
+        (
+            session.join(Member::User(uid)).map_err(|_| StatusCode::CONFLICT)?,
+            None,
+        )
     } else if let Some(name) = agent {
         let aid = *names
             .agents
             .entry(name.clone())
             .or_insert_with(|| st.store().create_agent(name, String::new()).id);
-        session.join(Member::Agent(aid)).map_err(|_| StatusCode::CONFLICT)?
+        (
+            session.join(Member::Agent(aid)).map_err(|_| StatusCode::CONFLICT)?,
+            Some(aid),
+        )
     } else {
         return Err(StatusCode::BAD_REQUEST);
     };
-    let aid = keep_agent.as_ref().and_then(|n| names.agents.get(n).copied());
     drop(names);
-    if let Some(aid) = aid {
-        st.runtime
-            .keep(id, aid, HostKind::Goose.host(None, None))
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if let Some(aid) = keep_agent {
+        keep_standin(st, id, aid)?;
     }
     let out = event_out(&ev);
     st.publish(id, out.clone());
@@ -246,10 +255,7 @@ fn ensure_kept(st: &AppState, id: SessionId) -> Result<(), StatusCode> {
     let Some(agent) = agent else {
         return Err(StatusCode::CONFLICT);
     };
-    st.runtime
-        .keep(id, agent, HostKind::Goose.host(None, None))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(())
+    keep_standin(st, id, agent)
 }
 
 /// Shared steer used by HTTP POST /events and WS `{"type":"message",...}`.
@@ -335,21 +341,16 @@ struct WsIn {
 fn apply_ws_text(st: &AppState, id: SessionId, txt: &str) -> Result<EventOut, StatusCode> {
     let body: WsIn = serde_json::from_str(txt).map_err(|_| StatusCode::BAD_REQUEST)?;
     let kind = body.kind.as_deref().unwrap_or("");
-    let has_text = body.message.is_some() || body.text.is_some();
-    match kind {
-        "join" => apply_join(st, id, body.user, body.agent),
-        "message" | "user" | "steer" => {
-            let name = body.user.ok_or(StatusCode::BAD_REQUEST)?;
-            let text = body.message.or(body.text).ok_or(StatusCode::BAD_REQUEST)?;
-            apply_user_message(st, id, name, text)
-        }
-        "" if has_text => {
-            let name = body.user.ok_or(StatusCode::BAD_REQUEST)?;
-            let text = body.message.or(body.text).ok_or(StatusCode::BAD_REQUEST)?;
-            apply_user_message(st, id, name, text)
-        }
-        "" => apply_join(st, id, body.user, body.agent),
-        _ => Err(StatusCode::BAD_REQUEST),
+    let text = body.message.or(body.text);
+    let steer = matches!(kind, "message" | "user" | "steer") || (kind.is_empty() && text.is_some());
+    if steer {
+        let name = body.user.ok_or(StatusCode::BAD_REQUEST)?;
+        let text = text.ok_or(StatusCode::BAD_REQUEST)?;
+        apply_user_message(st, id, name, text)
+    } else if kind == "join" || kind.is_empty() {
+        apply_join(st, id, body.user, body.agent)
+    } else {
+        Err(StatusCode::BAD_REQUEST)
     }
 }
 
