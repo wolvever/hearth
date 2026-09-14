@@ -118,7 +118,7 @@ XAI_API_KEY=... cargo test -p hearth --test grok_keep_wake -- --nocapture
 # GROK_API_KEY also works. Optional: XAI_MODEL / GROK_MODEL (default grok-3-mini).
 ```
 
-`hearth::grok_api_key()` reads those env vars. The test always exercises `Runtime::keep` + `wake` with a `grok` ticket; the HTTP call (`curl` to `https://api.x.ai/v1/chat/completions`) runs only when a key is present.
+`hearth::grok_api_key()` reads those env vars (or a local `.env` — gitignored; see `.env.example`). The test always exercises `Runtime::keep` + `wake` with a `grok` ticket; the HTTP call (`curl` to `https://api.x.ai/v1/chat/completions`) runs only when a key is present. Keys are not stored in the repo.
 
 ## Fail-closed Place
 
