@@ -21,8 +21,9 @@ mod runtime;
 pub use place::{Place, PlaceAttach, PlaceOs, PlaceProvider};
 pub use sandbox::FakeSandbox;
 pub use host::{
-    Host, ClaudeCode as ClaudeCodeHost, Codex as CodexHost, Dsh as DshHost, Fx as FxHost,
-    Pi as PiHost, OpenCode as OpenCodeHost, Goose as GooseHost,
+    grok_api_key, Host, HostKind, HostTicket, ClaudeCode as ClaudeCodeHost, Codex as CodexHost,
+    Dsh as DshHost, Fx as FxHost, Pi as PiHost, OpenCode as OpenCodeHost, Goose as GooseHost,
+    Grok as GrokHost,
 };
 pub use runtime::{KeepSpec, Liveness, Runtime, Wake};
 
@@ -76,38 +77,6 @@ pub struct Agent {
     pub name: String,
     pub instructions: String,
     pub config: HashMap<String, String>,
-}
-
-/// Known host kinds. Stored on [`Binding::kind`] as a string; not a sixth concept.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub enum HostKind {
-    ClaudeCode,
-    Codex,
-    Dsh,
-    Fx,
-    Pi,
-    OpenCode,
-    Goose,
-}
-
-impl HostKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::ClaudeCode => "claude_code",
-            Self::Codex => "codex",
-            Self::Dsh => "dsh",
-            Self::Fx => "fx",
-            Self::Pi => "pi",
-            Self::OpenCode => "opencode",
-            Self::Goose => "goose",
-        }
-    }
-}
-
-impl From<HostKind> for String {
-    fn from(k: HostKind) -> Self {
-        k.as_str().to_string()
-    }
 }
 
 /// Disposable runtime attachment. Native resume ids live here, never on `Session`.
@@ -475,6 +444,24 @@ impl Session {
         self.id
     }
 
+    fn read<T>(&self, f: impl FnOnce(&SessionData) -> T) -> Result<T> {
+        let g = self.store.lock()?;
+        let data = g
+            .sessions
+            .get(&self.id)
+            .ok_or(Error::UnknownSession(self.id))?;
+        Ok(f(data))
+    }
+
+    fn write<T>(&self, f: impl FnOnce(&mut SessionData) -> Result<T>) -> Result<T> {
+        let mut g = self.store.lock()?;
+        let data = g
+            .sessions
+            .get_mut(&self.id)
+            .ok_or(Error::UnknownSession(self.id))?;
+        f(data)
+    }
+
     pub fn join(&self, member: Member) -> Result<Event> {
         let mut g = self.store.lock()?;
         match &member {
@@ -493,37 +480,29 @@ impl Session {
     }
 
     pub fn leave(&self, member: Member) -> Result<Event> {
-        let mut g = self.store.lock()?;
-        let data = g
-            .sessions
-            .get_mut(&self.id)
-            .ok_or(Error::UnknownSession(self.id))?;
-        if !data.members.remove(&member) {
-            return Err(Error::NotMember);
-        }
-        if let Member::Agent(agent) = &member {
-            let agent = *agent;
-            let drop: Vec<BindingId> = data
-                .bindings
-                .values()
-                .filter(|b| b.agent == Some(agent))
-                .map(|b| b.id)
-                .collect();
-            for bid in drop {
-                data.bindings.remove(&bid);
-                data.push(EventBody::BindingReleased { binding: bid });
+        self.write(|data| {
+            if !data.members.remove(&member) {
+                return Err(Error::NotMember);
             }
-        }
-        Ok(data.push(EventBody::MemberLeave { member }))
+            if let Member::Agent(agent) = &member {
+                let agent = *agent;
+                let drop: Vec<BindingId> = data
+                    .bindings
+                    .values()
+                    .filter(|b| b.agent == Some(agent))
+                    .map(|b| b.id)
+                    .collect();
+                for bid in drop {
+                    data.bindings.remove(&bid);
+                    data.push(EventBody::BindingReleased { binding: bid });
+                }
+            }
+            Ok(data.push(EventBody::MemberLeave { member }))
+        })
     }
 
     pub fn append(&self, body: EventBody) -> Result<Event> {
-        let mut g = self.store.lock()?;
-        let data = g
-            .sessions
-            .get_mut(&self.id)
-            .ok_or(Error::UnknownSession(self.id))?;
-        Ok(data.push(body))
+        self.write(|data| Ok(data.push(body)))
     }
 
     pub fn bind(
@@ -554,17 +533,13 @@ impl Session {
     }
 
     fn attach_binding(&self, binding: Binding) -> Result<Binding> {
-        let binding = binding;
-        let mut g = self.store.lock()?;
-        let data = g
-            .sessions
-            .get_mut(&self.id)
-            .ok_or(Error::UnknownSession(self.id))?;
-        data.bindings.insert(binding.id, binding.clone());
-        data.push(EventBody::BindingAttached {
-            binding: binding.id,
-        });
-        Ok(binding)
+        self.write(|data| {
+            data.bindings.insert(binding.id, binding.clone());
+            data.push(EventBody::BindingAttached {
+                binding: binding.id,
+            });
+            Ok(binding)
+        })
     }
 
     pub fn ask_user(&self, agent: AgentId, prompt: impl Into<String>) -> Result<Event> {
@@ -655,17 +630,14 @@ impl Session {
 
     /// Release a binding. The session and its log remain.
     pub fn unbind(&self, binding_id: BindingId) -> Result<Event> {
-        let mut g = self.store.lock()?;
-        let data = g
-            .sessions
-            .get_mut(&self.id)
-            .ok_or(Error::UnknownSession(self.id))?;
-        if data.bindings.remove(&binding_id).is_none() {
-            return Err(Error::UnknownBinding(binding_id));
-        }
-        Ok(data.push(EventBody::BindingReleased {
-            binding: binding_id,
-        }))
+        self.write(|data| {
+            if data.bindings.remove(&binding_id).is_none() {
+                return Err(Error::UnknownBinding(binding_id));
+            }
+            Ok(data.push(EventBody::BindingReleased {
+                binding: binding_id,
+            }))
+        })
     }
 
     /// Append a compaction marker. Replaced EventIds stay in [`Self::events`], drop from [`Self::surface`].
@@ -678,83 +650,49 @@ impl Session {
     }
 
     pub fn turn_start(&self, agent: AgentId) -> Result<Event> {
-        let mut g = self.store.lock()?;
-        let data = g
-            .sessions
-            .get_mut(&self.id)
-            .ok_or(Error::UnknownSession(self.id))?;
-        let turn = data.next_turn_id;
-        data.next_turn_id += 1;
-        data.current_turn = Some(turn);
-        Ok(data.push(EventBody::TurnStart { agent }))
+        self.write(|data| {
+            let turn = data.next_turn_id;
+            data.next_turn_id += 1;
+            data.current_turn = Some(turn);
+            Ok(data.push(EventBody::TurnStart { agent }))
+        })
     }
 
     pub fn turn_end(&self, agent: AgentId) -> Result<Event> {
-        let mut g = self.store.lock()?;
-        let data = g
-            .sessions
-            .get_mut(&self.id)
-            .ok_or(Error::UnknownSession(self.id))?;
-        let event = data.push(EventBody::TurnEnd { agent });
-        data.current_turn = None;
-        Ok(event)
+        self.write(|data| {
+            let event = data.push(EventBody::TurnEnd { agent });
+            data.current_turn = None;
+            Ok(event)
+        })
     }
 
     pub fn mark_read(&self) -> Result<u64> {
-        let mut g = self.store.lock()?;
-        let data = g
-            .sessions
-            .get_mut(&self.id)
-            .ok_or(Error::UnknownSession(self.id))?;
-        let seq = data.next_seq_id;
-        data.next_seq_id += 1;
-        data.last_read = Some(seq);
-        Ok(seq)
+        self.write(|data| {
+            let seq = data.next_seq_id;
+            data.next_seq_id += 1;
+            data.last_read = Some(seq);
+            Ok(seq)
+        })
     }
 
     pub fn last_read(&self) -> Result<Option<u64>> {
-        let g = self.store.lock()?;
-        let data = g
-            .sessions
-            .get(&self.id)
-            .ok_or(Error::UnknownSession(self.id))?;
-        Ok(data.last_read)
+        self.read(|data| data.last_read)
     }
 
     pub fn next_turn_id(&self) -> Result<u64> {
-        let g = self.store.lock()?;
-        let data = g
-            .sessions
-            .get(&self.id)
-            .ok_or(Error::UnknownSession(self.id))?;
-        Ok(data.next_turn_id)
+        self.read(|data| data.next_turn_id)
     }
 
     pub fn next_seq_id(&self) -> Result<u64> {
-        let g = self.store.lock()?;
-        let data = g
-            .sessions
-            .get(&self.id)
-            .ok_or(Error::UnknownSession(self.id))?;
-        Ok(data.next_seq_id)
+        self.read(|data| data.next_seq_id)
     }
 
     pub fn current_turn(&self) -> Result<Option<u64>> {
-        let g = self.store.lock()?;
-        let data = g
-            .sessions
-            .get(&self.id)
-            .ok_or(Error::UnknownSession(self.id))?;
-        Ok(data.current_turn)
+        self.read(|data| data.current_turn)
     }
 
     pub fn events(&self) -> Result<Vec<Event>> {
-        let g = self.store.lock()?;
-        let data = g
-            .sessions
-            .get(&self.id)
-            .ok_or(Error::UnknownSession(self.id))?;
-        Ok(data.events.clone())
+        self.read(|data| data.events.clone())
     }
 
     /// Model-visible view of the log (not a second store).
@@ -763,41 +701,21 @@ impl Session {
     }
 
     pub fn members(&self) -> Result<Vec<Member>> {
-        let g = self.store.lock()?;
-        let data = g
-            .sessions
-            .get(&self.id)
-            .ok_or(Error::UnknownSession(self.id))?;
-        Ok(data.members.iter().cloned().collect())
+        self.read(|data| data.members.iter().cloned().collect())
     }
 
     pub fn bindings(&self) -> Result<Vec<Binding>> {
-        let g = self.store.lock()?;
-        let data = g
-            .sessions
-            .get(&self.id)
-            .ok_or(Error::UnknownSession(self.id))?;
-        Ok(data.bindings.values().cloned().collect())
+        self.read(|data| data.bindings.values().cloned().collect())
     }
 
     /// All attached [`Place`] locators. Survive unbind of all Bindings.
     pub fn places(&self) -> Result<Vec<Place>> {
-        let g = self.store.lock()?;
-        let data = g
-            .sessions
-            .get(&self.id)
-            .ok_or(Error::UnknownSession(self.id))?;
-        Ok(data.places.values().cloned().collect())
+        self.read(|data| data.places.values().cloned().collect())
     }
 
     /// Lookup one attached [`Place`] by id.
     pub fn place(&self, id: PlaceId) -> Result<Option<Place>> {
-        let g = self.store.lock()?;
-        let data = g
-            .sessions
-            .get(&self.id)
-            .ok_or(Error::UnknownSession(self.id))?;
-        Ok(data.places.get(&id).cloned())
+        self.read(|data| data.places.get(&id).cloned())
     }
 
     /// Fail-closed attach, keyed by [`PlaceId`]. Same provider+instance reuses that row.
@@ -805,37 +723,29 @@ impl Session {
     pub fn attach_place(&self, place: Place) -> Result<Place> {
         place.validate()?;
         let mut place = place;
-        let mut g = self.store.lock()?;
-        let data = g
-            .sessions
-            .get_mut(&self.id)
-            .ok_or(Error::UnknownSession(self.id))?;
-        if let Some(existing) = data.places.get(&place.id) {
-            if existing.provider != place.provider {
-                return Err(Error::PlaceProviderSwap);
+        self.write(|data| {
+            if let Some(existing) = data.places.get(&place.id) {
+                if existing.provider != place.provider {
+                    return Err(Error::PlaceProviderSwap);
+                }
+                data.places.insert(place.id, place.clone());
+                return Ok(place);
+            }
+            if let Some((&eid, _)) = data.places.iter().find(|(_, p)| {
+                p.provider == place.provider && p.instance == place.instance
+            }) {
+                place.id = eid;
+                data.places.insert(eid, place.clone());
+                return Ok(place);
             }
             data.places.insert(place.id, place.clone());
-            return Ok(place);
-        }
-        if let Some((&eid, _)) = data.places.iter().find(|(_, p)| {
-            p.provider == place.provider && p.instance == place.instance
-        }) {
-            place.id = eid;
-            data.places.insert(eid, place.clone());
-            return Ok(place);
-        }
-        data.places.insert(place.id, place.clone());
-        Ok(place)
+            Ok(place)
+        })
     }
 
     /// Remove one locator. Session, log, and other places remain.
     pub fn detach_place(&self, id: PlaceId) -> Result<Place> {
-        let mut g = self.store.lock()?;
-        let data = g
-            .sessions
-            .get_mut(&self.id)
-            .ok_or(Error::UnknownSession(self.id))?;
-        data.places.remove(&id).ok_or(Error::UnknownPlace(id))
+        self.write(|data| data.places.remove(&id).ok_or(Error::UnknownPlace(id)))
     }
 
     /// Distinct live sandbox ids on current Bindings. Empty after last unbind
@@ -1301,6 +1211,17 @@ mod tests {
     }
 
     #[test]
+    fn host_kind_grok_is_typed_host() {
+        let host = HostKind::Grok.host(Some("resume".into()), Some("box".into()));
+        assert!(matches!(host, Host::Grok(_)));
+        assert_eq!(host.kind_str(), "grok");
+        assert_eq!(host.native_resume_id(), Some("resume"));
+        assert_eq!(host.sandbox_id(), Some("box"));
+        let through = Host::from_bind("grok", None, None);
+        assert!(matches!(through, Host::Grok(_)));
+    }
+
+    #[test]
     fn bind_agent_goose_kind_string_goes_through_host() {
         let store = InMemory::new();
         let agent = store.create_agent("multi", "");
@@ -1533,9 +1454,13 @@ mod environment {
         let goose = session
             .bind_agent(agent.id, HostKind::Goose, None, None)
             .unwrap();
+        let grok = session
+            .bind_agent(agent.id, HostKind::Grok, None, None)
+            .unwrap();
         assert_eq!(dsh.kind, "dsh");
         assert_eq!(oc.kind, "opencode");
         assert_eq!(goose.kind, "goose");
+        assert_eq!(grok.kind, "grok");
         assert_eq!(dsh.agent, Some(agent.id));
     }
 }

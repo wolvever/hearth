@@ -9,7 +9,7 @@
 //! It does **not** spawn a CLI, invent [`crate::EventBody::AgentMessage`],
 //! or call [`crate::Session::turn_end`] — the host runner ends the turn later.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use crate::{
@@ -97,6 +97,12 @@ impl Runtime {
         self.kept.lock().map_err(|_| Error::Poisoned)
     }
 
+    fn kept_recipe(&self, session: SessionId) -> Result<(AgentId, Host)> {
+        let g = self.lock_kept()?;
+        let kept = g.get(&session).ok_or(Error::NotKept(session))?;
+        Ok((kept.agent, kept.host.clone()))
+    }
+
     /// Record a Host recipe for this session. Session and Agent must exist.
     /// Joins `Member::Agent` if needed (occupancy so later turns are legal).
     /// Does **not** bind. Overwriting keep on the same session updates the recipe.
@@ -106,19 +112,22 @@ impl Runtime {
         let _ = self.store.agent(spec.agent)?;
         ensure_agent_member(&sess, spec.agent)?;
         let mut g = self.lock_kept()?;
-        if let Some(existing) = g.get_mut(&session) {
-            existing.agent = spec.agent;
-            existing.host = spec.host;
-        } else {
-            g.insert(
-                session,
-                Kept {
-                    agent: spec.agent,
-                    host: spec.host,
-                    timer_every_ms: None,
-                    next_due_ms: None,
-                },
-            );
+        match g.get_mut(&session) {
+            Some(existing) => {
+                existing.agent = spec.agent;
+                existing.host = spec.host;
+            }
+            None => {
+                g.insert(
+                    session,
+                    Kept {
+                        agent: spec.agent,
+                        host: spec.host,
+                        timer_every_ms: None,
+                        next_due_ms: None,
+                    },
+                );
+            }
         }
         Ok(())
     }
@@ -153,50 +162,35 @@ impl Runtime {
     /// Binding is idle or in-turn; no live Binding plus `BindingReleased` is
     /// positively dead; never attached is [`Liveness::NeverBound`].
     pub fn classify(&self, session: SessionId) -> Result<Liveness> {
-        let agent = {
-            let g = self.lock_kept()?;
-            let kept = g.get(&session).ok_or(Error::NotKept(session))?;
-            kept.agent
-        };
-        let sess = self.store.session(session)?;
-        Ok(classify_session(&sess, agent)?)
+        let (agent, _) = self.kept_recipe(session)?;
+        classify_session(&self.store.session(session)?, agent)
     }
 
     /// Idle remint. Refused if a Binding is live or liveness is unknown.
     pub fn remint(&self, session: SessionId) -> Result<crate::BindingId> {
-        let (agent, host) = {
-            let g = self.lock_kept()?;
-            let kept = g.get(&session).ok_or(Error::NotKept(session))?;
-            (kept.agent, kept.host.clone())
-        };
+        let (agent, host) = self.kept_recipe(session)?;
         let sess = self.store.session(session)?;
         ensure_agent_member(&sess, agent)?;
         match classify_session(&sess, agent)? {
             Liveness::LiveIdle | Liveness::LiveInTurn => Err(Error::Waiting(WaitReason::AlreadyLive)),
             Liveness::Unknown => Err(Error::Waiting(WaitReason::LivenessUnknown)),
             Liveness::NeverBound | Liveness::PositivelyDead => {
-                let b = sess.bind_host(Some(agent), host)?;
-                Ok(b.id)
+                Ok(sess.bind_host(Some(agent), host)?.id)
             }
         }
     }
 
     /// Wake a kept session: find_server on the agent's Binding.
     ///
-    /// Prompt path never remints. `NeverBound` / `PositivelyDead` remint first
-    /// (idle path), then link. `LiveInTurn` / `Unknown` wait.
+    /// Prompt path never remints a live Binding. `NeverBound` / `PositivelyDead`
+    /// remint first (idle launch / empty pool), then link. `LiveInTurn` /
+    /// `Unknown` wait.
     /// Does **not** call [`Session::turn_end`] — the host runner would end the turn later.
     /// Does **not** spawn a real CLI or invent `AgentMessage`.
     pub fn wake(&self, session: SessionId, wake: Wake) -> Result<Vec<Event>> {
-        let (agent, host) = {
-            let g = self.lock_kept()?;
-            let kept = g.get(&session).ok_or(Error::NotKept(session))?;
-            (kept.agent, kept.host.clone())
-        };
-
+        let (agent, host) = self.kept_recipe(session)?;
         let sess = self.store.session(session)?;
         let start_len = sess.events()?.len();
-
         ensure_agent_member(&sess, agent)?;
 
         match classify_session(&sess, agent)? {
@@ -204,31 +198,10 @@ impl Runtime {
             Liveness::Unknown => return Err(Error::Waiting(WaitReason::LivenessUnknown)),
             Liveness::LiveIdle => {}
             Liveness::NeverBound | Liveness::PositivelyDead => {
-                match wake {
-                    Wake::UserQuery { .. } => {
-                        // Prompt path: remint is allowed only as the idle launch
-                        // when no lease exists (find_server with an empty pool).
-                        sess.bind_host(Some(agent), host)?;
-                    }
-                    Wake::Timer | Wake::Trigger { .. } => {
-                        sess.bind_host(Some(agent), host)?;
-                    }
-                }
+                sess.bind_host(Some(agent), host)?;
             }
         }
-
-        match wake {
-            Wake::UserQuery { user, text } => {
-                // Prefer UserMessage alone so queries are not doubled with Wake.
-                sess.user_message(user, text)?;
-            }
-            Wake::Timer | Wake::Trigger { .. } => {
-                sess.append(EventBody::Wake {
-                    source: wake.source(),
-                })?;
-            }
-        }
-
+        record_wake(&sess, &wake)?;
         sess.turn_start(agent)?;
 
         let events = sess.events()?;
@@ -267,32 +240,33 @@ impl Runtime {
     }
 }
 
+fn record_wake(session: &Session, wake: &Wake) -> Result<Event> {
+    match wake {
+        // Prefer UserMessage alone so queries are not doubled with Wake.
+        Wake::UserQuery { user, text } => session.user_message(*user, text),
+        Wake::Timer | Wake::Trigger { .. } => session.append(EventBody::Wake {
+            source: wake.source(),
+        }),
+    }
+}
+
 fn classify_session(session: &Session, agent: AgentId) -> Result<Liveness> {
-    let live = session
-        .bindings()?
-        .iter()
-        .any(|b| b.agent == Some(agent));
-    if live {
+    let bindings = session.bindings()?;
+    if bindings.iter().any(|b| b.agent == Some(agent)) {
         return Ok(if session.current_turn()?.is_some() {
             Liveness::LiveInTurn
         } else {
             Liveness::LiveIdle
         });
     }
-    let log = session.events()?;
-    let live_ids: std::collections::HashSet<_> = session
-        .bindings()?
-        .iter()
-        .map(|b| b.id)
-        .collect();
+    let live_ids: HashSet<_> = bindings.iter().map(|b| b.id).collect();
     let mut attached = false;
     let mut released_without_live = false;
-    for e in &log {
+    for e in session.events()? {
         match e.body {
-            EventBody::BindingAttached { binding } => {
+            EventBody::BindingAttached { .. } => {
                 attached = true;
                 released_without_live = false;
-                let _ = binding;
             }
             EventBody::BindingReleased { binding } => {
                 if !live_ids.contains(&binding) {
@@ -302,14 +276,14 @@ fn classify_session(session: &Session, agent: AgentId) -> Result<Liveness> {
             _ => {}
         }
     }
-    if released_without_live && !live {
-        Ok(Liveness::PositivelyDead)
-    } else if attached && !live {
+    Ok(if released_without_live {
+        Liveness::PositivelyDead
+    } else if attached {
         // Claimed on the log, no live Binding, no BindingReleased — vanished.
-        Ok(Liveness::Unknown)
+        Liveness::Unknown
     } else {
-        Ok(Liveness::NeverBound)
-    }
+        Liveness::NeverBound
+    })
 }
 
 fn ensure_agent_member(session: &Session, agent: AgentId) -> Result<()> {

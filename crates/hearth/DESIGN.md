@@ -18,7 +18,7 @@ A member is `UserId` or `AgentId`. One agent may sit in many sessions; one sessi
 | Field | Role |
 | --- | --- |
 | `id` | `BindingId` |
-| `kind` | Host string (`claude_code`, `codex`, `dsh`, `fx`, `pi`, `opencode`, `goose`, or adapter strings such as `paseo-cli` / `claude-managed`) |
+| `kind` | Host string (`claude_code`, `codex`, `dsh`, `fx`, `pi`, `opencode`, `goose`, `grok`, or adapter strings such as `paseo-cli` / `claude-managed`) |
 | `native_resume_id` | Provider resume token |
 | `sandbox_id` | Shared host place key (string). Not `Place`. |
 | `agent` | Optional `AgentId` for leave-scoped unbind |
@@ -104,6 +104,21 @@ There is no Place attach/detach event. `attach_place` / `detach_place` mutate se
   - Does **not** `turn_end` — the host runner ends the turn later. Does not spawn a CLI or invent `AgentMessage`.
 - `schedule(every_ms)` sets `next_due_ms = now + every_ms`. `tick(now)` wakes due sessions (`next_due_ms <= now`) then reschedules `now + every_ms`. Pass `now` (epoch ms, same clock as `Event.ts`) so tests drive the loop without sleeping.
 - `Wake` is not model-visible (`surface` omits it, like membership / turn / bind).
+
+### Grok test path
+
+`HostKind::Grok` (`"grok"`) is a Binding kind like Goose — not a seventh kernel name, not an Environment. Production `hearth-service` keep stays Goose.
+
+```
+# skip (exit 0): neither key set
+cargo test -p hearth --test grok_keep_wake
+
+# one real chat completion against the kept turn
+XAI_API_KEY=... cargo test -p hearth --test grok_keep_wake -- --nocapture
+# GROK_API_KEY also works. Optional: XAI_MODEL / GROK_MODEL (default grok-3-mini).
+```
+
+`hearth::grok_api_key()` reads those env vars. The test always exercises `Runtime::keep` + `wake` with a `grok` ticket; the HTTP call (`curl` to `https://api.x.ai/v1/chat/completions`) runs only when a key is present.
 
 ## Fail-closed Place
 
@@ -232,16 +247,16 @@ No HTTP for bind, unbind, compact, ask/decide, or Place swap.
 Adding OpenCode, Goose, Dsh, and the others is three pieces. **Host is not a seventh kernel name.**
 
 1. **User params** — what `bind` / `bind_agent` already take: optional `agent`, `kind`, `native_resume_id`, `sandbox_id`.
-2. **Host type** — a real Rust type constructed when `HostKind::Goose` (etc.) is passed: `Host::Goose(Goose { … })`. `HostKind::host` and `Host::from_bind` build it. Adapter strings (`paseo-cli`, …) become `Host::Other`. Not an Agent subclass.
-3. **Binding** — the record stored on the Session. Product `kind` stays a string (`Goose` → `"goose"`). `Host::into_binding` mints the `BindingId` and copies fields.
+2. **Host type** — a real Rust type constructed when `HostKind::Goose` (etc.) is passed: `Host::Goose(ticket)`. Known hosts share `HostTicket` (`native_resume_id`, `sandbox_id`). `HostKind::host` and `Host::from_bind` build it. Adapter strings (`paseo-cli`, …) become `Host::Other`. Not an Agent subclass.
+3. **Binding** — the record stored on the Session. Product `kind` stays a string (`Goose` → `"goose"`, `Grok` → `"grok"`). `Host::into_binding` mints the `BindingId` and copies fields.
 
 `bind` / `bind_agent` keep the same public signatures and go `(1) → (2) → (3)`. The typed path is `session.bind_host(Some(id), HostKind::Goose.host(None, Some("box".into())))`.
 
 ## Adding a host
 
-OpenCode, Goose, DeepSeek Harness, and the others are **Binding kinds** (via a typed `Host` ticket), not new Agent types. One `Agent` identity can bind as `opencode` in one session and `goose` in another.
+OpenCode, Goose, Grok, DeepSeek Harness, and the others are **Binding kinds** (via a typed `Host` ticket), not new Agent types. One `Agent` identity can bind as `opencode` in one session and `grok` in another.
 
-1. Add a `HostKind` variant and `as_str`, plus a matching `Host` struct/variant (or pass a raw string → `Host::Other`). `dsh` is DeepSeek Harness.
+1. Add one line to the `hosts!` list in `host.rs` (`HostKind` + `Host` + `as_str`). Or pass a raw string → `Host::Other`. `dsh` is DeepSeek Harness. `grok` is the xAI ticket (see Grok test path).
 2. `store.create_agent(...)` then `join` then `bind_agent(id, HostKind::OpenCode, resume, sandbox)` or `bind_host(Some(id), HostKind::OpenCode.host(resume, sandbox))`.
 3. Spawn and resume stay in a host crate / `Provisioner`. The kernel only records the Binding.
 4. Do not add an Agent subclass or a seventh kernel name.
