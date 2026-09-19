@@ -25,7 +25,7 @@ pub use host::{
     Dsh as DshHost, Fx as FxHost, Pi as PiHost, OpenCode as OpenCodeHost, Goose as GooseHost,
     Grok as GrokHost,
 };
-pub use runtime::{KeepSpec, Liveness, Runtime, Wake};
+pub use runtime::{HolderId, KeepSpec, Liveness, Runtime, SessionTurnLease, StepOutcome, Wake};
 
 // --- identities ---
 
@@ -127,6 +127,12 @@ pub enum EventBody {
     PermissionDecided { request: String, allowed: bool, by: UserId },
     TurnStart { agent: AgentId },
     TurnEnd { agent: AgentId },
+    /// Intra-turn durable step checkpoint. Not model-visible.
+    StepCompleted {
+        turn_id: u64,
+        step_id: String,
+        result: String,
+    },
     BindingAttached { binding: BindingId },
     BindingReleased { binding: BindingId },
     /// Replaces `[start, end]` (inclusive EventId range in log order) in [`Session::surface`]. Full log keeps both.
@@ -163,6 +169,14 @@ pub enum Error {
     NotKept(SessionId),
     #[error("prompt waiting ({0:?})")]
     Waiting(WaitReason),
+    #[error("turn lease lost")]
+    TurnLeaseLost,
+    #[error("session not owned by this holder")]
+    SessionNotOwned,
+    #[error("live turn is still open")]
+    LiveTurnOpen,
+    #[error("no interrupted turn to resume")]
+    TurnNotOpen,
 }
 
 /// Why [`Error::Waiting`] — return value, not a Queue type.
@@ -217,6 +231,35 @@ pub fn surface_of(events: &[Event]) -> Vec<Event> {
         .filter(|e| !hidden.contains(&e.id) && is_model_visible(&e.body))
         .cloned()
         .collect()
+}
+
+/// Last `TurnStart` without a later `TurnEnd`, walking the EventLog in order.
+pub fn open_turn_of(events: &[Event]) -> Option<(u64, AgentId)> {
+    let mut open = None;
+    for e in events {
+        match &e.body {
+            EventBody::TurnStart { agent } => {
+                open = e.turn.map(|t| (t, *agent));
+            }
+            EventBody::TurnEnd { .. } => {
+                open = None;
+            }
+            _ => {}
+        }
+    }
+    open
+}
+
+/// Memoized payload of `StepCompleted` for `(turn_id, step_id)`, if present.
+pub fn step_result_of(events: &[Event], turn_id: u64, step_id: &str) -> Option<String> {
+    events.iter().find_map(|e| match &e.body {
+        EventBody::StepCompleted {
+            turn_id: t,
+            step_id: s,
+            result,
+        } if *t == turn_id && s == step_id => Some(result.clone()),
+        _ => None,
+    })
 }
 
 // --- store ---
@@ -689,6 +732,24 @@ impl Session {
 
     pub fn current_turn(&self) -> Result<Option<u64>> {
         self.read(|data| data.current_turn)
+    }
+
+    /// Last `TurnStart` without a later `TurnEnd` on this session's EventLog.
+    pub fn open_turn(&self) -> Result<Option<u64>> {
+        self.read(|data| open_turn_of(&data.events).map(|(t, _)| t))
+    }
+
+    /// Set [`Self::current_turn`] from the EventLog (`TurnStart` without `TurnEnd`).
+    pub fn restore_open_turn(&self) -> Result<Option<u64>> {
+        self.write(|data| {
+            data.current_turn = open_turn_of(&data.events).map(|(t, _)| t);
+            Ok(data.current_turn)
+        })
+    }
+
+    /// Memoized `StepCompleted` payload for `(turn_id, step_id)`, if present.
+    pub fn step_result(&self, turn_id: u64, step_id: &str) -> Result<Option<String>> {
+        self.read(|data| step_result_of(&data.events, turn_id, step_id))
     }
 
     pub fn events(&self) -> Result<Vec<Event>> {

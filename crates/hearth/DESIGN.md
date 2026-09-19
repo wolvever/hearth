@@ -49,11 +49,12 @@ A member is `UserId` or `AgentId`. One agent may sit in many sessions; one sessi
 - `PermissionAsked { agent, request }`
 - `PermissionDecided { request, allowed, by }`
 - `TurnStart { agent }` / `TurnEnd { agent }`
+- `StepCompleted { turn_id, step_id, result }` — intra-turn durable-step checkpoint (string payload). Not model-visible.
 - `BindingAttached { binding }` / `BindingReleased { binding }`
 - `Compact { start, end, summary }` — replaces `[start, end]` (inclusive `EventId` range in log order) in `surface`; full log keeps originals and the marker
 - `Wake { source }` — Runtime timer/trigger marker (`WakeSource`: `UserQuery` / `Timer` / `Trigger { name }`). Not model-visible. User queries are `UserMessage` alone so they are not doubled.
 
-`events()` is the full log. `surface()` / `surface_of` / `is_model_visible` keep only `UserMessage`, `AgentMessage`, `ToolCall`, `ToolResult`, `Compact`, and hide events whose `id` lies in any Compact's inclusive log-order range (`start`/`end` EventIds; missing ids hide nothing). Think, permission, bind, membership, turn, and `Wake` stay in `events()` only. `SessionData` holds `next_turn_id` and `next_seq_id` (next unused, start at 1), plus `last_read` and `current_turn`. `push`/`append` assign a new `EventId`, `seq: None`, and `turn: current_turn` without bumping those counters.
+`events()` is the full log. `surface()` / `surface_of` / `is_model_visible` keep only `UserMessage`, `AgentMessage`, `ToolCall`, `ToolResult`, `Compact`, and hide events whose `id` lies in any Compact's inclusive log-order range (`start`/`end` EventIds; missing ids hide nothing). Think, permission, bind, membership, turn, `StepCompleted`, and `Wake` stay in `events()` only. `SessionData` holds `next_turn_id` and `next_seq_id` (next unused, start at 1), plus `last_read` and `current_turn`. `push`/`append` assign a new `EventId`, `seq: None`, and `turn: current_turn` without bumping those counters. `open_turn_of` / `Session::open_turn` / `restore_open_turn` recover a `TurnStart` without `TurnEnd` from the log. `step_result_of` / `Session::step_result` look up a memoized step payload.
 
 There is no Place attach/detach event. `attach_place` / `detach_place` mutate session state only.
 
@@ -78,6 +79,8 @@ There is no Place attach/detach event. `attach_place` / `detach_place` mutate se
 | `set_config` / `config` | Session `ConfigSet` on the log. `config()` is all joined agents' maps, then last-write-wins session keys. User config is not folded in. |
 | `compact(start, end, summary)` | Marker on the log (`EventId` range). |
 | `turn_start(agent)` / `turn_end(agent)` | Allocate `next_turn_id` and set `current_turn`; `TurnEnd` still stamped with that turn, then `current_turn` cleared. |
+| `open_turn` / `restore_open_turn` | EventLog view / restore of an interrupted turn (`TurnStart` without `TurnEnd`). |
+| `step_result(turn_id, step_id)` | Memoized `StepCompleted` payload, if any. |
 | `mark_read` | Only allocator for seq ids; bumps `next_seq_id` and `last_read`. |
 | `last_read` / `next_turn_id` / `next_seq_id` | Getters (next unused values). |
 | `surface` / `events` | View vs full log. |
@@ -103,7 +106,13 @@ There is no Place attach/detach event. `attach_place` / `detach_place` mutate se
   - `LiveIdle` (or after remint) → `UserQuery` is `user_message` (user must occupy the room). `Timer` / `Trigger` append `EventBody::Wake`. Then `turn_start(agent)`.
   - Does **not** `turn_end` — the host runner ends the turn later. Does not spawn a CLI or invent `AgentMessage`.
 - `schedule(every_ms)` sets `next_due_ms = now + every_ms`. `tick(now)` wakes due sessions (`next_due_ms <= now`) then reschedules `now + every_ms`. Pass `now` (epoch ms, same clock as `Event.ts`) so tests drive the loop without sleeping.
-- `Wake` is not model-visible (`surface` omits it, like membership / turn / bind).
+- `Wake` is not model-visible (`surface` omits it, like membership / turn / bind / `StepCompleted`).
+- `begin_turn(session, holder)` opens (or attaches to) a turn under a `SessionTurnLease` (holder + fence). Remints Binding only on `NeverBound` / `PositivelyDead`. Live holder → `LiveTurnOpen`. An interrupted lease must `resume_interrupted_turn`.
+- `end_turn(session, holder, fence, interrupted)` — `false` appends `TurnEnd` and clears the lease; `true` drops the live holder and leaves the turn open on the EventLog (host crash).
+- `durable_step(session, holder, fence, turn_id, step_id, f)` — requires a live lease (fence match) and an open turn. If `StepCompleted` for `(turn_id, step_id)` is already on the Session EventLog → `Memoized` (do not run `f`). Else run `f`, append `StepCompleted`, return `Executed`. `(session, turn_id, step_id)` has at most one successful side-effect.
+- `resume_interrupted_turn(session, new_holder)` — after host crash: refuse if a live holder (`LiveTurnOpen`); restore the open turn from the EventLog; reclaim the lease with a new fence; return `(turn_id, fence, binding_id)`. Does **not** remint Binding. Re-enter the turn from the top; memoization skips completed steps.
+- Holder / fence / `SessionTurnLease` are Runtime bookkeeping, not a seventh product name. No Queue type.
+- InMemory EventLog is append-then-return (no fsync). A parked durable EventLog should fsync `StepCompleted` before `Executed` is returned.
 
 ### Grok test path
 
@@ -231,11 +240,11 @@ No HTTP for bind, unbind, compact, ask/decide, or Place swap.
 ## Honest not-implemented
 
 - No process spawn, PTY, or CLI supervisor. `Provisioner` / service probe never start a session CLI.
-- No durable store (in-memory only).
+- No durable store (in-memory only). `StepCompleted` follows the same append-then-return path; fsync-before-`Executed` waits on a durable EventLog.
 - No public ingress, auth, or multi-node replication.
 - `PlaceAttach::RecreateFromGit` / `CopyThenMount` are enums only.
 - Cloud providers are labels + fail-closed checks, not provisioners.
-- `TurnStart` / `TurnEnd` exist on the enum and `turn_start` / `turn_end` allocate turn ids; no host turn runner. `Runtime::wake` calls `turn_start` only; the host runner would `turn_end` later.
+- `TurnStart` / `TurnEnd` exist on the enum and `turn_start` / `turn_end` allocate turn ids. `Runtime::begin_turn` / `end_turn` add a lease fence for durable steps; `Runtime::wake` still only `turn_start`s. No host turn runner.
 - `Runtime::tick` is a deterministic timer pump; no background thread.
 - `AskUser` is an event, not a blocking RPC.
 - `FakeSandbox` is an in-crate hashmap, not isolation.
