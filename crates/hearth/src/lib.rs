@@ -197,7 +197,7 @@ pub(crate) fn now_ts() -> u64 {
         .unwrap_or(0)
 }
 
-/// Model-visible bodies: messages and tool I/O. Think / permission / binding stay in the log.
+/// Model-visible bodies: messages and tool I/O. Think / permission / binding / turn / `StepCompleted` / `Wake` stay in the log.
 pub fn is_model_visible(body: &EventBody) -> bool {
     matches!(
         body,
