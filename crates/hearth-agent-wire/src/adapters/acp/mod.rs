@@ -196,19 +196,7 @@ pub fn encode_frame(cmd: &AgentCommand) -> Result<WireFrame, BusError> {
             "session/compact",
             serde_json::json!({ "sessionId": session_id }),
         ),
-        other => {
-            return Err(BusError::Unsupported(match other {
-                AgentCommand::CreateProject { .. } => "CreateProject",
-                AgentCommand::OpenSession { .. } => "OpenSession",
-                AgentCommand::CloseSession { .. } => "CloseSession",
-                AgentCommand::Steer { .. } => "Steer",
-                AgentCommand::Abort { .. } => "Abort",
-                AgentCommand::ReplyQuestion { .. } => "ReplyQuestion",
-                AgentCommand::SpawnTask { .. } => "SpawnTask",
-                AgentCommand::CancelTask { .. } => "CancelTask",
-                _ => "command",
-            }))
-        }
+        other => return Err(BusError::Unsupported(other.name())),
     };
     Ok(WireFrame::Json(serde_json::json!({
         "jsonrpc": "2.0",

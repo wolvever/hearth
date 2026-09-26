@@ -78,6 +78,47 @@ pub enum AgentCommand {
         background: bool,
     },
     CancelTask { session_id: SessionId, task_id: TaskId },
+    /// Switch the session mode (plan / ask / …). Encode is a stub until slice 7.
+    SetMode { session_id: SessionId, mode_id: String },
+    /// Opaque provider feature toggle. Encode is a stub until slice 7.
+    SetFeature {
+        session_id: SessionId,
+        feature_id: String,
+        value: serde_json::Value,
+    },
+    /// Opaque MCP server map. Encode is a stub until slice 7.
+    ConfigureMcp {
+        session_id: SessionId,
+        servers: serde_json::Value,
+    },
+    RevertConversation { session_id: SessionId, message_id: String },
+    RevertFiles { session_id: SessionId, message_id: String },
+    RevertBoth { session_id: SessionId, message_id: String },
+}
+
+impl AgentCommand {
+    /// Discriminant name for `BusError::Unsupported` encode stubs.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::CreateProject { .. } => "CreateProject",
+            Self::OpenSession { .. } => "OpenSession",
+            Self::CloseSession { .. } => "CloseSession",
+            Self::UserMessage { .. } => "UserMessage",
+            Self::Steer { .. } => "Steer",
+            Self::Abort { .. } => "Abort",
+            Self::ReplyPermission { .. } => "ReplyPermission",
+            Self::ReplyQuestion { .. } => "ReplyQuestion",
+            Self::Compact { .. } => "Compact",
+            Self::SpawnTask { .. } => "SpawnTask",
+            Self::CancelTask { .. } => "CancelTask",
+            Self::SetMode { .. } => "SetMode",
+            Self::SetFeature { .. } => "SetFeature",
+            Self::ConfigureMcp { .. } => "ConfigureMcp",
+            Self::RevertConversation { .. } => "RevertConversation",
+            Self::RevertFiles { .. } => "RevertFiles",
+            Self::RevertBoth { .. } => "RevertBoth",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -177,6 +218,18 @@ pub enum AgentEvent {
     },
     CompactStarted { session_id: SessionId },
     Compacted { session_id: SessionId },
+    /// Session mode list / current mode. Decoders may emit this before encode lands.
+    ModeChanged {
+        session_id: SessionId,
+        mode_id: Option<String>,
+        available: Vec<ModeInfo>,
+    },
+    /// Conversation and/or files rewound to `message_id`.
+    Rewound {
+        session_id: SessionId,
+        kind: RewindKind,
+        message_id: String,
+    },
     Status {
         session_id: SessionId,
         busy: bool,
@@ -199,6 +252,22 @@ pub struct PermissionOption {
     pub option_id: String,
     pub name: String,
     pub kind: String,
+}
+
+/// One selectable session mode on [`AgentEvent::ModeChanged`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModeInfo {
+    pub mode_id: String,
+    pub name: Option<String>,
+}
+
+/// Which surface a revert command or [`AgentEvent::Rewound`] applied to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RewindKind {
+    Conversation,
+    Files,
+    Both,
 }
 
 #[derive(Debug, Error)]
@@ -468,6 +537,95 @@ mod tests {
         let v = serde_json::to_value(&c).unwrap();
         let back: AgentCommand = serde_json::from_value(v).unwrap();
         assert_eq!(c, back);
+    }
+
+    fn slice2_commands() -> Vec<AgentCommand> {
+        vec![
+            AgentCommand::SetMode {
+                session_id: "s".into(),
+                mode_id: "plan".into(),
+            },
+            AgentCommand::SetFeature {
+                session_id: "s".into(),
+                feature_id: "thinking".into(),
+                value: serde_json::json!(true),
+            },
+            AgentCommand::ConfigureMcp {
+                session_id: "s".into(),
+                servers: serde_json::json!({"docs": {"command": "mcp-docs"}}),
+            },
+            AgentCommand::RevertConversation {
+                session_id: "s".into(),
+                message_id: "m1".into(),
+            },
+            AgentCommand::RevertFiles {
+                session_id: "s".into(),
+                message_id: "m1".into(),
+            },
+            AgentCommand::RevertBoth {
+                session_id: "s".into(),
+                message_id: "m1".into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn slice2_command_names_are_exhaustive() {
+        let names: Vec<&str> = slice2_commands().iter().map(AgentCommand::name).collect();
+        assert_eq!(
+            names,
+            [
+                "SetMode",
+                "SetFeature",
+                "ConfigureMcp",
+                "RevertConversation",
+                "RevertFiles",
+                "RevertBoth",
+            ]
+        );
+    }
+
+    #[test]
+    fn slice2_commands_serde_roundtrip() {
+        for c in slice2_commands() {
+            let v = serde_json::to_value(&c).unwrap();
+            let back: AgentCommand = serde_json::from_value(v).unwrap();
+            assert_eq!(c, back);
+        }
+    }
+
+    #[test]
+    fn slice2_events_serde_roundtrip() {
+        let events = [
+            AgentEvent::ModeChanged {
+                session_id: "s".into(),
+                mode_id: Some("plan".into()),
+                available: vec![ModeInfo {
+                    mode_id: "plan".into(),
+                    name: Some("Plan".into()),
+                }],
+            },
+            AgentEvent::Rewound {
+                session_id: "s".into(),
+                kind: RewindKind::Conversation,
+                message_id: "m1".into(),
+            },
+            AgentEvent::Rewound {
+                session_id: "s".into(),
+                kind: RewindKind::Files,
+                message_id: "m1".into(),
+            },
+            AgentEvent::Rewound {
+                session_id: "s".into(),
+                kind: RewindKind::Both,
+                message_id: "m1".into(),
+            },
+        ];
+        for ev in events {
+            let v = serde_json::to_value(&ev).unwrap();
+            let back: AgentEvent = serde_json::from_value(v).unwrap();
+            assert_eq!(ev, back);
+        }
     }
 
     #[test]

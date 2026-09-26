@@ -31,8 +31,11 @@ not Paseo session persistence / token streaming.
 
 ## Reserved (later slices — all false until they land)
 
-Catalog, SetMode / MCP, rewind, and session listing are out of this crate
-slice. Columns exist so the matrix test stays closed when those flags flip.
+`SetMode` / `SetFeature` / `ConfigureMcp` / `Revert*` and `ModeChanged` /
+`Rewound` exist as append-only stubs. Encoders return `Unsupported`; these
+flags stay `false` until a later encode-depth slice. Catalog and session
+listing remain later. Columns exist so the matrix test stays closed when
+those flags flip.
 
 | Agent | Folder | streaming | session_persistence | session_listing | dynamic_modes | mcp_servers | rewind_conversation | rewind_files | rewind_both |
 |-------|--------|:---------:|:-------------------:|:---------------:|:-------------:|:-----------:|:-------------------:|:------------:|:-----------:|

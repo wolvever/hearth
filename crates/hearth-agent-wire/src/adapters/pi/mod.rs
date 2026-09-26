@@ -128,7 +128,7 @@ impl AdapterCodec for PiCodec {
                 "type": "abort",
                 "sessionId": session_id,
             }),
-            _ => return Err(BusError::Unsupported("pi command stub")),
+            _ => return Err(BusError::Unsupported(cmd.name())),
         };
         Ok(WireFrame::Json(body))
     }
