@@ -1,0 +1,9 @@
+{
+  "type": "permission.asked",
+  "properties": {
+    "sessionID": "s1",
+    "id": "perm-1",
+    "title": "Allow shell?",
+    "options": [{"option_id": "allow", "name": "Allow", "kind": "allow_once"}]
+  }
+}

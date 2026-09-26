@@ -1,0 +1,7 @@
+{
+  "type": "tool.start",
+  "sessionId": "s1",
+  "callId": "c1",
+  "name": "bash",
+  "arguments": {"cmd": "ls"}
+}

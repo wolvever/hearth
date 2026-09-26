@@ -1,0 +1,6 @@
+{
+  "type": "run.start",
+  "lane": "main",
+  "runId": "run-1",
+  "sessionId": "s1"
+}

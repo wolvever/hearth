@@ -1,0 +1,19 @@
+[package]
+name = "hearth-agent-bus"
+version = "0.1.0"
+edition = "2021"
+description = "Unified coding-agent event bus for Hearth (Grok Build / Codex / Pi / OpenCode)"
+license = "MIT"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "hearth-agent-bus"
+path = "src/main.rs"
+
+[dependencies]
+hearth = { path = "../hearth" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"

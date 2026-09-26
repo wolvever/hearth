@@ -152,6 +152,7 @@ hosts! {
     OpenCode => "opencode",
     Goose => "goose",
     Grok => "grok",
+    GrokBuild => "grok_build",
 }
 
 /// `XAI_API_KEY` or `GROK_API_KEY`. Missing or empty → `None`.
