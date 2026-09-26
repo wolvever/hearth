@@ -3,7 +3,7 @@
 //! # Contrib layout
 //! One folder per agent under `adapters/<name>/`:
 //! - `mod.rs` — `map_*` + [`AdapterCodec`] impl
-//! - `README.md` — wire, capabilities, how to run fixtures
+//! - `README.md` — wire, `CapabilityFlags`, how to run fixtures
 //! - `fixtures/*.json` — captured native frames for `map_*` tests
 //!
 //! Generic ACP catalog agents start from [`acp`]. Never scrape unstructured
@@ -16,7 +16,7 @@ pub mod opencode;
 pub mod pi;
 
 use crate::transport::WireFrame;
-use crate::{AgentCommand, AgentEvent, AgentKind, BusError};
+use crate::{AgentCommand, AgentEvent, AgentKind, BusError, CapabilityFlags};
 
 /// Maps framed protocol messages ↔ unified wire types. Pure; no I/O.
 pub trait AdapterCodec: Send + Sync {
@@ -34,7 +34,8 @@ pub struct AdapterInfo {
     pub name: &'static str,
     pub wire: &'static str,
     pub folder: &'static str,
-    pub capabilities: &'static [&'static str],
+    /// Typed flags — must match the `CAPABILITIES.md` matrix for this row.
+    pub flags: CapabilityFlags,
 }
 
 /// Registry of built-in adapters — add a row when you land a new agent folder.
@@ -45,64 +46,35 @@ pub fn registry() -> &'static [AdapterInfo] {
             name: "grok_build",
             wire: "jsonrpc-content-length",
             folder: "adapters/grok_build",
-            capabilities: &[
-                "session",
-                "message",
-                "tool",
-                "plan",
-                "permission",
-                "thinking",
-            ],
+            flags: CapabilityFlags::for_agent(AgentKind::GrokBuild),
         },
         AdapterInfo {
             kind: AgentKind::Codex,
             name: "codex",
             wire: "jsonrpc-content-length",
             folder: "adapters/codex",
-            capabilities: &[
-                "session",
-                "message",
-                "tool",
-                "thinking",
-                "compact",
-                "permission",
-            ],
+            flags: CapabilityFlags::for_agent(AgentKind::Codex),
         },
         AdapterInfo {
             kind: AgentKind::Pi,
             name: "pi",
             wire: "websocket-json",
             folder: "adapters/pi",
-            capabilities: &["session", "message", "tool", "subagent"],
+            flags: CapabilityFlags::for_agent(AgentKind::Pi),
         },
         AdapterInfo {
             kind: AgentKind::OpenCode,
             name: "opencode",
             wire: "http-sse",
             folder: "adapters/opencode",
-            capabilities: &[
-                "session",
-                "message",
-                "tool",
-                "permission",
-                "question",
-                "thinking",
-                "compact",
-            ],
+            flags: CapabilityFlags::for_agent(AgentKind::OpenCode),
         },
         AdapterInfo {
             kind: AgentKind::Acp,
             name: "acp",
             wire: "jsonrpc-content-length",
             folder: "adapters/acp",
-            capabilities: &[
-                "session",
-                "message",
-                "tool",
-                "plan",
-                "permission",
-                "thinking",
-            ],
+            flags: CapabilityFlags::for_agent(AgentKind::Acp),
         },
     ]
 }

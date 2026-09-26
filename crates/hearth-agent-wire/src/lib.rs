@@ -17,10 +17,12 @@
 //! - SoftExpiring / Flush-before-dispatch stay parked — not in this crate.
 
 pub mod adapters;
+pub mod capabilities;
 pub mod host;
 pub mod transport;
 
 pub use adapters::{lookup, registry, AdapterCodec, AdapterInfo};
+pub use capabilities::CapabilityFlags;
 pub use host::{binding_kind, event_bodies, host_for, AttachError, AttachResult, HostAttach};
 pub use transport::{
     JsonRpcTransport, SseFrame, SseTransport, Transport, WebSocketJsonTransport, WireFrame,
@@ -526,7 +528,7 @@ mod tests {
     #[test]
     fn registry_discoverable() {
         assert_eq!(crate::registry().len(), 5);
-        assert!(crate::lookup(AgentKind::Pi).unwrap().capabilities.contains(&"subagent"));
+        assert!(crate::lookup(AgentKind::Pi).unwrap().flags.subagent);
         assert_eq!(
             crate::lookup(AgentKind::Acp).unwrap().wire,
             "jsonrpc-content-length"

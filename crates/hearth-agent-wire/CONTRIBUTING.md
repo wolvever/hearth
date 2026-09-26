@@ -37,8 +37,10 @@ src/adapters/<name>/
    (already-decoded JSON objects, not raw process dumps).
 4. **Implement** `map_*` / `map_notification` and `AdapterCodec`
    (`decode_event`, `encode_command` stubs for the commands you support).
-5. **Register** a row in `adapters::registry()` and a column in
-   `CAPABILITIES.md`.
+5. **Register** a row in `adapters::registry()` with typed
+   `CapabilityFlags` (via `CapabilityFlags::for_agent` / a new associated
+   const) and matching cells in `CAPABILITIES.md`. The
+   `capabilities_matrix_matches_registry` test fails if they drift.
 6. **Tests:** `map_*` tests that `include`/`read` fixtures; optionally a
    `FramedAgent<YourTransport, YourCodec>` round-trip.
 7. `cargo test` — keep green.
