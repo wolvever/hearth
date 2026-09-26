@@ -27,12 +27,16 @@ pub type AttachResult<T> = std::result::Result<T, AttachError>;
 
 /// Binding `kind` string for an [`AgentKind`]. [`AgentKind::GrokBuild`] is
 /// `grok_build`, distinct from chat [`HostKind::Grok`] (`grok`).
+/// [`AgentKind::Acp`] is `"acp"` — `HostKind` has no Acp variant; [`host_for`]
+/// goes through [`Host::from_bind`] → [`Host::Other`]. Claude later uses the
+/// existing [`HostKind::ClaudeCode`] (`claude_code`).
 pub fn binding_kind(kind: AgentKind) -> &'static str {
     match kind {
         AgentKind::GrokBuild => HostKind::GrokBuild.as_str(),
         AgentKind::Codex => HostKind::Codex.as_str(),
         AgentKind::Pi => HostKind::Pi.as_str(),
         AgentKind::OpenCode => HostKind::OpenCode.as_str(),
+        AgentKind::Acp => "acp",
     }
 }
 
@@ -452,6 +456,21 @@ mod tests {
             .count();
         assert_eq!(compact_count, 1);
         assert_eq!(session.bindings().unwrap()[0].id, attach.binding().id);
+    }
+
+    #[test]
+    fn acp_binding_kind_is_host_other() {
+        assert_eq!(binding_kind(AgentKind::Acp), "acp");
+        let host = host_for(AgentKind::Acp, Some("native-acp".into()), None);
+        assert_eq!(host.kind_str(), "acp");
+        assert!(matches!(
+            &host,
+            Host::Other {
+                kind,
+                native_resume_id: Some(id),
+                sandbox_id: None,
+            } if kind == "acp" && id == "native-acp"
+        ));
     }
 
     #[test]

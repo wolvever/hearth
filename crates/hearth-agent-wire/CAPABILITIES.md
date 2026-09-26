@@ -4,6 +4,7 @@ Wires: `jsonrpc-content-length` | `http-sse` | `websocket-json`
 
 | Agent | Folder | Wire | session | message | tool | thinking | plan | permission | question | compact | subagent/task |
 |-------|--------|------|:-------:|:-------:|:----:|:--------:|:----:|:----------:|:--------:|:-------:|:-------------:|
+| ACP (generic) | `adapters/acp` | jsonrpc-content-length | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | | stub | |
 | Grok Build | `adapters/grok_build` | jsonrpc-content-length | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | | stub | |
 | Codex | `adapters/codex` | jsonrpc-content-length | ✓ | ✓ | ✓ | ✓ | | stub | | ✓ | |
 | Pi | `adapters/pi` | websocket-json | ✓ | ✓ | ✓ | | | | | | ✓ |

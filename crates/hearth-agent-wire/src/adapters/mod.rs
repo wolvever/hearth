@@ -6,8 +6,10 @@
 //! - `README.md` — wire, capabilities, how to run fixtures
 //! - `fixtures/*.json` — captured native frames for `map_*` tests
 //!
-//! Never scrape unstructured stdout/stderr. Transports deliver [`WireFrame`]s.
+//! Generic ACP catalog agents start from [`acp`]. Never scrape unstructured
+//! stdout/stderr. Transports deliver [`WireFrame`]s.
 
+pub mod acp;
 pub mod codex;
 pub mod grok_build;
 pub mod opencode;
@@ -43,7 +45,14 @@ pub fn registry() -> &'static [AdapterInfo] {
             name: "grok_build",
             wire: "jsonrpc-content-length",
             folder: "adapters/grok_build",
-            capabilities: &["session", "message", "tool", "plan", "permission", "thinking"],
+            capabilities: &[
+                "session",
+                "message",
+                "tool",
+                "plan",
+                "permission",
+                "thinking",
+            ],
         },
         AdapterInfo {
             kind: AgentKind::Codex,
@@ -81,6 +90,20 @@ pub fn registry() -> &'static [AdapterInfo] {
                 "compact",
             ],
         },
+        AdapterInfo {
+            kind: AgentKind::Acp,
+            name: "acp",
+            wire: "jsonrpc-content-length",
+            folder: "adapters/acp",
+            capabilities: &[
+                "session",
+                "message",
+                "tool",
+                "plan",
+                "permission",
+                "thinking",
+            ],
+        },
     ]
 }
 
@@ -95,6 +118,7 @@ pub fn map_native(kind: AgentKind, raw: &serde_json::Value) -> Result<AgentEvent
         AgentKind::Codex => codex::map_notification(raw),
         AgentKind::Pi => pi::map_event(raw),
         AgentKind::OpenCode => opencode::map_event(raw),
+        AgentKind::Acp => acp::map_notification(raw, AgentKind::Acp),
     }
 }
 
@@ -105,6 +129,7 @@ pub fn decode_frame(kind: AgentKind, frame: &WireFrame) -> Result<Option<AgentEv
         AgentKind::Codex => codex::CodexCodec.decode_event(frame),
         AgentKind::Pi => pi::PiCodec.decode_event(frame),
         AgentKind::OpenCode => opencode::OpenCodeCodec.decode_event(frame),
+        AgentKind::Acp => acp::AcpCodec.decode_event(frame),
     }
 }
 
@@ -113,10 +138,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registry_lists_four_agents() {
+    fn registry_lists_five_agents() {
         let r = registry();
-        assert_eq!(r.len(), 4);
-        assert!(lookup(AgentKind::GrokBuild).unwrap().wire.contains("jsonrpc"));
+        assert_eq!(r.len(), 5);
+        assert!(lookup(AgentKind::GrokBuild)
+            .unwrap()
+            .wire
+            .contains("jsonrpc"));
         assert_eq!(lookup(AgentKind::OpenCode).unwrap().wire, "http-sse");
+        assert_eq!(
+            lookup(AgentKind::Acp).unwrap().wire,
+            "jsonrpc-content-length"
+        );
     }
 }

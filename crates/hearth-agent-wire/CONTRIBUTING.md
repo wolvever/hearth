@@ -20,6 +20,7 @@ without touching Host/Session/Binding or scraping logs.
 ## Afternoon checklist
 
 ```text
+src/adapters/acp/     # generic ACP map — base for catalog agents
 src/adapters/<name>/
   mod.rs              # map_* + AdapterCodec impl
   README.md           # wire, capabilities, fixture table
@@ -29,7 +30,9 @@ src/adapters/<name>/
 1. **Pick a wire** from the allowed list. Reuse `JsonRpcTransport`,
    `SseTransport`, or `WebSocketJsonTransport`. Add a new transport only if
    none fit — still framed, never log-scraping.
-2. **Copy a sibling folder** (`grok_build` for JSON-RPC, `opencode` for SSE).
+2. **Copy a sibling folder.** Start from `adapters/acp` for catalog / generic
+   ACP agents (Cursor, Copilot, …). Use `grok_build` for a Grok-specific ACP
+   profile, `opencode` for SSE, `pi` for WebSocket JSON.
 3. **Drop 2–3 fixtures** under `fixtures/` from a real session capture
    (already-decoded JSON objects, not raw process dumps).
 4. **Implement** `map_*` / `map_notification` and `AdapterCodec`
