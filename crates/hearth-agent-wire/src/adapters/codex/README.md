@@ -12,5 +12,5 @@
 | `fixtures/turn_started.json` | `AgentEvent::TurnStarted` |
 
 ```bash
-cargo test -p hearth_agent_bus codex::
+cargo test -p hearth-agent-wire codex::
 ```

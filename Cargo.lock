@@ -234,7 +234,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "hearth-agent-bus"
+name = "hearth-agent-wire"
 version = "0.1.0"
 dependencies = [
  "hearth",

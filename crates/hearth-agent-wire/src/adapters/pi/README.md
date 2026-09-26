@@ -7,5 +7,5 @@
 Snapshot + watch; events are not replayed on reconnect (native semantics).
 
 ```bash
-cargo test -p hearth_agent_bus pi::
+cargo test -p hearth-agent-wire pi::
 ```

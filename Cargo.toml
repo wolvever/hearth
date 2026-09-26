@@ -2,7 +2,7 @@
 resolver = "2"
 members = [
     "crates/hearth",
-    "crates/hearth-agent-bus",
+    "crates/hearth-agent-wire",
     "crates/hearth-paseo",
     "crates/hearth-managed",
     "crates/hearth-service",

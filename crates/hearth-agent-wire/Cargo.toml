@@ -1,15 +1,15 @@
 [package]
-name = "hearth-agent-bus"
+name = "hearth-agent-wire"
 version = "0.1.0"
 edition = "2021"
-description = "Unified coding-agent event bus for Hearth (Grok Build / Codex / Pi / OpenCode)"
+description = "Unified coding-agent wire for Hearth (Grok Build / Codex / Pi / OpenCode)"
 license = "MIT"
 
 [lib]
 path = "src/lib.rs"
 
 [[bin]]
-name = "hearth-agent-bus"
+name = "hearth-agent-wire"
 path = "src/main.rs"
 
 [dependencies]

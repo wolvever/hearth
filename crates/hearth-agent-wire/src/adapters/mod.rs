@@ -16,7 +16,7 @@ pub mod pi;
 use crate::transport::WireFrame;
 use crate::{AgentCommand, AgentEvent, AgentKind, BusError};
 
-/// Maps framed protocol messages ↔ unified bus types. Pure; no I/O.
+/// Maps framed protocol messages ↔ unified wire types. Pure; no I/O.
 pub trait AdapterCodec: Send + Sync {
     fn kind(&self) -> AgentKind;
     /// Preferred wire for this agent (discovery / CAPABILITIES matrix).

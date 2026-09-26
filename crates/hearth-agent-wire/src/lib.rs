@@ -1,4 +1,4 @@
-//! Unified coding-agent bus for Hearth.
+//! Unified coding-agent wire for Hearth.
 //!
 //! Normalizes Grok Build (ACP), Codex App Server, Pi harness, and OpenCode
 //! SSE into one `AgentEvent` / `AgentCommand` vocabulary so Hearth can talk

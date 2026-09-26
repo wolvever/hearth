@@ -36,7 +36,7 @@ pub fn binding_kind(kind: AgentKind) -> &'static str {
     }
 }
 
-/// Typed [`Host`] ticket for a bus agent kind. Does not mint a Binding.
+/// Typed [`Host`] ticket for an agent-wire kind. Does not mint a Binding.
 pub fn host_for(
     kind: AgentKind,
     native_resume_id: Option<String>,
@@ -433,7 +433,7 @@ mod tests {
                 Some(WorkingState {
                     objective: "ship bus".into(),
                     next: "review".into(),
-                    touched_files: vec!["crates/hearth-agent-bus/src/host.rs".into()],
+                    touched_files: vec!["crates/hearth-agent-wire/src/host.rs".into()],
                 }),
             )
             .unwrap();
