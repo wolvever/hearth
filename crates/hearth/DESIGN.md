@@ -1,6 +1,6 @@
 # hearth
 
-Session-first kernel. Six product names: **User**, **Agent**, **Session**, **Binding**, **Event**, **Place**. `Store` / `InMemory` persist them; `Provisioner` records a `Binding` without spawning a CLI; `FakeSandbox` is a host-side file map keyed by `sandbox_id`. None of those is a seventh concept. `Runtime` keeps Sessions so an Agent can wake on user queries, timers, and triggers — same class as Store / Provisioner / Host / FakeSandbox, not a seventh name.
+Session-first kernel. Six product names: **User**, **Agent**, **Session**, **Binding**, **Event**, **Place**. `Store` / `InMemory` persist them; `Provisioner` records a `Binding` without spawning a CLI; `FakeSandbox` is a host-side file map keyed by `sandbox_id`; `PlaceMemory` is durable memory files under a Place **claim**. None of those is a seventh concept. `Runtime` keeps Sessions so an Agent can wake on user queries, timers, and triggers — same class as Store / Provisioner / Host / FakeSandbox / PlaceMemory, not a seventh name.
 
 ## Six concepts
 
@@ -9,7 +9,7 @@ Session-first kernel. Six product names: **User**, **Agent**, **Session**, **Bin
 3. **Session** — joinable room: membership + one append-only `Event` log + current bindings + a map of `Place`s keyed by `PlaceId`. Exists with zero bindings and zero places. `unbind` never deletes the room, the log, or any place.
 4. **Binding** — disposable runtime: `id`, `kind` (string; `HostKind` is only a helper, not a type), optional `native_resume_id`, optional `sandbox_id`, optional `agent`. Native resume tokens live here, never on `Session.id`. `agent` names whose runtime this is so `leave` can unbind only that agent's Bindings.
 5. **Event** — `{ id, seq?, turn?, ts, body }`. `Event.id` (`EventId`) is identity. `seq` is an optional last-read cursor, allocated only by `mark_read`, never on append. `turn` is the open turn at append time. One log per Session. High-traffic cloud appends do not serialize on an integer counter.
-6. **Place** — locator attached to a Session (zero or many): `id` (`PlaceId`), `provider`, `instance`, `os`, `attach`. One laptop, many folders (many `LocalDir` places) plus maybe a VM. Same `provider`+`instance` is one row. Not an Environment recipe.
+6. **Place** — locator attached to a Session (zero or many): `id` (`PlaceId`), `provider`, `instance`, `os`, `attach`. One laptop, many folders (many `LocalDir` places) plus maybe a VM. Same `provider`+`instance` is one row. Not an Environment recipe. Durable agent memory is files under a Place claim (`PlaceMemory`), not a field on this locator and not a seventh noun.
 
 A member is `UserId` or `AgentId`. One agent may sit in many sessions; one session may hold many users and agents. Only a joined user may `user_message` or `decide_permission`.
 
@@ -51,7 +51,7 @@ A member is `UserId` or `AgentId`. One agent may sit in many sessions; one sessi
 - `TurnStart { agent }` / `TurnEnd { agent }`
 - `StepCompleted { turn_id, step_id, result }` — intra-turn durable-step checkpoint (string payload). Not model-visible.
 - `BindingAttached { binding }` / `BindingReleased { binding }`
-- `Compact { start, end, summary }` — replaces `[start, end]` (inclusive `EventId` range in log order) in `surface`; full log keeps originals and the marker
+- `Compact { start, end, summary }` — replaces `[start, end]` (inclusive `EventId` range in log order) in `surface`; full log keeps originals and the marker. Product path (`compact_with_handoff`) sets `summary` to a Place-path bridge after flushing `memory/handoff.md`; `compact` alone is the EventLog primitive and does not write memory.
 - `Wake { source }` — Runtime timer/trigger marker (`WakeSource`: `UserQuery` / `Timer` / `Trigger { name }`). Not model-visible. User queries are `UserMessage` alone so they are not doubled.
 
 `events()` is the full log. `surface()` / `surface_of` / `is_model_visible` keep only `UserMessage`, `AgentMessage`, `ToolCall`, `ToolResult`, `Compact`, and hide events whose `id` lies in any Compact's inclusive log-order range (`start`/`end` EventIds; missing ids hide nothing). Think, permission, bind, membership, turn, `StepCompleted`, and `Wake` stay in `events()` only. `SessionData` holds `next_turn_id` and `next_seq_id` (next unused, start at 1), plus `last_read` and `current_turn`. `push`/`append` assign a new `EventId`, `seq: None`, and `turn: current_turn` without bumping those counters. `open_turn_of` / `Session::open_turn` / `restore_open_turn` recover a `TurnStart` without `TurnEnd` from the log. `step_result_of` / `Session::step_result` look up a memoized step payload.
@@ -77,9 +77,9 @@ There is no Place attach/detach event. `attach_place` / `detach_place` mutate se
 | `ask_user` / `ask_permission` | Append events. No protocol. |
 | `decide_permission(request, allowed, by)` | Decider must occupy the room. |
 | `set_config` / `config` | Session `ConfigSet` on the log. `config()` is all joined agents' maps, then last-write-wins session keys. User config is not folded in. |
-| `compact(start, end, summary)` | Marker on the log (`EventId` range). |
+| `compact(start, end, summary)` | EventLog primitive: marker on the log (`EventId` range). Does **not** flush Place memory. |
 | `turn_start(agent)` / `turn_end(agent)` | Allocate `next_turn_id` and set `current_turn`; `TurnEnd` still stamped with that turn, then `current_turn` cleared. |
-| `open_turn` / `restore_open_turn` | EventLog view / restore of an interrupted turn (`TurnStart` without `TurnEnd`). |
+| `compact_with_handoff(memory, binding, start, end, working)` | **PreCompactHandoff**: require the Place is attached; flush `working` into `memory/handoff.md` under the Binding's Place claim; append `Compact` whose summary *references* Place paths. Does not remint Binding. |
 | `step_result(turn_id, step_id)` | Memoized `StepCompleted` payload, if any. |
 | `mark_read` | Only allocator for seq ids; bumps `next_seq_id` and `last_read`. |
 | `last_read` / `next_turn_id` / `next_seq_id` | Getters (next unused values). |
@@ -140,6 +140,55 @@ XAI_API_KEY=... cargo test -p hearth --test grok_keep_wake -- --nocapture
 
 Same `provider`+`instance` re-attach overwrites that row (reuses its `PlaceId`). Different folders on one laptop are many `LocalDir` places. Cloud/`RecreateFromGit`/`CopyThenMount` are stored labels; this crate does not provision VMs or clone repos.
 
+## Place-backed memory
+
+Durable memory is **files under a Place claim**, not Session EventLog compaction and not a seventh noun. `PlaceMemory` composes with `Place` / `Session` / `Binding` the way `FakeSandbox` composes with `sandbox_id`. No Queue. SoftExpiring pile and Flush-before-dispatch stay parked.
+
+| Layer | Path (under Place) | Load policy |
+| --- | --- | --- |
+| Instructions | `AGENTS.md` | Always inject (human-authored) |
+| Index | `memory/MEMORY.md` | Always inject, **byte-capped** (`SUMMARY_BYTE_CAP`) |
+| User slice | `memory/USER.md` | Always inject when present, capped |
+| Topics | `memory/topics/*.md` | On demand via `read_topic` |
+| Handoff | `memory/handoff.md` | Flush **before** EventLog compact; bridge points here |
+| Skills | `skills/*/SKILL.md` | Procedural; load when relevant (`read_skill`) |
+
+### Invariants
+
+1. **Inject index only** — `inject(session_cwd)` returns `AGENTS.md` + capped `MEMORY.md` + optional capped `USER.md`. Never dump topics/skills every turn.
+2. **Writes require Place claim** (keep-as-claim). `acquire_claim(binding)` / `release_claim` / `transfer_claim`. No claim → `NoPlaceClaim`. A second Binding without transfer → `SplitBrain`.
+3. **PreCompactHandoff** — `compact_with_handoff` / `PlaceMemory::compact_bridge` flush `WorkingState` into `handoff.md` before the EventLog `Compact` marker. The compact summary *references* `place://{PlaceId}/memory/handoff.md` + `MEMORY.md`. It does not inline the handbook.
+4. **Cross-agent** = same Place + claim transfer. Session and Binding ids stay (no remint).
+5. **Scope** — optional `applies_to` cwd. Foreign `session_cwd` still gets `AGENTS.md`, not the memory index / user slice.
+
+`Session::compact` remains the EventLog primitive (used by tests that only hide a range). The product path is `compact_with_handoff`.
+
+### Documented holes
+
+These `MemoryPolicy` variants exist so the holes stay testable. They are not production defaults.
+
+| Hole | What goes wrong |
+| --- | --- |
+| `NaiveInjectFullHandbook` | Every turn dumps `MEMORY.md` + all topics → context blowup |
+| `NaiveCompactWithoutHandoff` | Compact summary is transcript-only; `handoff.md` is never written → working state lost |
+| `NaiveWriteWithoutClaim` | Writes succeed without the Place claim → split-brain concurrent edits |
+
+`MemoryPolicy::PlaceBacked` is the correct path.
+
+### API
+
+```
+PlaceMemory::new(place_id, MemoryPolicy::PlaceBacked)
+PlaceMemory::for_place(&place, policy)
+acquire_claim / release_claim / transfer_claim / claim_holder
+set_agents_md / set_memory_md / set_user_md / put_topic / put_skill / set_applies_to_cwd
+inject(session_cwd) -> InjectedContext
+flush_handoff(WorkingState) / compact_bridge(...) / handoff()
+Session::compact_with_handoff(memory, binding, start, end, working)
+```
+
+Writes take the claiming `BindingId`. `transfer_claim(from, to)` moves the claim; it does not remint Binding or Session.
+
 ## Join / leave / unbind / place
 
 - `join` is occupancy only — no Binding, no Place.
@@ -154,9 +203,9 @@ Shared host folder/VM is still `Binding.sandbox_id` (option A: two Bindings, sam
 
 **Environment** (Claude Managed Agents / Tag recipe: isolation, runtime image, recycle) is **not** a kernel type. Adapters map it to `Binding.sandbox_id` + `kind`. Recycle = unbind old Binding, bind a new one on the same Session, replay `surface`.
 
-**Place** is the sixth kernel type: attach locator on the Session. It outlives Bindings. It is not an Environment recipe and does not store files.
+**Place** is the sixth kernel type: attach locator on the Session. It outlives Bindings. It is not an Environment recipe. The locator struct does not store files.
 
-`FakeSandbox` is host map (`sandbox_id → path → text`), not a Binding and not Place.
+`PlaceMemory` is the Place-claim file map (`AGENTS.md`, `memory/*`, `skills/*`) — same class as `FakeSandbox`, not a seventh name. `FakeSandbox` is host map (`sandbox_id → path → text`), not a Binding and not Place.
 
 ## Refused kernel types
 
@@ -167,7 +216,7 @@ Claude Tag **channel** and Multica **Issue** are Sessions in adapters. MA **Sess
 ## Layout
 
 ```
-crates/hearth/           kernel (lib.rs, host.rs, place.rs, sandbox.rs, runtime.rs)
+crates/hearth/           kernel (lib.rs, host.rs, place.rs, place_memory.rs, sandbox.rs, runtime.rs)
 crates/hearth-paseo/     Paseo name map (no daemon / worktree supervisor)
 crates/hearth-managed/   MA / Tag name map
 crates/hearth-service/   local HTTP + WebSocket
@@ -248,6 +297,8 @@ No HTTP for bind, unbind, compact, ask/decide, or Place swap.
 - `Runtime::tick` is a deterministic timer pump; no background thread.
 - `AskUser` is an event, not a blocking RPC.
 - `FakeSandbox` is an in-crate hashmap, not isolation.
+- `PlaceMemory` is an in-crate file map (not fsync'd onto `LocalDir`). A durable Place would persist the same paths.
+- SoftExpiring pile / DualGate / AdmitCommit and Flush-before-dispatch stay **parked**.
 - Adapters (`hearth-paseo`, `hearth-managed`) convert names; they do not embed those products.
 
 
