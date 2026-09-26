@@ -5,7 +5,7 @@
 //! binding without starting a CLI. Occupancy is session membership; ask/decide
 //! and config live as events or identity maps, not extra types. Channel, Thread,
 //! Issue, and Squad stay out of the kernel.
-//! A Session may hold many [`Place`] locators (not Environment). Bindings may share `sandbox_id`. Claude Tag channels and Multica issues are sessions in adapters. [`FakeSandbox`] is host-side demo state. [`Runtime`] is the same class as Store / Provisioner / Host / FakeSandbox — not a seventh name.
+//! A Session may hold many [`Place`] locators (not Environment). Bindings may share `sandbox_id`. Claude Tag channels and Multica issues are sessions in adapters. [`FakeSandbox`] is host-side demo state. [`PlaceMemory`] is Place-backed durable memory (files under a Place claim; not EventLog compaction). [`Runtime`] is the same class as Store / Provisioner / Host / FakeSandbox / PlaceMemory — not a seventh name.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -16,9 +16,14 @@ use uuid::Uuid;
 
 mod sandbox;
 mod place;
+mod place_memory;
 mod host;
 mod runtime;
 pub use place::{Place, PlaceAttach, PlaceOs, PlaceProvider};
+pub use place_memory::{
+    cross_agent_write, skill_path, topic_path, InjectedContext, MemoryFiles, MemoryPolicy,
+    PlaceMemory, WorkingState, AGENTS_MD, HANDOFF_MD, MEMORY_MD, SUMMARY_BYTE_CAP, USER_MD,
+};
 pub use sandbox::FakeSandbox;
 pub use host::{
     grok_api_key, Host, HostKind, HostTicket, ClaudeCode as ClaudeCodeHost, Codex as CodexHost,
@@ -136,6 +141,7 @@ pub enum EventBody {
     BindingAttached { binding: BindingId },
     BindingReleased { binding: BindingId },
     /// Replaces `[start, end]` (inclusive EventId range in log order) in [`Session::surface`]. Full log keeps both.
+    /// Product compact path: [`Session::compact_with_handoff`] (PreCompactHandoff).
     Compact { start: EventId, end: EventId, summary: String },
     /// Runtime wake marker (Timer / Trigger). Not model-visible.
     Wake { source: WakeSource },
@@ -165,6 +171,18 @@ pub enum Error {
     PlaceProviderSwap,
     #[error("unknown place {0:?}")]
     UnknownPlace(PlaceId),
+    /// Place-backed memory write without a claim (keep-as-claim).
+    #[error("no place claim")]
+    NoPlaceClaim,
+    /// Another Binding already holds the Place memory claim.
+    #[error("place claim split-brain")]
+    SplitBrain,
+    /// Compact path ran without flushing `memory/handoff.md`.
+    #[error("compact lost working state")]
+    CompactLostWorkingState,
+    /// On-demand topic/skill is not in the Place memory files.
+    #[error("memory topic missing: {0}")]
+    TopicMissing(String),
     #[error("session {0:?} is not kept")]
     NotKept(SessionId),
     #[error("prompt waiting ({0:?})")]
@@ -684,12 +702,30 @@ impl Session {
     }
 
     /// Append a compaction marker. Replaced EventIds stay in [`Self::events`], drop from [`Self::surface`].
+    ///
+    /// This is the EventLog primitive. The product path is
+    /// [`Self::compact_with_handoff`]: flush Place `handoff.md` first, then
+    /// store a summary that *references* Place paths (see `NaiveCompactWithoutHandoff`).
     pub fn compact(&self, start: EventId, end: EventId, summary: impl Into<String>) -> Result<Event> {
         self.append(EventBody::Compact {
             start,
             end,
             summary: summary.into(),
         })
+    }
+
+    /// PreCompactHandoff then EventLog compact. Working state is written to
+    /// Place `memory/handoff.md`; the Compact summary points at those paths.
+    /// Does not remint Binding. Place must already be attached to this session.
+    pub fn compact_with_handoff(
+        &self,
+        memory: &PlaceMemory,
+        binding: BindingId,
+        start: EventId,
+        end: EventId,
+        working: Option<WorkingState>,
+    ) -> Result<Event> {
+        crate::place_memory::pre_compact_handoff(self, memory, binding, start, end, working)
     }
 
     pub fn turn_start(&self, agent: AgentId) -> Result<Event> {
