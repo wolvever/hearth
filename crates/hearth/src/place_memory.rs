@@ -425,9 +425,7 @@ pub(crate) fn pre_compact_handoff(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        EventBody, HostKind, InMemory, Member, PlaceAttach, PlaceProvider,
-    };
+    use crate::{EventBody, HostKind, InMemory, Member, PlaceAttach, PlaceProvider};
 
     fn seeded(policy: MemoryPolicy) -> (PlaceMemory, BindingId) {
         let p = PlaceMemory::new(PlaceId::new(), policy);
