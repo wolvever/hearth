@@ -1,20 +1,11 @@
-# Pi adapter
+# pi adapter
 
-[earendil-works/pi](https://github.com/earendil-works/pi) durable harness events. Snapshot + watch; events are not replayed on reconnect.
+- **Source:** `earendil-works/pi` durable harness
+- **Wire:** WebSocket JSON (or length-prefixed JSON) via `WebSocketJsonTransport`
+- **Codec:** `PiCodec` — `map_event` on decoded JSON objects
 
-| Layer | Type |
-| --- | --- |
-| Transport | `WsJsonFramer` (one watch message = one JSON value) |
-| Adapter | `map_event(&Value) -> AgentEvent` |
+Snapshot + watch; events are not replayed on reconnect (native semantics).
 
-## Mapped types
-
-- `run.start` / `run.started` → `TurnStarted`
-- `run.end` / `run.ended` → `TurnCompleted`
-- `message` / `entry.message` → `Message`
-- `tool.start` / `tool.end` → `ToolCall` / `ToolResult`
-- `lane.start` → `SubagentStarted`
-
-## Fixtures
-
-- `fixtures/run_start.json` — `run.start` → `TurnStarted`
+```bash
+cargo test -p hearth_agent_bus pi::
+```

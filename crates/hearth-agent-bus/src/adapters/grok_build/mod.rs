@@ -1,7 +1,5 @@
 //! Grok Build — Agent Client Protocol (ACP) JSON-RPC.
 //! Source: xai-org/grok-build (`grok agent stdio` / `serve`).
-//!
-//! Transport: [`crate::transport::JsonRpcFramer`]. Mapper: [`map_notification`].
 
 use crate::{AgentEvent, AgentKind, BusError, ToolStatus};
 use serde_json::Value;
@@ -156,15 +154,102 @@ fn map_permission_request(params: &Value) -> Result<AgentEvent, BusError> {
     })
 }
 
+
+use crate::adapters::AdapterCodec;
+use crate::transport::WireFrame;
+use crate::AgentCommand;
+
+/// ACP codec for Grok Build. Consumes JSON-RPC [`WireFrame::Json`] only.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct GrokBuildCodec;
+
+impl AdapterCodec for GrokBuildCodec {
+    fn kind(&self) -> AgentKind {
+        AgentKind::GrokBuild
+    }
+
+    fn wire(&self) -> &'static str {
+        "jsonrpc-content-length"
+    }
+
+    fn decode_event(&self, frame: &WireFrame) -> Result<Option<AgentEvent>, BusError> {
+        match frame {
+            WireFrame::Json(v) => map_notification(v).map(Some),
+            WireFrame::Sse { .. } => Err(BusError::Decode(
+                "grok_build expects JSON-RPC frames, not SSE".into(),
+            )),
+        }
+    }
+
+    fn encode_command(&self, cmd: &AgentCommand) -> Result<WireFrame, BusError> {
+        let (method, params) = match cmd {
+            AgentCommand::UserMessage { session_id, text } => (
+                "session/prompt",
+                serde_json::json!({
+                    "sessionId": session_id,
+                    "prompt": [{"type": "text", "text": text}],
+                }),
+            ),
+            AgentCommand::ReplyPermission {
+                session_id,
+                permission_id,
+                allow,
+                option_id,
+            } => (
+                "session/request_permission/result",
+                serde_json::json!({
+                    "sessionId": session_id,
+                    "id": permission_id,
+                    "outcome": if *allow { "selected" } else { "cancelled" },
+                    "optionId": option_id,
+                }),
+            ),
+            AgentCommand::Compact { session_id } => (
+                "session/compact",
+                serde_json::json!({ "sessionId": session_id }),
+            ),
+            other => {
+                return Err(BusError::Unsupported(match other {
+                    AgentCommand::CreateProject { .. } => "CreateProject",
+                    AgentCommand::OpenSession { .. } => "OpenSession",
+                    AgentCommand::CloseSession { .. } => "CloseSession",
+                    AgentCommand::Steer { .. } => "Steer",
+                    AgentCommand::Abort { .. } => "Abort",
+                    AgentCommand::ReplyQuestion { .. } => "ReplyQuestion",
+                    AgentCommand::SpawnTask { .. } => "SpawnTask",
+                    AgentCommand::CancelTask { .. } => "CancelTask",
+                    _ => "command",
+                }))
+            }
+        };
+        Ok(WireFrame::Json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        })))
+    }
+}
+
 #[cfg(test)]
-mod tests {
+mod map_tests {
     use super::*;
+    use crate::adapters::AdapterCodec;
+    use crate::transport::WireFrame;
+    use crate::ToolStatus;
+
+    fn fixture(name: &str) -> serde_json::Value {
+        let path = format!(
+            "{}/src/adapters/grok_build/fixtures/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        serde_json::from_str(&raw).unwrap()
+    }
 
     #[test]
-    fn fixture_tool_call() {
-        let raw: Value =
-            serde_json::from_str(include_str!("fixtures/session_update_tool_call.json")).unwrap();
-        match map_notification(&raw).unwrap() {
+    fn map_tool_call_fixture() {
+        let ev = map_notification(&fixture("session_update_tool_call.json")).unwrap();
+        match ev {
             AgentEvent::ToolCall { item_id, name, status, .. } => {
                 assert_eq!(item_id, "c1");
                 assert_eq!(name, "read");
@@ -172,5 +257,21 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn map_permission_fixture() {
+        let ev = map_notification(&fixture("permission_request.json")).unwrap();
+        assert!(matches!(ev, AgentEvent::PermissionAsk { .. }));
+    }
+
+    #[test]
+    fn codec_rejects_sse_frame() {
+        let frame = WireFrame::Sse {
+            event: None,
+            id: None,
+            data: serde_json::json!({}),
+        };
+        assert!(GrokBuildCodec.decode_event(&frame).is_err());
     }
 }

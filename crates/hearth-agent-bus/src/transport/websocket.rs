@@ -1,56 +1,60 @@
-//! One WebSocket text message = one JSON value.
+//! WebSocket JSON transport stub — one JSON message per WS text/binary frame.
+//! No line scraping; the WS layer already delivers discrete messages.
 
-use super::{parse_one_json, Frame, Framer, TransportError, MAX_FRAME_BYTES};
+use super::{Transport, WireFrame};
+use crate::BusError;
+use serde_json::Value;
+use std::collections::VecDeque;
 
-/// One WebSocket text message = one JSON value. Does not concatenate messages.
-pub struct WsJsonFramer {
-    failed: Option<TransportError>,
+#[derive(Debug, Default)]
+pub struct WebSocketJsonTransport {
+    inbound: VecDeque<Value>,
+    outbound: Vec<Value>,
 }
 
-impl Default for WsJsonFramer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl WsJsonFramer {
+impl WebSocketJsonTransport {
     pub fn new() -> Self {
-        Self { failed: None }
+        Self::default()
     }
 
-    fn check(&self) -> Result<(), TransportError> {
-        match &self.failed {
-            Some(e) => Err(e.clone()),
-            None => Ok(()),
-        }
+    pub fn push_decoded(&mut self, msg: Value) {
+        self.inbound.push_back(msg);
     }
 
-    fn die<T>(&mut self, err: TransportError) -> Result<T, TransportError> {
-        self.failed = Some(err.clone());
-        Err(err)
+    pub fn outbound(&self) -> &[Value] {
+        &self.outbound
     }
 
-    /// One complete WS text frame.
-    pub fn push_message(&mut self, bytes: &[u8]) -> Result<Frame, TransportError> {
-        self.check()?;
-        if bytes.len() > MAX_FRAME_BYTES {
-            return self.die(TransportError::TooLarge(bytes.len()));
-        }
-        match parse_one_json(bytes) {
-            Ok(v) => Ok(Frame::ws(v)),
-            Err(e) => self.die(e),
-        }
+    pub fn decode_text(text: &str) -> Result<Value, BusError> {
+        serde_json::from_str(text).map_err(|e| BusError::Decode(e.to_string()))
     }
 }
 
-impl Framer for WsJsonFramer {
-    fn push_bytes(&mut self, bytes: &[u8]) -> Result<Vec<Frame>, TransportError> {
-        Ok(vec![self.push_message(bytes)?])
+impl Transport for WebSocketJsonTransport {
+    fn send_frame(&mut self, frame: WireFrame) -> Result<(), BusError> {
+        match frame {
+            WireFrame::Json(v) => {
+                self.outbound.push(v);
+                Ok(())
+            }
+            WireFrame::Sse { .. } => Err(BusError::Transport(
+                "WebSocketJsonTransport rejects SSE frames".into(),
+            )),
+        }
     }
 
-    fn finish(&mut self) -> Result<Vec<Frame>, TransportError> {
-        self.check()?;
-        Ok(vec![])
+    fn try_recv_frame(&mut self) -> Result<Option<WireFrame>, BusError> {
+        Ok(self.inbound.pop_front().map(WireFrame::Json))
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_text_json() {
+        let v = WebSocketJsonTransport::decode_text(r#"{"ok":true}"#).unwrap();
+        assert_eq!(v["ok"], true);
+    }
+}

@@ -455,8 +455,9 @@ mod tests {
     }
 
     #[test]
-    fn frame_agent_jsonrpc_bytes_append_tool_call() {
-        use crate::{encode_jsonrpc, FramedAgent, JsonRpcFramer};
+    fn framed_agent_jsonrpc_push_decoded_appends_tool_call() {
+        use crate::adapters::grok_build::GrokBuildCodec;
+        use crate::{FramedAgent, JsonRpcTransport};
 
         let (_store, _user, agent, session) = room();
         let binding = session
@@ -466,11 +467,8 @@ mod tests {
             "adapters/grok_build/fixtures/session_update_tool_call.json"
         ))
         .unwrap();
-        let mut agent_io = FramedAgent::new(AgentKind::GrokBuild);
-        let mut framer = JsonRpcFramer::new();
-        agent_io
-            .push_bytes(&mut framer, &encode_jsonrpc(&raw).unwrap())
-            .unwrap();
+        let mut agent_io = FramedAgent::new(JsonRpcTransport::new(), GrokBuildCodec);
+        agent_io.transport_mut().push_decoded(raw);
         let mut attach = HostAttach::attach(binding, agent.id, agent_io);
         attach.drain(&session).unwrap();
         assert!(session.events().unwrap().iter().any(|e| matches!(

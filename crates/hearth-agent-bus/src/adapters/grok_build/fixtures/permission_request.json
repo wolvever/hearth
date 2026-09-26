@@ -1,0 +1,10 @@
+{
+  "jsonrpc": "2.0",
+  "method": "session/request_permission",
+  "params": {
+    "sessionId": "s1",
+    "id": "perm-1",
+    "title": "Allow read?",
+    "options": [{"optionId": "allow", "name": "Allow", "kind": "allow_once"}]
+  }
+}

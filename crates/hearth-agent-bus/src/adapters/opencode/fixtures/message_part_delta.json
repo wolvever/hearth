@@ -1,0 +1,8 @@
+{
+  "type": "message.part.delta",
+  "properties": {
+    "sessionID": "s1",
+    "delta": "hello",
+    "part": { "id": "p1", "type": "text", "text": "hello" }
+  }
+}

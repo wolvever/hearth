@@ -1,7 +1,4 @@
 //! OpenCode SSE / EventV2 bus (anomalyco/opencode).
-//!
-//! Transport: [`crate::transport::SseFramer`] (EventSource, blank-line dispatch).
-//! Mapper: [`map_event`].
 
 use crate::{AgentEvent, AgentKind, BusError, PermissionOption, ToolStatus};
 use serde_json::Value;
@@ -151,17 +148,105 @@ pub fn map_event(msg: &Value) -> Result<AgentEvent, BusError> {
     }
 }
 
+
+use crate::adapters::AdapterCodec;
+use crate::transport::WireFrame;
+use crate::AgentCommand;
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct OpenCodeCodec;
+
+impl AdapterCodec for OpenCodeCodec {
+    fn kind(&self) -> AgentKind {
+        AgentKind::OpenCode
+    }
+
+    fn wire(&self) -> &'static str {
+        "http-sse"
+    }
+
+    fn decode_event(&self, frame: &WireFrame) -> Result<Option<AgentEvent>, BusError> {
+        // Prefer the SSE data payload; also accept plain JSON for fixtures.
+        let v = match frame {
+            WireFrame::Sse { data, .. } => data,
+            WireFrame::Json(v) => v,
+        };
+        map_event(v).map(Some)
+    }
+
+    fn encode_command(&self, cmd: &AgentCommand) -> Result<WireFrame, BusError> {
+        let body = match cmd {
+            AgentCommand::UserMessage { session_id, text } => serde_json::json!({
+                "type": "session.prompt",
+                "sessionID": session_id,
+                "text": text,
+            }),
+            AgentCommand::ReplyPermission {
+                session_id,
+                permission_id,
+                allow,
+                option_id,
+            } => serde_json::json!({
+                "type": "permission.reply",
+                "sessionID": session_id,
+                "id": permission_id,
+                "allow": allow,
+                "optionID": option_id,
+            }),
+            _ => return Err(BusError::Unsupported("opencode command stub")),
+        };
+        Ok(WireFrame::Json(body))
+    }
+}
+
 #[cfg(test)]
-mod tests {
+mod map_tests {
     use super::*;
+    use crate::adapters::AdapterCodec;
+    use crate::transport::{SseTransport, Transport, WireFrame};
+
+    fn fixture(name: &str) -> serde_json::Value {
+        let path = format!(
+            "{}/src/adapters/opencode/fixtures/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        serde_json::from_str(&raw).unwrap()
+    }
 
     #[test]
-    fn fixture_permission_asked() {
-        let raw: Value =
-            serde_json::from_str(include_str!("fixtures/permission_asked.json")).unwrap();
-        match map_event(&raw).unwrap() {
+    fn map_permission_fixture() {
+        let ev = map_event(&fixture("permission_asked.json")).unwrap();
+        match ev {
             AgentEvent::PermissionAsk { title, .. } => assert!(title.contains("Allow")),
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn map_message_delta_fixture() {
+        let ev = map_event(&fixture("message_part_delta.json")).unwrap();
+        assert!(matches!(ev, AgentEvent::MessageDelta { .. }));
+    }
+
+    #[test]
+    fn codec_via_sse_frame() {
+        let data = fixture("permission_asked.json");
+        let frame = WireFrame::Sse {
+            event: Some("permission".into()),
+            id: None,
+            data,
+        };
+        let ev = OpenCodeCodec.decode_event(&frame).unwrap().unwrap();
+        assert!(matches!(ev, AgentEvent::PermissionAsk { .. }));
+    }
+
+    #[test]
+    fn sse_transport_then_codec() {
+        let mut t = SseTransport::new();
+        t.push_decoded(Some("permission"), fixture("permission_asked.json"));
+        let frame = t.try_recv_frame().unwrap().unwrap();
+        let ev = OpenCodeCodec.decode_event(&frame).unwrap().unwrap();
+        assert!(matches!(ev, AgentEvent::PermissionAsk { .. }));
     }
 }

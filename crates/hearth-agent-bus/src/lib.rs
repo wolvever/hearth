@@ -8,18 +8,22 @@
 //! [`hearth::PlaceMemory`] and [`hearth::FakeSandbox`] compose: claim-aware
 //! where writes matter, Binding ids not reminted on attach or resume.
 //!
-//! Transport (`JsonRpcFramer` / `SseFramer` / `WsJsonFramer`) decodes bytes →
-//! [`Frame`]. Adapters map `Value` / `Frame` → [`AgentEvent`]. There is no
-//! public newline `push_line` / `map_wire_line`.
+//! # Architecture
+//! - **Transport** owns framing (Content-Length JSON-RPC, SSE EventSource, WS JSON).
+//! - **AdapterCodec** maps typed [`transport::WireFrame`]s ↔ [`AgentEvent`] / [`AgentCommand`].
+//! - Prefer [`FramedAgent<T, C>`] for live attach. [`LoopbackAgent`] stays for Host tests.
+//! - Never scrape unstructured stdout/stderr or regex logs for events.
+//! - There is no public `map_wire_line` / `push_line`.
+//! - SoftExpiring / Flush-before-dispatch stay parked — not in this crate.
 
 pub mod adapters;
 pub mod host;
 pub mod transport;
 
+pub use adapters::{lookup, registry, AdapterCodec, AdapterInfo};
 pub use host::{binding_kind, event_bodies, host_for, AttachError, AttachResult, HostAttach};
 pub use transport::{
-    encode_jsonrpc, encode_sse, Frame, FramedAgent, FrameKind, Framer, JsonRpcFramer, SseFramer,
-    TransportError, WsJsonFramer, MAX_FRAME_BYTES,
+    JsonRpcTransport, SseFrame, SseTransport, Transport, WebSocketJsonTransport, WireFrame,
 };
 
 use serde::{Deserialize, Serialize};
@@ -201,6 +205,8 @@ pub enum BusError {
     Transport(String),
     #[error("decode: {0}")]
     Decode(String),
+    #[error("encode: {0}")]
+    Encode(String),
 }
 
 /// What Hearth Host talks to. Live adapters own a child process / socket;
@@ -209,6 +215,51 @@ pub trait CodingAgent: Send {
     fn kind(&self) -> AgentKind;
     fn send(&mut self, cmd: AgentCommand) -> Result<(), BusError>;
     fn try_recv(&mut self) -> Result<Option<AgentEvent>, BusError>;
+}
+
+/// Combines a [`Transport`] with an [`adapters::AdapterCodec`].
+/// Host attach should prefer this over line-scraping helpers.
+pub struct FramedAgent<T: transport::Transport, C: adapters::AdapterCodec> {
+    transport: T,
+    codec: C,
+}
+
+impl<T: transport::Transport, C: adapters::AdapterCodec> FramedAgent<T, C> {
+    pub fn new(transport: T, codec: C) -> Self {
+        Self { transport, codec }
+    }
+
+    pub fn transport(&self) -> &T {
+        &self.transport
+    }
+
+    pub fn transport_mut(&mut self) -> &mut T {
+        &mut self.transport
+    }
+}
+
+impl<T: transport::Transport, C: adapters::AdapterCodec> CodingAgent for FramedAgent<T, C> {
+    fn kind(&self) -> AgentKind {
+        self.codec.kind()
+    }
+
+    fn send(&mut self, cmd: AgentCommand) -> Result<(), BusError> {
+        let frame = self.codec.encode_command(&cmd)?;
+        self.transport.send_frame(frame)
+    }
+
+    fn try_recv(&mut self) -> Result<Option<AgentEvent>, BusError> {
+        loop {
+            match self.transport.try_recv_frame()? {
+                None => return Ok(None),
+                Some(frame) => {
+                    if let Some(ev) = self.codec.decode_event(&frame)? {
+                        return Ok(Some(ev));
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// In-memory loopback for Host-side tests: commands enqueue synthetic events.
@@ -416,12 +467,63 @@ mod tests {
     }
 
     #[test]
-    fn map_frame_uses_adapter_not_line_split() {
-        let raw: serde_json::Value = serde_json::from_str(include_str!(
-            "adapters/grok_build/fixtures/session_update_tool_call.json"
-        ))
-        .unwrap();
-        let ev = adapters::map_frame(AgentKind::GrokBuild, &crate::Frame::json_rpc(raw)).unwrap();
+    fn framed_agent_jsonrpc_roundtrip() {
+        use crate::adapters::grok_build::GrokBuildCodec;
+        use crate::transport::JsonRpcTransport;
+
+        let mut agent = FramedAgent::new(JsonRpcTransport::new(), GrokBuildCodec);
+        agent
+            .transport_mut()
+            .push_decoded(serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": "s1",
+                    "update": {
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": "c1",
+                        "title": "read",
+                        "status": "pending"
+                    }
+                }
+            }));
+        let ev = agent.try_recv().unwrap().unwrap();
         assert!(matches!(ev, AgentEvent::ToolCall { .. }));
+
+        agent
+            .send(AgentCommand::UserMessage {
+                session_id: "s1".into(),
+                text: "hi".into(),
+            })
+            .unwrap();
+        assert_eq!(agent.transport().outbound().len(), 1);
+    }
+
+    #[test]
+    fn framed_agent_sse_opencode() {
+        use crate::adapters::opencode::OpenCodeCodec;
+        use crate::transport::SseTransport;
+
+        let mut agent = FramedAgent::new(SseTransport::new(), OpenCodeCodec);
+        agent.transport_mut().push_decoded(
+            Some("permission"),
+            serde_json::json!({
+                "type": "permission.asked",
+                "properties": {
+                    "sessionID": "s1",
+                    "id": "perm-1",
+                    "title": "Allow shell?",
+                    "options": []
+                }
+            }),
+        );
+        let ev = agent.try_recv().unwrap().unwrap();
+        assert!(matches!(ev, AgentEvent::PermissionAsk { .. }));
+    }
+
+    #[test]
+    fn registry_discoverable() {
+        assert_eq!(crate::registry().len(), 4);
+        assert!(crate::lookup(AgentKind::Pi).unwrap().capabilities.contains(&"subagent"));
     }
 }

@@ -1,154 +1,162 @@
-//! WHATWG EventSource / SSE.
+//! HTTP + SSE transport stub — typed EventSource frames only.
+//!
+//! Adapters receive [`SseFrame`] / [`WireFrame::Sse`] after framing is done.
+//! Do not strip `data:` prefixes inside adapter mappers; that belongs here
+//! (or at the HTTP client boundary that yields typed frames).
 
-use super::{parse_one_json, Frame, Framer, TransportError};
+use super::{Transport, WireFrame};
+use crate::BusError;
 use serde_json::Value;
+use std::collections::VecDeque;
 
-/// Encode one SSE event (`data:` + blank-line terminator). Multi-line JSON is split.
-pub fn encode_sse(value: &Value, event: Option<&str>) -> Result<Vec<u8>, TransportError> {
-    let body = serde_json::to_string(value)
-        .map_err(|e| TransportError::Corrupt(format!("encode JSON: {e}")))?;
-    let mut out = String::new();
-    if let Some(ev) = event {
-        out.push_str("event: ");
-        out.push_str(ev);
-        out.push('\n');
-    }
-    for line in body.split('\n') {
-        out.push_str("data: ");
-        out.push_str(line);
-        out.push('\n');
-    }
-    out.push('\n');
-    Ok(out.into_bytes())
+/// One Server-Sent Event after EventSource framing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SseFrame {
+    pub event: Option<String>,
+    pub id: Option<String>,
+    pub data: Value,
 }
 
-/// WHATWG EventSource framer. Dispatches only on a blank line.
-pub struct SseFramer {
-    buf: Vec<u8>,
-    data: Vec<String>,
-    event: Option<String>,
-    id: Option<String>,
-    failed: Option<TransportError>,
-}
-
-impl Default for SseFramer {
-    fn default() -> Self {
-        Self::new()
+impl From<SseFrame> for WireFrame {
+    fn from(f: SseFrame) -> Self {
+        WireFrame::Sse {
+            event: f.event,
+            id: f.id,
+            data: f.data,
+        }
     }
 }
 
-impl SseFramer {
+/// Stub SSE transport that accepts already-decoded EventSource frames.
+#[derive(Debug, Default)]
+pub struct SseTransport {
+    inbound: VecDeque<SseFrame>,
+    outbound: Vec<SseFrame>,
+}
+
+impl SseTransport {
     pub fn new() -> Self {
-        Self {
-            buf: Vec::new(),
-            data: Vec::new(),
-            event: None,
+        Self::default()
+    }
+
+    /// Push a typed frame (e.g. from an EventSource client that already parsed
+    /// `event:` / `data:` / `id:` fields and JSON-decoded the data payload).
+    pub fn push_frame(&mut self, frame: SseFrame) {
+        self.inbound.push_back(frame);
+    }
+
+    /// Convenience: push JSON data with optional event name.
+    pub fn push_decoded(&mut self, event: Option<&str>, data: Value) {
+        self.push_frame(SseFrame {
+            event: event.map(str::to_string),
             id: None,
-            failed: None,
-        }
+            data,
+        });
     }
 
-    fn check(&self) -> Result<(), TransportError> {
-        match &self.failed {
-            Some(e) => Err(e.clone()),
-            None => Ok(()),
-        }
+    pub fn outbound(&self) -> &[SseFrame] {
+        &self.outbound
     }
 
-    fn die<T>(&mut self, err: TransportError) -> Result<T, TransportError> {
-        self.failed = Some(err.clone());
-        self.buf.clear();
-        self.data.clear();
-        self.event = None;
-        self.id = None;
-        Err(err)
-    }
-
-    fn pending(&self) -> bool {
-        !self.data.is_empty() || self.event.is_some() || self.id.is_some()
-    }
-
-    fn take_line(&mut self) -> Option<Vec<u8>> {
-        let nl = self
-            .buf
-            .windows(2)
-            .position(|w| w == b"\r\n")
-            .map(|i| (i, 2))
-            .or_else(|| self.buf.iter().position(|&b| b == b'\n').map(|i| (i, 1)))
-            .or_else(|| self.buf.iter().position(|&b| b == b'\r').map(|i| (i, 1)))?;
-        let (at, skip) = nl;
-        let line = self.buf[..at].to_vec();
-        self.buf.drain(..at + skip);
-        Some(line)
-    }
-
-    fn apply_line(&mut self, line: &[u8]) -> Result<Option<Frame>, TransportError> {
-        if line.is_empty() {
-            return self.dispatch();
-        }
-        if line.first() == Some(&b':') {
+    /// Parse one complete SSE event block (fields separated by `\n`, block by blank line).
+    /// `data` must be JSON. Skips `[DONE]` sentinels. Not for unstructured log lines.
+    pub fn parse_event_block(block: &str) -> Result<Option<SseFrame>, BusError> {
+        let block = block.trim();
+        if block.is_empty() {
             return Ok(None);
         }
-        let text = std::str::from_utf8(line)
-            .map_err(|_| TransportError::Corrupt("SSE field is not utf-8".into()))?;
-        let (name, value) = match text.split_once(':') {
-            Some((n, v)) => (n, v.strip_prefix(' ').unwrap_or(v)),
-            None => (text, ""),
-        };
-        match name {
-            "data" => self.data.push(value.to_string()),
-            "event" => self.event = Some(value.to_string()),
-            "id" => {
-                if !value.contains('\0') {
-                    self.id = Some(value.to_string());
-                }
+        let mut event: Option<String> = None;
+        let mut id: Option<String> = None;
+        let mut data_lines: Vec<&str> = Vec::new();
+        for line in block.lines() {
+            if line.starts_with(':') {
+                continue; // comment
             }
-            "retry" => {}
-            _ => {}
+            if let Some(rest) = line.strip_prefix("event:") {
+                event = Some(rest.trim().to_string());
+            } else if let Some(rest) = line.strip_prefix("id:") {
+                id = Some(rest.trim().to_string());
+            } else if let Some(rest) = line.strip_prefix("data:") {
+                data_lines.push(rest.trim_start());
+            } else {
+                return Err(BusError::Decode(format!(
+                    "SSE: unknown field line (not event/id/data/comment): {line:?}"
+                )));
+            }
         }
-        Ok(None)
-    }
-
-    fn dispatch(&mut self) -> Result<Option<Frame>, TransportError> {
-        if self.data.is_empty() {
-            self.event = None;
+        if data_lines.is_empty() {
             return Ok(None);
         }
-        let data = self.data.join("\n");
-        self.data.clear();
-        let event = self.event.take();
-        let id = self.id.clone();
-        if data == "[DONE]" {
+        let payload = data_lines.join("\n");
+        if payload == "[DONE]" {
             return Ok(None);
         }
-        match parse_one_json(data.as_bytes()) {
-            Ok(value) => Ok(Some(Frame::sse(value, event, id))),
-            Err(e) => self.die(e),
-        }
+        let data: Value =
+            serde_json::from_str(&payload).map_err(|e| BusError::Decode(format!("SSE data JSON: {e}")))?;
+        Ok(Some(SseFrame { event, id, data }))
     }
 }
 
-impl Framer for SseFramer {
-    fn push_bytes(&mut self, bytes: &[u8]) -> Result<Vec<Frame>, TransportError> {
-        self.check()?;
-        self.buf.extend_from_slice(bytes);
-        let mut out = Vec::new();
-        while let Some(line) = self.take_line() {
-            if let Some(frame) = self.apply_line(&line)? {
-                out.push(frame);
+impl Transport for SseTransport {
+    fn send_frame(&mut self, frame: WireFrame) -> Result<(), BusError> {
+        match frame {
+            WireFrame::Sse { event, id, data } => {
+                self.outbound.push(SseFrame { event, id, data });
+                Ok(())
+            }
+            WireFrame::Json(data) => {
+                // Outbound HTTP POST bodies may be plain JSON; wrap as data-only SSE frame.
+                self.outbound.push(SseFrame {
+                    event: None,
+                    id: None,
+                    data,
+                });
+                Ok(())
             }
         }
-        Ok(out)
     }
 
-    fn finish(&mut self) -> Result<Vec<Frame>, TransportError> {
-        self.check()?;
-        if !self.buf.is_empty() || self.pending() {
-            return self.die(TransportError::Corrupt(
-                "partial SSE event at end of stream".into(),
-            ));
-        }
-        Ok(vec![])
+    fn try_recv_frame(&mut self) -> Result<Option<WireFrame>, BusError> {
+        Ok(self.inbound.pop_front().map(Into::into))
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_typed_event_block() {
+        let block = "event: permission\nid: 1\ndata: {\"type\":\"permission.asked\",\"properties\":{\"sessionID\":\"s\",\"id\":\"p1\",\"title\":\"run?\",\"options\":[]}}\n";
+        let frame = SseTransport::parse_event_block(block).unwrap().unwrap();
+        assert_eq!(frame.event.as_deref(), Some("permission"));
+        assert_eq!(frame.id.as_deref(), Some("1"));
+        assert_eq!(frame.data["type"], "permission.asked");
+    }
+
+    #[test]
+    fn done_sentinel_skipped() {
+        assert!(SseTransport::parse_event_block("data: [DONE]\n")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn rejects_non_field_garbage() {
+        let err = SseTransport::parse_event_block("INFO agent started\n").unwrap_err();
+        assert!(err.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn push_decoded_recv() {
+        let mut t = SseTransport::new();
+        t.push_decoded(Some("msg"), serde_json::json!({"type":"x"}));
+        match t.try_recv_frame().unwrap() {
+            Some(WireFrame::Sse { event, data, .. }) => {
+                assert_eq!(event.as_deref(), Some("msg"));
+                assert_eq!(data["type"], "x");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+}

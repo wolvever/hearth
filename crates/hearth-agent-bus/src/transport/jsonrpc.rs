@@ -1,168 +1,168 @@
-//! Content-Length JSON-RPC (ACP / LSP / Codex app-server).
+//! Content-Length / length-prefixed JSON-RPC transport (LSP / ACP style).
+//!
+//! Callers feed **already-framed** bytes or **already-decoded** [`Value`]s.
+//! This type never treats a bare newline as a message boundary for the body
+//! (headers use CRLF per LSP; NDJSON-of-logs is explicitly rejected).
 
-use super::{
-    parse_one_json, Frame, Framer, TransportError, MAX_FRAME_BYTES,
-};
+use super::{Transport, WireFrame};
+use crate::BusError;
 use serde_json::Value;
+use std::collections::VecDeque;
 
-/// Encode a JSON-RPC / ACP message with `Content-Length` headers.
-pub fn encode_jsonrpc(value: &Value) -> Result<Vec<u8>, TransportError> {
-    let body = serde_json::to_vec(value)
-        .map_err(|e| TransportError::Corrupt(format!("encode JSON: {e}")))?;
-    if body.len() > MAX_FRAME_BYTES {
-        return Err(TransportError::TooLarge(body.len()));
-    }
-    let mut out = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
-    out.extend_from_slice(&body);
-    Ok(out)
+/// In-memory / stub JSON-RPC transport.
+#[derive(Debug, Default)]
+pub struct JsonRpcTransport {
+    inbound: VecDeque<Value>,
+    outbound: Vec<Value>,
 }
 
-/// LSP / ACP Content-Length framer. Rejects newline-delimited JSON.
-pub struct JsonRpcFramer {
-    buf: Vec<u8>,
-    failed: Option<TransportError>,
-}
-
-impl Default for JsonRpcFramer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl JsonRpcFramer {
+impl JsonRpcTransport {
     pub fn new() -> Self {
-        Self {
-            buf: Vec::new(),
-            failed: None,
-        }
+        Self::default()
     }
 
-    fn check(&self) -> Result<(), TransportError> {
-        match &self.failed {
-            Some(e) => Err(e.clone()),
-            None => Ok(()),
-        }
+    /// Push an already-decoded JSON-RPC message (notification, request, or response).
+    pub fn push_decoded(&mut self, msg: Value) {
+        self.inbound.push_back(msg);
     }
 
-    fn die<T>(&mut self, err: TransportError) -> Result<T, TransportError> {
-        self.failed = Some(err.clone());
-        self.buf.clear();
-        Err(err)
+    pub fn outbound(&self) -> &[Value] {
+        &self.outbound
     }
 
-    fn reject_bare_json(&self) -> Result<(), TransportError> {
-        let start = match self.buf.iter().position(|b| !b.is_ascii_whitespace()) {
-            Some(i) => self.buf[i],
-            None => return Ok(()),
-        };
-        if start == b'{' || start == b'[' {
-            return Err(TransportError::Corrupt(
-                "json-rpc requires Content-Length headers; newline-delimited JSON is rejected"
-                    .into(),
-            ));
-        }
-        Ok(())
-    }
-
-    fn extract_one(&mut self) -> Result<Option<Value>, TransportError> {
-        if self.buf.is_empty() {
-            return Ok(None);
-        }
-        if let Err(e) = self.reject_bare_json() {
-            return self.die(e);
-        }
-        let Some(header_end) = find_header_end(&self.buf) else {
-            return Ok(None);
-        };
-        let header_bytes = &self.buf[..header_end];
-        let headers = match std::str::from_utf8(header_bytes) {
-            Ok(s) => s,
-            Err(_) => return self.die(TransportError::Corrupt("headers are not utf-8".into())),
-        };
-        let content_length = match parse_content_length(headers) {
-            Ok(n) => n,
-            Err(e) => return self.die(e),
-        };
-        if content_length > MAX_FRAME_BYTES {
-            return self.die(TransportError::TooLarge(content_length));
-        }
-        let total = header_end + content_length;
-        if self.buf.len() < total {
-            return Ok(None);
-        }
-        let body = self.buf[header_end..total].to_vec();
-        self.buf.drain(..total);
-        match parse_one_json(&body) {
-            Ok(v) => Ok(Some(v)),
-            Err(e) => self.die(e),
-        }
-    }
-}
-
-impl Framer for JsonRpcFramer {
-    fn push_bytes(&mut self, bytes: &[u8]) -> Result<Vec<Frame>, TransportError> {
-        self.check()?;
-        if bytes.len() > MAX_FRAME_BYTES && self.buf.is_empty() {
-            return self.die(TransportError::TooLarge(bytes.len()));
-        }
-        self.buf.extend_from_slice(bytes);
-        if self.buf.len() > MAX_FRAME_BYTES.saturating_add(4096) {
-            return self.die(TransportError::TooLarge(self.buf.len()));
-        }
-        let mut out = Vec::new();
-        while let Some(value) = self.extract_one()? {
-            out.push(Frame::json_rpc(value));
-        }
+    /// Encode one message as LSP/ACP Content-Length framed bytes.
+    pub fn encode_content_length(msg: &Value) -> Result<Vec<u8>, BusError> {
+        let body = serde_json::to_vec(msg).map_err(|e| BusError::Encode(e.to_string()))?;
+        let header = format!("Content-Length: {}\r\n\r\n", body.len());
+        let mut out = header.into_bytes();
+        out.extend_from_slice(&body);
         Ok(out)
     }
 
-    fn finish(&mut self) -> Result<Vec<Frame>, TransportError> {
-        self.check()?;
-        let leftover = skip_ws(&self.buf);
-        if leftover.is_empty() {
-            self.buf.clear();
-            return Ok(vec![]);
+    /// Decode one Content-Length framed message from a growable buffer.
+    /// Returns `Ok(None)` if the buffer is incomplete. Leaves leftovers in `buf`.
+    ///
+    /// Does **not** split on bare newlines for the JSON body.
+    pub fn try_decode_content_length(buf: &mut Vec<u8>) -> Result<Option<Value>, BusError> {
+        let Some(header_end) = find_header_end(buf) else {
+            return Ok(None);
+        };
+        let header = std::str::from_utf8(&buf[..header_end])
+            .map_err(|e| BusError::Decode(format!("utf8 header: {e}")))?;
+        let mut content_length: Option<usize> = None;
+        for line in header.split("\r\n") {
+            if line.is_empty() {
+                continue;
+            }
+            let Some((name, value)) = line.split_once(':') else {
+                continue;
+            };
+            if name.eq_ignore_ascii_case("Content-Length") {
+                content_length = Some(
+                    value
+                        .trim()
+                        .parse()
+                        .map_err(|e| BusError::Decode(format!("Content-Length: {e}")))?,
+                );
+            }
         }
-        self.die(TransportError::Corrupt(
-            "partial JSON-RPC frame at end of stream".into(),
-        ))
+        let len = content_length
+            .ok_or_else(|| BusError::Decode("missing Content-Length header".into()))?;
+        let body_start = header_end + 4; // \r\n\r\n
+        let body_end = body_start + len;
+        if buf.len() < body_end {
+            return Ok(None);
+        }
+        let body = &buf[body_start..body_end];
+        let value: Value =
+            serde_json::from_slice(body).map_err(|e| BusError::Decode(e.to_string()))?;
+        buf.drain(..body_end);
+        Ok(Some(value))
+    }
+
+    /// Decode one big-endian u32 length-prefixed JSON message.
+    pub fn try_decode_length_prefixed(buf: &mut Vec<u8>) -> Result<Option<Value>, BusError> {
+        if buf.len() < 4 {
+            return Ok(None);
+        }
+        let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        if buf.len() < 4 + len {
+            return Ok(None);
+        }
+        let body = &buf[4..4 + len];
+        let value: Value =
+            serde_json::from_slice(body).map_err(|e| BusError::Decode(e.to_string()))?;
+        buf.drain(..4 + len);
+        Ok(Some(value))
     }
 }
 
 fn find_header_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .map(|i| i + 4)
-        .or_else(|| buf.windows(2).position(|w| w == b"\n\n").map(|i| i + 2))
+    buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
-fn parse_content_length(headers: &str) -> Result<usize, TransportError> {
-    let mut found = None;
-    for raw in headers.split(['\n', '\r']) {
-        let line = raw.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Some((name, value)) = line.split_once(':') else {
-            return Err(TransportError::Corrupt(format!(
-                "malformed header line: {line:?}"
-            )));
-        };
-        if name.trim().eq_ignore_ascii_case("content-length") {
-            let n = value.trim().parse::<usize>().map_err(|_| {
-                TransportError::Corrupt(format!("invalid Content-Length: {:?}", value.trim()))
-            })?;
-            found = Some(n);
+impl Transport for JsonRpcTransport {
+    fn send_frame(&mut self, frame: WireFrame) -> Result<(), BusError> {
+        match frame {
+            WireFrame::Json(v) => {
+                self.outbound.push(v);
+                Ok(())
+            }
+            WireFrame::Sse { .. } => Err(BusError::Transport(
+                "JsonRpcTransport rejects SSE frames — use SseTransport".into(),
+            )),
         }
     }
-    found.ok_or_else(|| TransportError::Corrupt("missing Content-Length".into()))
+
+    fn try_recv_frame(&mut self) -> Result<Option<WireFrame>, BusError> {
+        Ok(self.inbound.pop_front().map(WireFrame::Json))
+    }
 }
 
-fn skip_ws(buf: &[u8]) -> &[u8] {
-    let i = buf
-        .iter()
-        .position(|b| !b.is_ascii_whitespace())
-        .unwrap_or(buf.len());
-    &buf[i..]
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
+    #[test]
+    fn content_length_roundtrip() {
+        let msg = serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{}});
+        let bytes = JsonRpcTransport::encode_content_length(&msg).unwrap();
+        let mut buf = bytes;
+        let decoded = JsonRpcTransport::try_decode_content_length(&mut buf)
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded, msg);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn content_length_incomplete_returns_none() {
+        let mut buf = b"Content-Length: 100\r\n\r\n{".to_vec();
+        assert!(JsonRpcTransport::try_decode_content_length(&mut buf)
+            .unwrap()
+            .is_none());
+        assert_eq!(buf.len(), 24);
+    }
+
+    #[test]
+    fn length_prefixed_roundtrip() {
+        let msg = serde_json::json!({"method":"ping"});
+        let body = serde_json::to_vec(&msg).unwrap();
+        let mut buf = (body.len() as u32).to_be_bytes().to_vec();
+        buf.extend_from_slice(&body);
+        let decoded = JsonRpcTransport::try_decode_length_prefixed(&mut buf)
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn push_decoded_recv() {
+        let mut t = JsonRpcTransport::new();
+        t.push_decoded(serde_json::json!({"a":1}));
+        match t.try_recv_frame().unwrap() {
+            Some(WireFrame::Json(v)) => assert_eq!(v["a"], 1),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+}

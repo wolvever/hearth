@@ -197,28 +197,29 @@ Same composition class as `PlaceMemory` / `FakeSandbox`: `HostAttach` holds an e
 
 ### Crate layout (contrib)
 
-Transport and Adapter are split. Transport decodes **bytes → Frame** and **fail-closes** on partial leftover / corrupt frames. Adapter maps **Value / Frame → AgentEvent**. There is no public newline `push_line` / `map_wire_line`.
+Transport and Adapter are split. Transport frames **bytes ↔ `WireFrame`**. `AdapterCodec` maps **`WireFrame` ↔ `AgentEvent` / `AgentCommand`**. There is no public newline `push_line` / `map_wire_line`.
 
 ```
 crates/hearth-agent-bus/
   CAPABILITIES.md      # shipped kinds + how to add Claude Code / Cursor
   CONTRIBUTING.md
-  src/lib.rs           # AgentEvent, AgentCommand, CodingAgent, LoopbackAgent
-  src/transport/       # Frame, FramedAgent, jsonrpc / sse / websocket framers
+  REDESIGN.md          # Transport vs Codec rules (stdio scrape banned)
+  src/lib.rs           # AgentEvent, AgentCommand, CodingAgent, FramedAgent, LoopbackAgent
+  src/transport/       # WireFrame, Transport, jsonrpc / sse / websocket
   src/host.rs          # HostAttach, event_bodies
   src/adapters/<name>/
     README.md
     fixtures/*.json
-    mod.rs             # map_notification or map_event
+    mod.rs             # map_* + AdapterCodec
 ```
 
 | Transport | Wire | Rejects |
 | --- | --- | --- |
-| `JsonRpcFramer` | LSP/ACP `Content-Length` | NDJSON, missing length, invalid JSON, leftover on `finish` |
-| `SseFramer` | WHATWG EventSource | Single-line `data:` strip, non-JSON data (except `[DONE]`), leftover event |
-| `WsJsonFramer` | one WS text message | concatenated JSON values |
+| `JsonRpcTransport` | LSP/ACP `Content-Length` or u32 length-prefix | NDJSON, missing length, invalid JSON, SSE frames |
+| `SseTransport` | WHATWG EventSource (`event` / `data` / `id`) | Single-line `data:` strip inside adapters, non-JSON data (except `[DONE]`) |
+| `WebSocketJsonTransport` | one WS text message | concatenated JSON values, SSE frames |
 
-`FramedAgent::push_frame(Value)` is the decoded path; `push_bytes(&mut Framer, &[u8])` is the byte path. Live process spawn is optional and not required for the kernel bar.
+`FramedAgent<T, C>` is `Transport` + `AdapterCodec`. Decoded path: `JsonRpcTransport::push_decoded` / `SseTransport::push_frame`. Byte path: `try_decode_content_length` / `parse_event_block` / `decode_text`, then `push_decoded`. Live process spawn is optional and not required for the kernel bar.
 
 ### Outbound `AgentCommand` (Hearth → agent)
 
@@ -339,9 +340,9 @@ A Tag **channel** is a `Session`. Not a Channel type. A Multica **Issue** is a `
 | attach / resume | same `Binding.id` (no remint) |
 | `AgentEvent` drain | `Session` EventLog append (`turn_start` / `append` / …) |
 | `AgentCommand::Compact` | after `compact_with_handoff` (Place `handoff.md`) |
-| bytes → Frame | `JsonRpcFramer` / `SseFramer` / `WsJsonFramer` (fail closed) |
-| Frame → AgentEvent | `adapters::map_native` / `map_frame` |
-| `FramedAgent` | `push_frame` / `push_bytes` (not `push_line`) |
+| bytes → WireFrame | `JsonRpcTransport` / `SseTransport` / `WebSocketJsonTransport` |
+| WireFrame → AgentEvent | `AdapterCodec::decode_event` / `adapters::decode_frame` / `map_native` |
+| `FramedAgent<T, C>` | `transport_mut().push_decoded(...)` (not `push_line`) |
 | Goose ypipe child | unchanged; bus is for *external* coding agents |
 
 ### Two runtimes / host chrome

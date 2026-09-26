@@ -1,7 +1,5 @@
 //! Codex App Server JSON-RPC (openai/codex).
 //! thread/turn/item lifecycle, approvals, compaction.
-//!
-//! Transport: [`crate::transport::JsonRpcFramer`]. Mapper: [`map_notification`].
 
 use crate::{AgentEvent, AgentKind, BusError, ToolStatus};
 use serde_json::Value;
@@ -77,6 +75,7 @@ pub fn map_notification(msg: &Value) -> Result<AgentEvent, BusError> {
     }
 }
 
+
 fn map_item(method: &str, session_id: &str, params: &Value) -> Result<AgentEvent, BusError> {
     let item = params.get("item").cloned().unwrap_or(Value::Null);
     let ty = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -144,17 +143,80 @@ fn map_item(method: &str, session_id: &str, params: &Value) -> Result<AgentEvent
     }
 }
 
+
+use crate::adapters::AdapterCodec;
+use crate::transport::WireFrame;
+use crate::AgentCommand;
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CodexCodec;
+
+impl AdapterCodec for CodexCodec {
+    fn kind(&self) -> AgentKind {
+        AgentKind::Codex
+    }
+
+    fn wire(&self) -> &'static str {
+        "jsonrpc-content-length"
+    }
+
+    fn decode_event(&self, frame: &WireFrame) -> Result<Option<AgentEvent>, BusError> {
+        match frame {
+            WireFrame::Json(v) => map_notification(v).map(Some),
+            WireFrame::Sse { .. } => Err(BusError::Decode(
+                "codex expects JSON-RPC frames, not SSE".into(),
+            )),
+        }
+    }
+
+    fn encode_command(&self, cmd: &AgentCommand) -> Result<WireFrame, BusError> {
+        let (method, params) = match cmd {
+            AgentCommand::UserMessage { session_id, text } => (
+                "turn/start",
+                serde_json::json!({ "threadId": session_id, "input": text }),
+            ),
+            AgentCommand::Compact { session_id } => (
+                "thread/compact",
+                serde_json::json!({ "threadId": session_id }),
+            ),
+            AgentCommand::Abort { session_id } => (
+                "turn/abort",
+                serde_json::json!({ "threadId": session_id }),
+            ),
+            _ => return Err(BusError::Unsupported("codex command stub")),
+        };
+        Ok(WireFrame::Json(serde_json::json!({
+            "method": method,
+            "params": params,
+        })))
+    }
+}
+
 #[cfg(test)]
-mod tests {
+mod map_tests {
     use super::*;
 
+    fn fixture(name: &str) -> serde_json::Value {
+        let path = format!(
+            "{}/src/adapters/codex/fixtures/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        serde_json::from_str(&raw).unwrap()
+    }
+
     #[test]
-    fn fixture_item_reasoning() {
-        let raw: Value =
-            serde_json::from_str(include_str!("fixtures/item_reasoning.json")).unwrap();
-        match map_notification(&raw).unwrap() {
+    fn map_reasoning_fixture() {
+        let ev = map_notification(&fixture("item_reasoning.json")).unwrap();
+        match ev {
             AgentEvent::Thinking { text, .. } => assert!(text.contains("consider")),
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn map_turn_started_fixture() {
+        let ev = map_notification(&fixture("turn_started.json")).unwrap();
+        assert!(matches!(ev, AgentEvent::TurnStarted { .. }));
     }
 }

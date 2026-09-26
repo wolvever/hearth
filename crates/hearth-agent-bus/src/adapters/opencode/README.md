@@ -1,21 +1,12 @@
-# OpenCode adapter
+# opencode adapter
 
-[anomalyco/opencode](https://github.com/anomalyco/opencode) EventV2 over SSE.
+- **Source:** `anomalyco/opencode` EventV2 bus
+- **Wire:** HTTP + SSE via `SseTransport` (typed EventSource frames)
+- **Codec:** `OpenCodeCodec` — `map_event` on the JSON `data` payload
 
-| Layer | Type |
-| --- | --- |
-| Transport | `SseFramer` (WHATWG EventSource: blank-line dispatch, joined `data:` lines) |
-| Adapter | `map_event(&Value) -> AgentEvent` |
+Do **not** call a generic "stdio line" helper that strips `data:`. Feed
+`SseFrame { event, data }` from the SSE transport instead.
 
-Do not strip a single `data:` prefix and parse. Feed the byte stream to `SseFramer`. `data: [DONE]` is a stream terminator, not JSON.
-
-## Mapped types
-
-- `session.created` / `session.status` / `session.error`
-- `message.part.updated` / `message.part.delta` → thinking / tool / message / compact
-- `permission.asked` → `PermissionAsk`
-- `question.asked` → `QuestionAsk`
-
-## Fixtures
-
-- `fixtures/permission_asked.json` — `permission.asked` → `PermissionAsk`
+```bash
+cargo test -p hearth_agent_bus opencode::
+```
