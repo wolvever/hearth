@@ -8,5 +8,5 @@ Do **not** call a generic "stdio line" helper that strips `data:`. Feed
 `SseFrame { event, data }` from the SSE transport instead.
 
 ```bash
-cargo test -p hearth_agent_bus opencode::
+cargo test -p hearth-agent-wire opencode::
 ```

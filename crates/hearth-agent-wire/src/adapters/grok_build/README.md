@@ -17,5 +17,5 @@ Use `transport::JsonRpcTransport::try_decode_content_length` at the I/O boundary
 | `fixtures/permission_request.json` | `AgentEvent::PermissionAsk` |
 
 ```bash
-cargo test -p hearth_agent_bus grok_build::
+cargo test -p hearth-agent-wire grok_build::
 ```

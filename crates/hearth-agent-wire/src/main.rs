@@ -1,7 +1,7 @@
 //! Demo: map sample native payloads from each harness into AgentEvent.
 
-use hearth_agent_bus::adapters::{codex, grok_build, opencode, pi};
-use hearth_agent_bus::*;
+use hearth_agent_wire::adapters::{codex, grok_build, opencode, pi};
+use hearth_agent_wire::*;
 
 fn check(name: &str, ok: bool) {
     if ok {
@@ -97,5 +97,5 @@ fn main() {
         .contains("compact"),
     );
 
-    println!("summary: 6 passed — unified bus ready for Hearth wiring");
+    println!("summary: 6 passed — unified wire ready for Hearth");
 }

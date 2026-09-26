@@ -1,7 +1,7 @@
 # Redesign: Transport vs Codec (contrib-friendly)
 
 **Date:** 2026-09-26 (Asia/Shanghai)  
-**Scope:** `crates/hearth-agent-bus` (mirrored from the Agent Research redesign toy)  
+**Scope:** `crates/hearth-agent-wire` (mirrored from the Agent Research redesign toy)  
 **Not in scope:** SoftExpiring, Flush-before-dispatch, DualGate, AdmitCommit
 
 ## Cheng feedback (quoted intent)
@@ -78,7 +78,7 @@ Tests encode the anti-pattern: `wire_line_maps_stdio_json_and_sse`,
 brittle (partial lines, banner text, log noise, multi-line JSON, missing
 Content-Length). It also teaches contributors the wrong extension point.
 
-### What to change in HostAttach / bus (exact guidance)
+### What to change in HostAttach / wire (exact guidance)
 
 Keep:
 
@@ -105,7 +105,7 @@ may contain newlines inside JSON strings when using Content-Length).
 
 ### Suggested PR #5 follow-up commit message
 
-`bus: split Transport/Codec; drop map_wire_line stdio scrape`
+`wire: split Transport/Codec; drop map_wire_line stdio scrape`
 
 ## How a new agent lands in &lt;1 afternoon
 
