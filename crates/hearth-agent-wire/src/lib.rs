@@ -1,8 +1,8 @@
 //! Unified coding-agent wire for Hearth.
 //!
-//! Normalizes Grok Build (ACP), Codex App Server, Pi harness, and OpenCode
-//! SSE into one `AgentEvent` / `AgentCommand` vocabulary so Hearth can talk
-//! to any of them without a seventh kernel noun.
+//! Normalizes generic ACP, Grok Build (ACP profile), Codex App Server, Pi
+//! harness, and OpenCode SSE into one `AgentEvent` / `AgentCommand` vocabulary
+//! so Hearth can talk to any of them without a seventh kernel noun.
 //!
 //! [`HostAttach`] composes with Place / Session / Binding the way
 //! [`hearth::PlaceMemory`] and [`hearth::FakeSandbox`] compose: claim-aware
@@ -44,6 +44,8 @@ pub enum AgentKind {
     Codex,
     Pi,
     OpenCode,
+    /// Generic ACP / catalog profile. Binding kind is `"acp"` via `Host::Other`.
+    Acp,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -523,7 +525,11 @@ mod tests {
 
     #[test]
     fn registry_discoverable() {
-        assert_eq!(crate::registry().len(), 4);
+        assert_eq!(crate::registry().len(), 5);
         assert!(crate::lookup(AgentKind::Pi).unwrap().capabilities.contains(&"subagent"));
+        assert_eq!(
+            crate::lookup(AgentKind::Acp).unwrap().wire,
+            "jsonrpc-content-length"
+        );
     }
 }

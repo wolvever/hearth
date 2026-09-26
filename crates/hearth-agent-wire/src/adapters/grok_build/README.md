@@ -2,7 +2,7 @@
 
 - **Source:** `xai-org/grok-build` (`grok agent stdio` / `serve`)
 - **Wire:** Content-Length JSON-RPC (ACP) via `JsonRpcTransport`
-- **Codec:** `GrokBuildCodec` — `map_notification` on already-decoded JSON-RPC messages
+- **Codec:** `GrokBuildCodec` — `map_notification` delegates to `acp::map_*` and keeps `AgentKind::GrokBuild`
 
 ## Rules
 
