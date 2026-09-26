@@ -10,8 +10,12 @@ is a later catalog slice — this folder is map + codec only.
 
 ## Caps defaults
 
-session · message · tool · thinking · plan · permission  
-(compact encode is a stub; question / subagent are unset until a profile overrides)
+[`CapabilityFlags::ACP`](../../capabilities.rs): session · message · tool ·
+thinking · plan · permission.
+
+Compact encode is a stub (`compact: false`); question / subagent / Paseo
+reserved flags stay unset until a profile or later slice overrides. See
+`CAPABILITIES.md`.
 
 ## Rules
 
