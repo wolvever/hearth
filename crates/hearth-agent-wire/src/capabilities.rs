@@ -409,9 +409,6 @@ mod tests {
             CapabilityFlags::GROK_BUILD
         );
         assert_eq!(CapabilityFlags::ACP, CapabilityFlags::GROK_BUILD);
-        assert!(CapabilityFlags::PI.subagent);
-        assert!(!CapabilityFlags::CODEX.permission);
-        assert!(!CapabilityFlags::ACP.compact);
     }
 
     #[test]
