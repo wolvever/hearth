@@ -11,7 +11,9 @@
 pub mod adapters;
 pub mod host;
 
-pub use host::{binding_kind, event_bodies, host_for, AttachError, HostAttach, WireAgent};
+pub use host::{
+    binding_kind, event_bodies, host_for, AttachError, AttachResult, HostAttach, WireAgent,
+};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

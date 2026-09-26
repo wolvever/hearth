@@ -25,7 +25,7 @@ pub enum AttachError {
     Bus(#[from] BusError),
 }
 
-pub type Result<T> = std::result::Result<T, AttachError>;
+pub type AttachResult<T> = std::result::Result<T, AttachError>;
 
 /// Binding `kind` string for an [`AgentKind`]. [`AgentKind::GrokBuild`] is
 /// `grok_build`, distinct from chat [`HostKind::Grok`] (`grok`).
@@ -153,7 +153,7 @@ impl<A: CodingAgent> HostAttach<A> {
 
     /// Mint Binding once via [`Session::bind_host`], then attach. Further
     /// reconnects must use [`Self::attach`] / [`Self::resume`].
-    pub fn bind(session: &Session, agent: AgentId, host: Host, coding: A) -> Result<Self> {
+    pub fn bind(session: &Session, agent: AgentId, host: Host, coding: A) -> AttachResult<Self> {
         let binding = session.bind_host(Some(agent), host)?;
         Ok(Self::attach(binding, agent, coding))
     }
@@ -180,13 +180,13 @@ impl<A: CodingAgent> HostAttach<A> {
             .unwrap_or_else(|| format!("{}", self.binding.id.0))
     }
 
-    pub fn send(&mut self, cmd: AgentCommand) -> Result<()> {
+    pub fn send(&mut self, cmd: AgentCommand) -> AttachResult<()> {
         self.coding.send(cmd)?;
         Ok(())
     }
 
     /// Open the native agent session. Does not remint Binding.
-    pub fn open(&mut self, cwd: Option<String>) -> Result<()> {
+    pub fn open(&mut self, cwd: Option<String>) -> AttachResult<()> {
         self.coding.send(AgentCommand::OpenSession {
             project_id: self
                 .binding
@@ -204,7 +204,7 @@ impl<A: CodingAgent> HostAttach<A> {
         session: &Session,
         user: UserId,
         text: impl Into<String>,
-    ) -> Result<Event> {
+    ) -> AttachResult<Event> {
         let text = text.into();
         let ev = session.user_message(user, text.clone())?;
         self.coding.send(AgentCommand::UserMessage {
@@ -220,7 +220,7 @@ impl<A: CodingAgent> HostAttach<A> {
         session: &Session,
         user: UserId,
         text: impl Into<String>,
-    ) -> Result<Event> {
+    ) -> AttachResult<Event> {
         let text = text.into();
         let ev = session.user_message(user, text.clone())?;
         self.coding.send(AgentCommand::Steer {
@@ -237,7 +237,7 @@ impl<A: CodingAgent> HostAttach<A> {
         allowed: bool,
         by: UserId,
         permission_id: impl Into<String>,
-    ) -> Result<Event> {
+    ) -> AttachResult<Event> {
         let ev = session.decide_permission(request, allowed, by)?;
         self.coding.send(AgentCommand::ReplyPermission {
             session_id: self.wire_session(),
@@ -257,7 +257,7 @@ impl<A: CodingAgent> HostAttach<A> {
         start: EventId,
         end: EventId,
         working: Option<WorkingState>,
-    ) -> Result<Event> {
+    ) -> AttachResult<Event> {
         let ev = session.compact_with_handoff(memory, self.binding.id, start, end, working)?;
         self.coding.send(AgentCommand::Compact {
             session_id: self.wire_session(),
@@ -267,7 +267,7 @@ impl<A: CodingAgent> HostAttach<A> {
     }
 
     /// Drain inbound [`AgentEvent`]s onto the Session EventLog.
-    pub fn drain(&mut self, session: &Session) -> Result<Vec<Event>> {
+    pub fn drain(&mut self, session: &Session) -> AttachResult<Vec<Event>> {
         let mut out = Vec::new();
         while let Some(ev) = self.coding.try_recv()? {
             out.extend(self.apply(session, ev)?);
@@ -275,7 +275,7 @@ impl<A: CodingAgent> HostAttach<A> {
         Ok(out)
     }
 
-    fn apply(&mut self, session: &Session, ev: AgentEvent) -> Result<Vec<Event>> {
+    fn apply(&mut self, session: &Session, ev: AgentEvent) -> AttachResult<Vec<Event>> {
         match &ev {
             AgentEvent::SessionStarted { session_id, .. } => {
                 self.native_session = Some(session_id.clone());
@@ -296,7 +296,7 @@ impl<A: CodingAgent> HostAttach<A> {
 
 impl HostAttach<LoopbackAgent> {
     /// Bind + LoopbackAgent for Host tests.
-    pub fn loopback(session: &Session, agent: AgentId, kind: AgentKind) -> Result<Self> {
+    pub fn loopback(session: &Session, agent: AgentId, kind: AgentKind) -> AttachResult<Self> {
         Self::bind(
             session,
             agent,
@@ -323,7 +323,7 @@ impl WireAgent {
         }
     }
 
-    pub fn push_line(&mut self, line: &str) -> Result<()> {
+    pub fn push_line(&mut self, line: &str) -> AttachResult<()> {
         if let Some(ev) = adapters::map_wire_line(self.kind, line)? {
             self.inbound.push(ev);
         }
