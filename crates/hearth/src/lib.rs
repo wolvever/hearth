@@ -28,7 +28,7 @@ pub use sandbox::FakeSandbox;
 pub use host::{
     grok_api_key, Host, HostKind, HostTicket, ClaudeCode as ClaudeCodeHost, Codex as CodexHost,
     Dsh as DshHost, Fx as FxHost, Pi as PiHost, OpenCode as OpenCodeHost, Goose as GooseHost,
-    Grok as GrokHost,
+    Grok as GrokHost, GrokBuild as GrokBuildHost,
 };
 pub use runtime::{HolderId, KeepSpec, Liveness, Runtime, SessionTurnLease, StepOutcome, Wake};
 
@@ -1319,6 +1319,18 @@ mod tests {
     }
 
     #[test]
+    fn host_kind_grok_build_is_typed_host() {
+        let host = HostKind::GrokBuild.host(Some("resume".into()), Some("box".into()));
+        assert!(matches!(host, Host::GrokBuild(_)));
+        assert_eq!(host.kind_str(), "grok_build");
+        assert_eq!(host.native_resume_id(), Some("resume"));
+        assert_eq!(host.sandbox_id(), Some("box"));
+        let through = Host::from_bind("grok_build", None, None);
+        assert!(matches!(through, Host::GrokBuild(_)));
+        assert!(!matches!(through, Host::Grok(_)));
+    }
+
+    #[test]
     fn bind_agent_goose_kind_string_goes_through_host() {
         let store = InMemory::new();
         let agent = store.create_agent("multi", "");
@@ -1554,10 +1566,14 @@ mod environment {
         let grok = session
             .bind_agent(agent.id, HostKind::Grok, None, None)
             .unwrap();
+        let grok_build = session
+            .bind_agent(agent.id, HostKind::GrokBuild, None, None)
+            .unwrap();
         assert_eq!(dsh.kind, "dsh");
         assert_eq!(oc.kind, "opencode");
         assert_eq!(goose.kind, "goose");
         assert_eq!(grok.kind, "grok");
+        assert_eq!(grok_build.kind, "grok_build");
         assert_eq!(dsh.agent, Some(agent.id));
     }
 }

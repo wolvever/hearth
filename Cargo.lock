@@ -234,6 +234,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hearth-agent-bus"
+version = "0.1.0"
+dependencies = [
+ "hearth",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "hearth-managed"
 version = "0.1.0"
 dependencies = [

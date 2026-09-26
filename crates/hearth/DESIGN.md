@@ -1,6 +1,6 @@
 # hearth
 
-Session-first kernel. Six product names: **User**, **Agent**, **Session**, **Binding**, **Event**, **Place**. `Store` / `InMemory` persist them; `Provisioner` records a `Binding` without spawning a CLI; `FakeSandbox` is a host-side file map keyed by `sandbox_id`; `PlaceMemory` is durable memory files under a Place **claim**. None of those is a seventh concept. `Runtime` keeps Sessions so an Agent can wake on user queries, timers, and triggers — same class as Store / Provisioner / Host / FakeSandbox / PlaceMemory, not a seventh name.
+Session-first kernel. Six product names: **User**, **Agent**, **Session**, **Binding**, **Event**, **Place**. `Store` / `InMemory` persist them; `Provisioner` records a `Binding` without spawning a CLI; `FakeSandbox` is a host-side file map keyed by `sandbox_id`; `PlaceMemory` is durable memory files under a Place **claim**. None of those is a seventh concept. `Runtime` keeps Sessions so an Agent can wake on user queries, timers, and triggers — same class as Store / Provisioner / Host / FakeSandbox / PlaceMemory, not a seventh name. `hearth-agent-bus` is an **adapter layer** (unified `AgentEvent` / `AgentCommand` for Grok Build, Codex, Pi, OpenCode) plus a thin `HostAttach` under Place / Session / Binding — not a seventh noun and not a Queue.
 
 ## Six concepts
 
@@ -18,7 +18,7 @@ A member is `UserId` or `AgentId`. One agent may sit in many sessions; one sessi
 | Field | Role |
 | --- | --- |
 | `id` | `BindingId` |
-| `kind` | Host string (`claude_code`, `codex`, `dsh`, `fx`, `pi`, `opencode`, `goose`, `grok`, or adapter strings such as `paseo-cli` / `claude-managed`) |
+| `kind` | Host string (`claude_code`, `codex`, `dsh`, `fx`, `pi`, `opencode`, `goose`, `grok`, `grok_build`, or adapter strings such as `paseo-cli` / `claude-managed`) |
 | `native_resume_id` | Provider resume token |
 | `sandbox_id` | Shared host place key (string). Not `Place`. |
 | `agent` | Optional `AgentId` for leave-scoped unbind |
@@ -116,7 +116,7 @@ There is no Place attach/detach event. `attach_place` / `detach_place` mutate se
 
 ### Grok test path
 
-`HostKind::Grok` (`"grok"`) is a Binding kind like Goose — not a seventh kernel name, not an Environment. Production `hearth-service` keep stays Goose.
+`HostKind::Grok` (`"grok"`) is a Binding kind like Goose — not a seventh kernel name, not an Environment. Production `hearth-service` keep stays Goose. `HostKind::GrokBuild` (`"grok_build"`) is the ACP coding-agent ticket used by `hearth-agent-bus`, distinct from the xAI chat ticket.
 
 ```
 # skip (exit 0): neither key set
@@ -189,6 +189,67 @@ Session::compact_with_handoff(memory, binding, start, end, working)
 
 Writes take the claiming `BindingId`. `transfer_claim(from, to)` moves the claim; it does not remint Binding or Session.
 
+## Agent bus (`hearth-agent-bus`)
+
+Adapter layer so Host can talk to external coding agents (Grok Build ACP, Codex App Server, Pi harness, OpenCode SSE) through one `AgentEvent` / `AgentCommand` surface. **Not a seventh kernel noun.** Host↔Goose remains the runtime child over ypipe. This crate normalizes *external* agents so Session/EventLog can record and steer them uniformly. No Queue type — bus buffers are transport-local only (`LoopbackAgent`, `WireAgent`).
+
+Same composition class as `PlaceMemory` / `FakeSandbox`: `HostAttach` holds an existing `Binding` plus a `CodingAgent`. Bind once (`HostAttach::bind` → `session.bind_host`); attach/resume reuse that `Binding.id` (no remint). Native resume tokens stay on `Binding.native_resume_id`. Subagent/task ids correlate on the EventLog; they do not mint child Sessions or Bindings.
+
+### Crate layout
+
+```
+crates/hearth-agent-bus/
+  src/lib.rs           # AgentEvent, AgentCommand, CodingAgent, LoopbackAgent
+  src/host.rs          # HostAttach, event_bodies, WireAgent (stdio/SSE lines)
+  src/adapters/
+    grok_build.rs      # ACP JSON-RPC → AgentEvent
+    codex.rs           # App Server JSON-RPC → AgentEvent
+    pi.rs              # harness watch events → AgentEvent
+    opencode.rs        # SSE EventV2 → AgentEvent
+```
+
+Mappers are pure JSON → `AgentEvent`. `adapters::map_wire_line` accepts one stdio JSON line or an OpenCode `data:` SSE line. Live process spawn is optional and not required for the kernel bar.
+
+### Outbound `AgentCommand` (Hearth → agent)
+
+`CreateProject` / `OpenSession` / `CloseSession` / `UserMessage` / `Steer` / `Abort` / `ReplyPermission` / `ReplyQuestion` / `Compact` / `SpawnTask` / `CancelTask`.
+
+### Inbound `AgentEvent` (agent → Hearth)
+
+Session/project lifecycle, message and thinking (plus deltas), tool call upsert + result, plan, `PermissionAsk` / `QuestionAsk`, task / subagent lifecycle, `CompactStarted` / `Compacted`, status, error, `Native` (unmapped payload).
+
+### EventLog mapping
+
+`HostAttach::drain` appends through existing Session methods. Binding is not reminted.
+
+| AgentEvent | EventLog |
+| --- | --- |
+| `TurnStarted` / `TurnCompleted` | `turn_start` / `turn_end` (allocate / clear turn ids) |
+| assistant `Message` / `MessageDelta` | `AgentMessage` |
+| `Thinking` / `ThinkingDelta` | `AgentThink` (log only; not `surface`) |
+| `ToolCall` / `ToolResult` | `ToolCall` / `ToolResult` |
+| `Plan` | `AgentMessage` (joined entries) |
+| `PermissionAsk` | `PermissionAsked` |
+| `QuestionAsk` | `AskUser` |
+| `TaskCompleted` | `AgentMessage` (`task {id} ok\|failed`) |
+| `SessionStarted` | remember native session id on the attach; no Event, no remint |
+| `CompactStarted` / `Compacted` | ignored on drain (must not append a second `Compact`) |
+| lifecycle / `Status` / `Error` / `Native` / subagent start | not appended |
+
+`HostAttach::user_message` is occupancy-checked `Session::user_message` then outbound `UserMessage`. Permission reply is `decide_permission` then `ReplyPermission`.
+
+### Compact
+
+`AgentCommand::Compact` **composes with** PreCompactHandoff. `HostAttach::compact_with_handoff` calls `Session::compact_with_handoff` (flush `memory/handoff.md` under the Binding's Place claim, EventLog `Compact` whose summary *references* Place paths) and only then sends `AgentCommand::Compact`. It does not replace `Session::compact` (EventLog primitive) and does not write memory itself. Place-backed `compact_with_handoff` / `handoff.md` stay intact.
+
+### Host kinds
+
+`AgentKind::{GrokBuild, Codex, Pi, OpenCode}` map to Binding kinds `grok_build` / `codex` / `pi` / `opencode` via `host_for` / `Host::from_bind`. `grok_build` is ACP; `grok` remains the xAI chat ticket.
+
+### Parked (do not land here)
+
+SoftExpiring pile, DualGate, AdmitCommit, Flush-before-dispatch, EffectId upsert, Evidence-before-next-inference, Stage-before-cutover (beyond what is already on main), host heartbeat, Binding fence, turn-lease renew. Runtime already has a lease fence for durable steps; the bus does not add another.
+
 ## Join / leave / unbind / place
 
 - `join` is occupancy only — no Binding, no Place.
@@ -216,10 +277,11 @@ Claude Tag **channel** and Multica **Issue** are Sessions in adapters. MA **Sess
 ## Layout
 
 ```
-crates/hearth/           kernel (lib.rs, host.rs, place.rs, place_memory.rs, sandbox.rs, runtime.rs)
-crates/hearth-paseo/     Paseo name map (no daemon / worktree supervisor)
-crates/hearth-managed/   MA / Tag name map
-crates/hearth-service/   local HTTP + WebSocket
+crates/hearth/              kernel (lib.rs, host.rs, place.rs, place_memory.rs, sandbox.rs, runtime.rs)
+crates/hearth-agent-bus/    unified AgentEvent / AgentCommand + HostAttach (not a seventh noun)
+crates/hearth-paseo/        Paseo name map (no daemon / worktree supervisor)
+crates/hearth-managed/      MA / Tag name map
+crates/hearth-service/      local HTTP + WebSocket
 ```
 
 Examples: `steer.rs`, `two_runtimes.rs`.
@@ -257,6 +319,18 @@ Paseo collapses chat and running CLI. hearth splits them: the room outlives the 
 ### Claude Tag / Multica
 
 A Tag **channel** is a `Session`. Not a Channel type. A Multica **Issue** is a `Session` in the adapter. Not Issue/Thread/Squad in the kernel.
+
+### Agent bus (`hearth-agent-bus`)
+
+| Bus idea | hearth |
+| --- | --- |
+| `AgentEvent` / `AgentCommand` | adapter vocabulary — not a kernel type |
+| `HostAttach` | PlaceMemory-shaped composer over one Binding |
+| attach / resume | same `Binding.id` (no remint) |
+| `AgentEvent` drain | `Session` EventLog append (`turn_start` / `append` / …) |
+| `AgentCommand::Compact` | after `compact_with_handoff` (Place `handoff.md`) |
+| stdio / SSE lines | `WireAgent` / `map_wire_line` (transport-local) |
+| Goose ypipe child | unchanged; bus is for *external* coding agents |
 
 ### Two runtimes / host chrome
 
@@ -298,13 +372,14 @@ No HTTP for bind, unbind, compact, ask/decide, or Place swap.
 - `AskUser` is an event, not a blocking RPC.
 - `FakeSandbox` is an in-crate hashmap, not isolation.
 - `PlaceMemory` is an in-crate file map (not fsync'd onto `LocalDir`). A durable Place would persist the same paths.
-- SoftExpiring pile / DualGate / AdmitCommit and Flush-before-dispatch stay **parked**.
-- Adapters (`hearth-paseo`, `hearth-managed`) convert names; they do not embed those products.
+- SoftExpiring pile / DualGate / AdmitCommit and Flush-before-dispatch stay **parked**. Also parked on the agent bus: EffectId upsert, Evidence-before-next-inference, Stage-before-cutover (beyond main), host heartbeat, Binding fence, turn-lease renew.
+- Adapters (`hearth-paseo`, `hearth-managed`, `hearth-agent-bus`) convert names / wire formats; they do not embed those products. The bus is not a seventh noun and not a Queue.
+- `hearth-agent-bus` mappers + `LoopbackAgent` / `WireAgent` are in-process. Stdio/SSE line attach is welcome; live CLI spawn/PTY is still Host follow-on.
 
 
 ## Three parts of a host bind
 
-Adding OpenCode, Goose, Dsh, and the others is three pieces. **Host is not a seventh kernel name.**
+Adding OpenCode, Goose, Grok Build, Dsh, and the others is three pieces. **Host is not a seventh kernel name.** External coding-agent I/O goes through `hearth-agent-bus` (`HostAttach`); Goose over ypipe is unchanged.
 
 1. **User params** — what `bind` / `bind_agent` already take: optional `agent`, `kind`, `native_resume_id`, `sandbox_id`.
 2. **Host type** — a real Rust type constructed when `HostKind::Goose` (etc.) is passed: `Host::Goose(ticket)`. Known hosts share `HostTicket` (`native_resume_id`, `sandbox_id`). `HostKind::host` and `Host::from_bind` build it. Adapter strings (`paseo-cli`, …) become `Host::Other`. Not an Agent subclass.
@@ -316,7 +391,7 @@ Adding OpenCode, Goose, Dsh, and the others is three pieces. **Host is not a sev
 
 OpenCode, Goose, Grok, DeepSeek Harness, and the others are **Binding kinds** (via a typed `Host` ticket), not new Agent types. One `Agent` identity can bind as `opencode` in one session and `grok` in another.
 
-1. Add one line to the `hosts!` list in `host.rs` (`HostKind` + `Host` + `as_str`). Or pass a raw string → `Host::Other`. `dsh` is DeepSeek Harness. `grok` is the xAI ticket (see Grok test path).
+1. Add one line to the `hosts!` list in `host.rs` (`HostKind` + `Host` + `as_str`). Or pass a raw string → `Host::Other`. `dsh` is DeepSeek Harness. `grok` is the xAI chat ticket (see Grok test path). `grok_build` is Grok Build ACP via `hearth-agent-bus`.
 2. `store.create_agent(...)` then `join` then `bind_agent(id, HostKind::OpenCode, resume, sandbox)` or `bind_host(Some(id), HostKind::OpenCode.host(resume, sandbox))`.
 3. Spawn and resume stay in a host crate / `Provisioner`. The kernel only records the Binding.
 4. Do not add an Agent subclass or a seventh kernel name.
