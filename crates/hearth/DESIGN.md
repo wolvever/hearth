@@ -191,24 +191,34 @@ Writes take the claiming `BindingId`. `transfer_claim(from, to)` moves the claim
 
 ## Agent bus (`hearth-agent-bus`)
 
-Adapter layer so Host can talk to external coding agents (Grok Build ACP, Codex App Server, Pi harness, OpenCode SSE) through one `AgentEvent` / `AgentCommand` surface. **Not a seventh kernel noun.** Host↔Goose remains the runtime child over ypipe. This crate normalizes *external* agents so Session/EventLog can record and steer them uniformly. No Queue type — bus buffers are transport-local only (`LoopbackAgent`, `WireAgent`).
+Adapter layer so Host can talk to external coding agents (Grok Build ACP, Codex App Server, Pi harness, OpenCode SSE) through one `AgentEvent` / `AgentCommand` surface. **Not a seventh kernel noun.** Host↔Goose remains the runtime child over ypipe. This crate normalizes *external* agents so Session/EventLog can record and steer them uniformly. No Queue type — bus buffers are transport-local only (`LoopbackAgent`, `FramedAgent`).
 
 Same composition class as `PlaceMemory` / `FakeSandbox`: `HostAttach` holds an existing `Binding` plus a `CodingAgent`. Bind once (`HostAttach::bind` → `session.bind_host`); attach/resume reuse that `Binding.id` (no remint). Native resume tokens stay on `Binding.native_resume_id`. Subagent/task ids correlate on the EventLog; they do not mint child Sessions or Bindings.
 
-### Crate layout
+### Crate layout (contrib)
+
+Transport and Adapter are split. Transport decodes **bytes → Frame** and **fail-closes** on partial leftover / corrupt frames. Adapter maps **Value / Frame → AgentEvent**. There is no public newline `push_line` / `map_wire_line`.
 
 ```
 crates/hearth-agent-bus/
+  CAPABILITIES.md      # shipped kinds + how to add Claude Code / Cursor
+  CONTRIBUTING.md
   src/lib.rs           # AgentEvent, AgentCommand, CodingAgent, LoopbackAgent
-  src/host.rs          # HostAttach, event_bodies, WireAgent (stdio/SSE lines)
-  src/adapters/
-    grok_build.rs      # ACP JSON-RPC → AgentEvent
-    codex.rs           # App Server JSON-RPC → AgentEvent
-    pi.rs              # harness watch events → AgentEvent
-    opencode.rs        # SSE EventV2 → AgentEvent
+  src/transport/       # Frame, FramedAgent, jsonrpc / sse / websocket framers
+  src/host.rs          # HostAttach, event_bodies
+  src/adapters/<name>/
+    README.md
+    fixtures/*.json
+    mod.rs             # map_notification or map_event
 ```
 
-Mappers are pure JSON → `AgentEvent`. `adapters::map_wire_line` accepts one stdio JSON line or an OpenCode `data:` SSE line. Live process spawn is optional and not required for the kernel bar.
+| Transport | Wire | Rejects |
+| --- | --- | --- |
+| `JsonRpcFramer` | LSP/ACP `Content-Length` | NDJSON, missing length, invalid JSON, leftover on `finish` |
+| `SseFramer` | WHATWG EventSource | Single-line `data:` strip, non-JSON data (except `[DONE]`), leftover event |
+| `WsJsonFramer` | one WS text message | concatenated JSON values |
+
+`FramedAgent::push_frame(Value)` is the decoded path; `push_bytes(&mut Framer, &[u8])` is the byte path. Live process spawn is optional and not required for the kernel bar.
 
 ### Outbound `AgentCommand` (Hearth → agent)
 
@@ -329,7 +339,9 @@ A Tag **channel** is a `Session`. Not a Channel type. A Multica **Issue** is a `
 | attach / resume | same `Binding.id` (no remint) |
 | `AgentEvent` drain | `Session` EventLog append (`turn_start` / `append` / …) |
 | `AgentCommand::Compact` | after `compact_with_handoff` (Place `handoff.md`) |
-| stdio / SSE lines | `WireAgent` / `map_wire_line` (transport-local) |
+| bytes → Frame | `JsonRpcFramer` / `SseFramer` / `WsJsonFramer` (fail closed) |
+| Frame → AgentEvent | `adapters::map_native` / `map_frame` |
+| `FramedAgent` | `push_frame` / `push_bytes` (not `push_line`) |
 | Goose ypipe child | unchanged; bus is for *external* coding agents |
 
 ### Two runtimes / host chrome
@@ -374,7 +386,7 @@ No HTTP for bind, unbind, compact, ask/decide, or Place swap.
 - `PlaceMemory` is an in-crate file map (not fsync'd onto `LocalDir`). A durable Place would persist the same paths.
 - SoftExpiring pile / DualGate / AdmitCommit and Flush-before-dispatch stay **parked**. Also parked on the agent bus: EffectId upsert, Evidence-before-next-inference, Stage-before-cutover (beyond main), host heartbeat, Binding fence, turn-lease renew.
 - Adapters (`hearth-paseo`, `hearth-managed`, `hearth-agent-bus`) convert names / wire formats; they do not embed those products. The bus is not a seventh noun and not a Queue.
-- `hearth-agent-bus` mappers + `LoopbackAgent` / `WireAgent` are in-process. Stdio/SSE line attach is welcome; live CLI spawn/PTY is still Host follow-on.
+- `hearth-agent-bus` mappers + `LoopbackAgent` / `FramedAgent` are in-process. Transport is Content-Length JSON-RPC / EventSource / WS JSON — not newline-split stdio. Live CLI spawn/PTY is still Host follow-on.
 
 
 ## Three parts of a host bind

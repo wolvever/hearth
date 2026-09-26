@@ -1,5 +1,7 @@
 //! Codex App Server JSON-RPC (openai/codex).
 //! thread/turn/item lifecycle, approvals, compaction.
+//!
+//! Transport: [`crate::transport::JsonRpcFramer`]. Mapper: [`map_notification`].
 
 use crate::{AgentEvent, AgentKind, BusError, ToolStatus};
 use serde_json::Value;
@@ -139,5 +141,20 @@ fn map_item(method: &str, session_id: &str, params: &Value) -> Result<AgentEvent
             method: format!("item:{other}"),
             payload: params.clone(),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixture_item_reasoning() {
+        let raw: Value =
+            serde_json::from_str(include_str!("fixtures/item_reasoning.json")).unwrap();
+        match map_notification(&raw).unwrap() {
+            AgentEvent::Thinking { text, .. } => assert!(text.contains("consider")),
+            other => panic!("unexpected {other:?}"),
+        }
     }
 }

@@ -8,9 +8,7 @@
 //!
 //! SoftExpiring / DualGate / AdmitCommit / Flush-before-dispatch stay parked.
 
-use crate::{
-    adapters, AgentCommand, AgentEvent, AgentKind, BusError, CodingAgent, LoopbackAgent,
-};
+use crate::{AgentCommand, AgentEvent, AgentKind, BusError, CodingAgent, LoopbackAgent};
 use hearth::{
     AgentId, Binding, Event, EventBody, EventId, Host, HostKind, PlaceMemory, Session, UserId,
     WorkingState,
@@ -306,54 +304,6 @@ impl HostAttach<LoopbackAgent> {
     }
 }
 
-/// Stdio / SSE attach helper: push native JSON (or `data:`) lines, recv events.
-/// Transport-local buffer only — not a Queue noun. Does not spawn a process.
-pub struct WireAgent {
-    kind: AgentKind,
-    inbound: Vec<AgentEvent>,
-    sent: Vec<AgentCommand>,
-}
-
-impl WireAgent {
-    pub fn new(kind: AgentKind) -> Self {
-        Self {
-            kind,
-            inbound: Vec::new(),
-            sent: Vec::new(),
-        }
-    }
-
-    pub fn push_line(&mut self, line: &str) -> AttachResult<()> {
-        if let Some(ev) = adapters::map_wire_line(self.kind, line)? {
-            self.inbound.push(ev);
-        }
-        Ok(())
-    }
-
-    pub fn sent(&self) -> &[AgentCommand] {
-        &self.sent
-    }
-}
-
-impl CodingAgent for WireAgent {
-    fn kind(&self) -> AgentKind {
-        self.kind
-    }
-
-    fn send(&mut self, cmd: AgentCommand) -> Result<(), BusError> {
-        self.sent.push(cmd);
-        Ok(())
-    }
-
-    fn try_recv(&mut self) -> Result<Option<AgentEvent>, BusError> {
-        if self.inbound.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(self.inbound.remove(0)))
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -505,17 +455,23 @@ mod tests {
     }
 
     #[test]
-    fn wire_agent_stdio_line_appends_tool_call() {
+    fn frame_agent_jsonrpc_bytes_append_tool_call() {
+        use crate::{encode_jsonrpc, FramedAgent, JsonRpcFramer};
+
         let (_store, _user, agent, session) = room();
         let binding = session
             .bind_host(Some(agent.id), host_for(AgentKind::GrokBuild, None, None))
             .unwrap();
-        let mut wire = WireAgent::new(AgentKind::GrokBuild);
-        wire.push_line(
-            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call_update","toolCallId":"c1","title":"read","status":"pending"}}}"#,
-        )
+        let raw: serde_json::Value = serde_json::from_str(include_str!(
+            "adapters/grok_build/fixtures/session_update_tool_call.json"
+        ))
         .unwrap();
-        let mut attach = HostAttach::attach(binding, agent.id, wire);
+        let mut agent_io = FramedAgent::new(AgentKind::GrokBuild);
+        let mut framer = JsonRpcFramer::new();
+        agent_io
+            .push_bytes(&mut framer, &encode_jsonrpc(&raw).unwrap())
+            .unwrap();
+        let mut attach = HostAttach::attach(binding, agent.id, agent_io);
         attach.drain(&session).unwrap();
         assert!(session.events().unwrap().iter().any(|e| matches!(
             &e.body,

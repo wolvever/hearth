@@ -1,0 +1,12 @@
+{
+  "method": "item/completed",
+  "params": {
+    "threadId": "th1",
+    "turnId": "tu1",
+    "item": {
+      "type": "reasoning",
+      "id": "r1",
+      "text": "consider options"
+    }
+  }
+}

@@ -1,4 +1,7 @@
 //! OpenCode SSE / EventV2 bus (anomalyco/opencode).
+//!
+//! Transport: [`crate::transport::SseFramer`] (EventSource, blank-line dispatch).
+//! Mapper: [`map_event`].
 
 use crate::{AgentEvent, AgentKind, BusError, PermissionOption, ToolStatus};
 use serde_json::Value;
@@ -145,5 +148,20 @@ pub fn map_event(msg: &Value) -> Result<AgentEvent, BusError> {
             method: other.into(),
             payload: msg.clone(),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixture_permission_asked() {
+        let raw: Value =
+            serde_json::from_str(include_str!("fixtures/permission_asked.json")).unwrap();
+        match map_event(&raw).unwrap() {
+            AgentEvent::PermissionAsk { title, .. } => assert!(title.contains("Allow")),
+            other => panic!("unexpected {other:?}"),
+        }
     }
 }

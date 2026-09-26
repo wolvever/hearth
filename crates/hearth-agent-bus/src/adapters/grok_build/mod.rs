@@ -1,5 +1,7 @@
 //! Grok Build — Agent Client Protocol (ACP) JSON-RPC.
 //! Source: xai-org/grok-build (`grok agent stdio` / `serve`).
+//!
+//! Transport: [`crate::transport::JsonRpcFramer`]. Mapper: [`map_notification`].
 
 use crate::{AgentEvent, AgentKind, BusError, ToolStatus};
 use serde_json::Value;
@@ -152,4 +154,23 @@ fn map_permission_request(params: &Value) -> Result<AgentEvent, BusError> {
             .map(str::to_string),
         options,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixture_tool_call() {
+        let raw: Value =
+            serde_json::from_str(include_str!("fixtures/session_update_tool_call.json")).unwrap();
+        match map_notification(&raw).unwrap() {
+            AgentEvent::ToolCall { item_id, name, status, .. } => {
+                assert_eq!(item_id, "c1");
+                assert_eq!(name, "read");
+                assert_eq!(status, ToolStatus::Pending);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
 }

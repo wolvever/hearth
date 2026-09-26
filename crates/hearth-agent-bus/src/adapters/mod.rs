@@ -1,14 +1,19 @@
-//! Pure JSON → [`crate::AgentEvent`] mappers. Live spawn stays Host-side.
+//! Adapter: [`Frame`] / [`Value`] → [`crate::AgentEvent`].
+//!
+//! Transport (bytes → Frame) lives in [`crate::transport`]. Do not parse
+//! stdio lines here. Each adapter is a folder: `README.md`, `fixtures/*.json`,
+//! and `map_*`. See crate-root `CAPABILITIES.md` / `CONTRIBUTING.md`.
 
 pub mod codex;
 pub mod grok_build;
 pub mod opencode;
 pub mod pi;
 
+use crate::transport::Frame;
 use crate::{AgentEvent, AgentKind, BusError};
 use serde_json::Value;
 
-/// Dispatch a native payload to the adapter for `kind`.
+/// Dispatch a native JSON payload to the adapter for `kind`.
 pub fn map_native(kind: AgentKind, raw: &Value) -> Result<AgentEvent, BusError> {
     match kind {
         AgentKind::GrokBuild => grok_build::map_notification(raw),
@@ -18,23 +23,7 @@ pub fn map_native(kind: AgentKind, raw: &Value) -> Result<AgentEvent, BusError> 
     }
 }
 
-/// One stdio JSON line or OpenCode SSE `data:` line → optional [`AgentEvent`].
-/// Empty lines and SSE `[DONE]` are skipped. Transport-local — not a Queue noun.
-pub fn map_wire_line(kind: AgentKind, line: &str) -> Result<Option<AgentEvent>, BusError> {
-    let line = line.trim();
-    if line.is_empty() {
-        return Ok(None);
-    }
-    let payload = if let Some(rest) = line.strip_prefix("data:") {
-        let rest = rest.trim();
-        if rest.is_empty() || rest == "[DONE]" {
-            return Ok(None);
-        }
-        rest
-    } else {
-        line
-    };
-    let value: Value =
-        serde_json::from_str(payload).map_err(|e| BusError::Decode(e.to_string()))?;
-    map_native(kind, &value).map(Some)
+/// Adapter entry from a decoded transport [`Frame`].
+pub fn map_frame(kind: AgentKind, frame: &Frame) -> Result<AgentEvent, BusError> {
+    map_native(kind, &frame.value)
 }

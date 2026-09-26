@@ -1,5 +1,8 @@
 //! Pi durable harness events (earendil-works/pi).
 //! Snapshot + watch; events not replayed on reconnect.
+//!
+//! Transport: typically [`crate::transport::WsJsonFramer`] (one watch message =
+//! one JSON value). Mapper: [`map_event`].
 
 use crate::{AgentEvent, AgentKind, BusError};
 use serde_json::Value;
@@ -90,5 +93,16 @@ pub fn map_event(msg: &Value) -> Result<AgentEvent, BusError> {
             method: other.into(),
             payload: msg.clone(),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixture_run_start() {
+        let raw: Value = serde_json::from_str(include_str!("fixtures/run_start.json")).unwrap();
+        assert!(matches!(map_event(&raw).unwrap(), AgentEvent::TurnStarted { .. }));
     }
 }

@@ -7,12 +7,19 @@
 //! [`HostAttach`] composes with Place / Session / Binding the way
 //! [`hearth::PlaceMemory`] and [`hearth::FakeSandbox`] compose: claim-aware
 //! where writes matter, Binding ids not reminted on attach or resume.
+//!
+//! Transport (`JsonRpcFramer` / `SseFramer` / `WsJsonFramer`) decodes bytes →
+//! [`Frame`]. Adapters map `Value` / `Frame` → [`AgentEvent`]. There is no
+//! public newline `push_line` / `map_wire_line`.
 
 pub mod adapters;
 pub mod host;
+pub mod transport;
 
-pub use host::{
-    binding_kind, event_bodies, host_for, AttachError, AttachResult, HostAttach, WireAgent,
+pub use host::{binding_kind, event_bodies, host_for, AttachError, AttachResult, HostAttach};
+pub use transport::{
+    encode_jsonrpc, encode_sse, Frame, FramedAgent, FrameKind, Framer, JsonRpcFramer, SseFramer,
+    TransportError, WsJsonFramer, MAX_FRAME_BYTES,
 };
 
 use serde::{Deserialize, Serialize};
@@ -409,25 +416,12 @@ mod tests {
     }
 
     #[test]
-    fn wire_line_maps_stdio_json_and_sse() {
-        let grok = adapters::map_wire_line(
-            AgentKind::GrokBuild,
-            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call_update","toolCallId":"c1","title":"bash","status":"pending"}}}"#,
-        )
-        .unwrap()
+    fn map_frame_uses_adapter_not_line_split() {
+        let raw: serde_json::Value = serde_json::from_str(include_str!(
+            "adapters/grok_build/fixtures/session_update_tool_call.json"
+        ))
         .unwrap();
-        assert!(matches!(grok, AgentEvent::ToolCall { .. }));
-
-        let sse = adapters::map_wire_line(
-            AgentKind::OpenCode,
-            r#"data: {"type":"permission.asked","properties":{"sessionID":"s","id":"p1","title":"run?","options":[]}}"#,
-        )
-        .unwrap()
-        .unwrap();
-        assert!(matches!(sse, AgentEvent::PermissionAsk { .. }));
-
-        assert!(adapters::map_wire_line(AgentKind::OpenCode, "data: [DONE]")
-            .unwrap()
-            .is_none());
+        let ev = adapters::map_frame(AgentKind::GrokBuild, &crate::Frame::json_rpc(raw)).unwrap();
+        assert!(matches!(ev, AgentEvent::ToolCall { .. }));
     }
 }
