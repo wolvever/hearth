@@ -39,44 +39,46 @@ pub struct AdapterInfo {
 }
 
 /// Registry of built-in adapters — add a row when you land a new agent folder.
+const REGISTRY: &[AdapterInfo] = &[
+    AdapterInfo {
+        kind: AgentKind::GrokBuild,
+        name: "grok_build",
+        wire: "jsonrpc-content-length",
+        folder: "adapters/grok_build",
+        flags: CapabilityFlags::for_agent(AgentKind::GrokBuild),
+    },
+    AdapterInfo {
+        kind: AgentKind::Codex,
+        name: "codex",
+        wire: "jsonrpc-content-length",
+        folder: "adapters/codex",
+        flags: CapabilityFlags::for_agent(AgentKind::Codex),
+    },
+    AdapterInfo {
+        kind: AgentKind::Pi,
+        name: "pi",
+        wire: "websocket-json",
+        folder: "adapters/pi",
+        flags: CapabilityFlags::for_agent(AgentKind::Pi),
+    },
+    AdapterInfo {
+        kind: AgentKind::OpenCode,
+        name: "opencode",
+        wire: "http-sse",
+        folder: "adapters/opencode",
+        flags: CapabilityFlags::for_agent(AgentKind::OpenCode),
+    },
+    AdapterInfo {
+        kind: AgentKind::Acp,
+        name: "acp",
+        wire: "jsonrpc-content-length",
+        folder: "adapters/acp",
+        flags: CapabilityFlags::for_agent(AgentKind::Acp),
+    },
+];
+
 pub fn registry() -> &'static [AdapterInfo] {
-    &[
-        AdapterInfo {
-            kind: AgentKind::GrokBuild,
-            name: "grok_build",
-            wire: "jsonrpc-content-length",
-            folder: "adapters/grok_build",
-            flags: CapabilityFlags::for_agent(AgentKind::GrokBuild),
-        },
-        AdapterInfo {
-            kind: AgentKind::Codex,
-            name: "codex",
-            wire: "jsonrpc-content-length",
-            folder: "adapters/codex",
-            flags: CapabilityFlags::for_agent(AgentKind::Codex),
-        },
-        AdapterInfo {
-            kind: AgentKind::Pi,
-            name: "pi",
-            wire: "websocket-json",
-            folder: "adapters/pi",
-            flags: CapabilityFlags::for_agent(AgentKind::Pi),
-        },
-        AdapterInfo {
-            kind: AgentKind::OpenCode,
-            name: "opencode",
-            wire: "http-sse",
-            folder: "adapters/opencode",
-            flags: CapabilityFlags::for_agent(AgentKind::OpenCode),
-        },
-        AdapterInfo {
-            kind: AgentKind::Acp,
-            name: "acp",
-            wire: "jsonrpc-content-length",
-            folder: "adapters/acp",
-            flags: CapabilityFlags::for_agent(AgentKind::Acp),
-        },
-    ]
+    REGISTRY
 }
 
 pub fn lookup(kind: AgentKind) -> Option<&'static AdapterInfo> {
