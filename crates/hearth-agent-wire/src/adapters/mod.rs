@@ -107,6 +107,17 @@ pub fn decode_frame(kind: AgentKind, frame: &WireFrame) -> Result<Option<AgentEv
     }
 }
 
+/// Encode via the registered codec for `kind`.
+pub fn encode_command(kind: AgentKind, cmd: &AgentCommand) -> Result<WireFrame, BusError> {
+    match kind {
+        AgentKind::GrokBuild => grok_build::GrokBuildCodec.encode_command(cmd),
+        AgentKind::Codex => codex::CodexCodec.encode_command(cmd),
+        AgentKind::Pi => pi::PiCodec.encode_command(cmd),
+        AgentKind::OpenCode => opencode::OpenCodeCodec.encode_command(cmd),
+        AgentKind::Acp => acp::AcpCodec.encode_command(cmd),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,5 +135,56 @@ mod tests {
             lookup(AgentKind::Acp).unwrap().wire,
             "jsonrpc-content-length"
         );
+    }
+
+    fn slice2_stub_commands() -> [AgentCommand; 6] {
+        [
+            AgentCommand::SetMode {
+                session_id: "s".into(),
+                mode_id: "plan".into(),
+            },
+            AgentCommand::SetFeature {
+                session_id: "s".into(),
+                feature_id: "thinking".into(),
+                value: serde_json::json!(true),
+            },
+            AgentCommand::ConfigureMcp {
+                session_id: "s".into(),
+                servers: serde_json::json!({}),
+            },
+            AgentCommand::RevertConversation {
+                session_id: "s".into(),
+                message_id: "m1".into(),
+            },
+            AgentCommand::RevertFiles {
+                session_id: "s".into(),
+                message_id: "m1".into(),
+            },
+            AgentCommand::RevertBoth {
+                session_id: "s".into(),
+                message_id: "m1".into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn slice2_commands_encode_unsupported_on_all_adapters() {
+        for info in registry() {
+            assert!(
+                !info.flags.dynamic_modes
+                    && !info.flags.mcp_servers
+                    && !info.flags.rewind_conversation
+                    && !info.flags.rewind_files
+                    && !info.flags.rewind_both,
+                "{} reserved slice-2 flags must stay false while encode is a stub",
+                info.name
+            );
+            for cmd in &slice2_stub_commands() {
+                match encode_command(info.kind, cmd) {
+                    Err(BusError::Unsupported(name)) => assert_eq!(name, cmd.name()),
+                    other => panic!("{} {} => {other:?}", info.name, cmd.name()),
+                }
+            }
+        }
     }
 }

@@ -193,7 +193,7 @@ impl AdapterCodec for OpenCodeCodec {
                 "allow": allow,
                 "optionID": option_id,
             }),
-            _ => return Err(BusError::Unsupported("opencode command stub")),
+            _ => return Err(BusError::Unsupported(cmd.name())),
         };
         Ok(WireFrame::Json(body))
     }

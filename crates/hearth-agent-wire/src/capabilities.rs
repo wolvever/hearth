@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 ///
 /// Landed matrix columns (`session`, `message`, `tool`, …) describe events and
 /// commands this crate already maps. Reserved Paseo fields stay `false` until
-/// later slices (catalog, SetMode, MCP, rewind, session listing).
+/// a later encode lands (catalog, MCP/rewind encode, session listing).
+/// `SetMode` / `ConfigureMcp` / `Revert*` variants exist; flags stay false.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapabilityFlags {
     /// Token / chunk streaming when the wire emits incremental deltas.
@@ -20,19 +21,19 @@ pub struct CapabilityFlags {
     pub session_persistence: bool,
     /// Provider can list existing sessions (later ProviderDriver).
     pub session_listing: bool,
-    /// Dynamic mode switching (`SetMode` — slice 2).
+    /// Dynamic mode switching (`SetMode`). False until an adapter encode lands.
     pub dynamic_modes: bool,
-    /// MCP server configure (`ConfigureMcp` — slice 2).
+    /// MCP server configure (`ConfigureMcp`). False until an adapter encode lands.
     pub mcp_servers: bool,
     /// Thinking / reasoning events (CAPABILITIES `thinking`).
     pub reasoning_stream: bool,
     /// Tool call / result events (CAPABILITIES `tool`).
     pub tool_invocations: bool,
-    /// Revert conversation only (`RevertConversation` — later).
+    /// Revert conversation only (`RevertConversation`). Encode is a stub.
     pub rewind_conversation: bool,
-    /// Revert files only (`RevertFiles` — later).
+    /// Revert files only (`RevertFiles`). Encode is a stub.
     pub rewind_files: bool,
-    /// Revert conversation + files (`RevertBoth` — later).
+    /// Revert conversation + files (`RevertBoth`). Encode is a stub.
     pub rewind_both: bool,
     /// Session start / end events mapped (CAPABILITIES `session`).
     pub session: bool,

@@ -183,7 +183,7 @@ impl AdapterCodec for CodexCodec {
                 "turn/abort",
                 serde_json::json!({ "threadId": session_id }),
             ),
-            _ => return Err(BusError::Unsupported("codex command stub")),
+            _ => return Err(BusError::Unsupported(cmd.name())),
         };
         Ok(WireFrame::Json(serde_json::json!({
             "method": method,
