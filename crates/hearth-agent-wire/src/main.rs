@@ -71,7 +71,21 @@ fn main() {
         "runId": "r1"
     }))
     .unwrap();
-    check("pi run.start → TurnStarted", matches!(p, AgentEvent::TurnStarted { .. }));
+    check(
+        "pi run.start → TurnStarted",
+        matches!(p, AgentEvent::TurnStarted { .. }),
+    );
+
+    let p_rpc = pi::map_event(&serde_json::json!({
+        "type": "tool_execution_start",
+        "toolCallId": "c1",
+        "toolName": "bash"
+    }))
+    .unwrap();
+    check(
+        "pi RPC tool_execution_start → ToolCall",
+        matches!(p_rpc, AgentEvent::ToolCall { .. }),
+    );
 
     let oc = opencode::map_event(&serde_json::json!({
         "type": "permission.asked",
@@ -97,5 +111,5 @@ fn main() {
         .contains("compact"),
     );
 
-    println!("summary: 6 passed — unified wire ready for Hearth");
+    println!("summary: 7 passed — unified wire ready for Hearth");
 }

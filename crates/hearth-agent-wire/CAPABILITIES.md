@@ -1,6 +1,6 @@
 # Adapter capabilities matrix
 
-Wires: `jsonrpc-content-length` | `http-sse` | `websocket-json`
+Wires: `jsonrpc-content-length` | `http-sse` | `websocket-json` | `jsonl-rpc`
 
 Flags are typed [`CapabilityFlags`](src/capabilities.rs) on each `registry()`
 [`AdapterInfo`](src/adapters/mod.rs). Host / catalog read the struct; this file
@@ -22,7 +22,7 @@ drifts from these tables (or if a `CapabilityFlags` field has no column).
 | ACP (generic) | adapters/acp | jsonrpc-content-length | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | | stub | |
 | Grok Build | adapters/grok_build | jsonrpc-content-length | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | | stub | |
 | Codex | adapters/codex | jsonrpc-content-length | ✓ | ✓ | ✓ | ✓ | | stub | | ✓ | |
-| Pi | adapters/pi | websocket-json | ✓ | ✓ | ✓ | | | | | | ✓ |
+| Pi | adapters/pi | jsonl-rpc | ✓ | ✓ | ✓ | ✓ | | | | ✓ | ✓ |
 | OpenCode | adapters/opencode | http-sse | ✓ | ✓ | ✓ | ✓ | | ✓ | ✓ | ✓ | |
 
 Column aliases: `tool` → `tool_invocations`, `thinking` → `reasoning_stream`,

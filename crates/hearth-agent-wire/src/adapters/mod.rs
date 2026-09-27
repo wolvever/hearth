@@ -7,7 +7,8 @@
 //! - `fixtures/*.json` — captured native frames for `map_*` tests
 //!
 //! Generic ACP catalog agents start from [`acp`]. Never scrape unstructured
-//! stdout/stderr. Transports deliver [`WireFrame`]s.
+//! stdout/stderr. Transports deliver [`WireFrame`]s. Pi uses `jsonl-rpc`
+//! (typed RPC frames after [`crate::transport::JsonlRpcTransport`]).
 
 pub mod acp;
 pub mod codex;
@@ -38,40 +39,48 @@ pub struct AdapterInfo {
     pub flags: CapabilityFlags,
 }
 
+impl AdapterInfo {
+    /// Parsed [`crate::transport::WireKind`] for this row. All registry wires
+    /// must be an allowed framed kind (`jsonl-rpc` included).
+    pub fn wire_kind(self) -> Option<crate::transport::WireKind> {
+        crate::transport::WireKind::parse(self.wire)
+    }
+}
+
 /// Registry of built-in adapters — add a row when you land a new agent folder.
 const REGISTRY: &[AdapterInfo] = &[
     AdapterInfo {
         kind: AgentKind::GrokBuild,
         name: "grok_build",
-        wire: "jsonrpc-content-length",
+        wire: crate::transport::WireKind::JsonRpc.as_str(),
         folder: "adapters/grok_build",
         flags: CapabilityFlags::for_agent(AgentKind::GrokBuild),
     },
     AdapterInfo {
         kind: AgentKind::Codex,
         name: "codex",
-        wire: "jsonrpc-content-length",
+        wire: crate::transport::WireKind::JsonRpc.as_str(),
         folder: "adapters/codex",
         flags: CapabilityFlags::for_agent(AgentKind::Codex),
     },
     AdapterInfo {
         kind: AgentKind::Pi,
         name: "pi",
-        wire: "websocket-json",
+        wire: crate::transport::WireKind::JsonlRpc.as_str(),
         folder: "adapters/pi",
         flags: CapabilityFlags::for_agent(AgentKind::Pi),
     },
     AdapterInfo {
         kind: AgentKind::OpenCode,
         name: "opencode",
-        wire: "http-sse",
+        wire: crate::transport::WireKind::Sse.as_str(),
         folder: "adapters/opencode",
         flags: CapabilityFlags::for_agent(AgentKind::OpenCode),
     },
     AdapterInfo {
         kind: AgentKind::Acp,
         name: "acp",
-        wire: "jsonrpc-content-length",
+        wire: crate::transport::WireKind::JsonRpc.as_str(),
         folder: "adapters/acp",
         flags: CapabilityFlags::for_agent(AgentKind::Acp),
     },
@@ -135,6 +144,19 @@ mod tests {
             lookup(AgentKind::Acp).unwrap().wire,
             "jsonrpc-content-length"
         );
+        assert_eq!(lookup(AgentKind::Pi).unwrap().wire, "jsonl-rpc");
+        assert_eq!(
+            lookup(AgentKind::Pi).unwrap().wire_kind(),
+            Some(crate::transport::WireKind::JsonlRpc)
+        );
+        for info in r {
+            assert!(
+                info.wire_kind().is_some(),
+                "{} wire {:?} is not an allowed WireKind",
+                info.name,
+                info.wire
+            );
+        }
     }
 
     fn slice2_stub_commands() -> [AgentCommand; 6] {

@@ -474,6 +474,31 @@ mod tests {
     }
 
     #[test]
+    fn framed_agent_jsonl_pi_rpc_appends_tool_call() {
+        use crate::adapters::pi::PiCodec;
+        use crate::{FramedAgent, JsonlRpcTransport};
+
+        let (_store, _user, agent, session) = room();
+        let binding = session
+            .bind_host(Some(agent.id), host_for(AgentKind::Pi, None, None))
+            .unwrap();
+        let raw: serde_json::Value = serde_json::from_str(include_str!(
+            "adapters/pi/fixtures/tool_execution_start.json"
+        ))
+        .unwrap();
+        let mut agent_io = FramedAgent::new(JsonlRpcTransport::new(), PiCodec);
+        agent_io
+            .transport_mut()
+            .push_bytes(&JsonlRpcTransport::encode_jsonl(&raw).unwrap());
+        let mut attach = HostAttach::attach(binding, agent.id, agent_io);
+        attach.drain(&session).unwrap();
+        assert!(session.events().unwrap().iter().any(|e| matches!(
+            &e.body,
+            EventBody::ToolCall { name, .. } if name == "bash"
+        )));
+    }
+
+    #[test]
     fn framed_agent_jsonrpc_push_decoded_appends_tool_call() {
         use crate::adapters::grok_build::GrokBuildCodec;
         use crate::{FramedAgent, JsonRpcTransport};
