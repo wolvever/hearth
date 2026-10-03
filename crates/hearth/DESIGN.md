@@ -206,6 +206,7 @@ crates/hearth-agent-wire/
   REDESIGN.md          # Transport vs Codec rules (stdio scrape banned)
   src/lib.rs           # AgentEvent, AgentCommand, CodingAgent, FramedAgent, LoopbackAgent
   src/transport/       # WireFrame, WireKind, Transport, jsonrpc / sse / websocket / jsonl
+  src/catalog/         # builtin.toml → LaunchSpec data (Copilot, Cursor; shared AcpCodec; no spawn)
   src/host.rs          # HostAttach, event_bodies
   src/adapters/<name>/
     README.md
@@ -221,6 +222,8 @@ crates/hearth-agent-wire/
 | `JsonlRpcTransport` | `jsonl-rpc` — newline frame delimiter + `rpc_chunk` reassembly | banner / invalid JSON as events, NDJSON log scrape, SSE frames |
 
 `FramedAgent<T, C>` is `Transport` + `AdapterCodec`. Decoded path: `JsonRpcTransport::push_decoded` / `SseTransport::push_frame` / `JsonlRpcTransport::push_decoded`. Byte path: `try_decode_content_length` / `parse_event_block` / `decode_text` / `JsonlRpcTransport::push_bytes`, then codec. Live process spawn is optional and not required for the kernel bar.
+
+`catalog/` is profile data only. Builtin Copilot (`copilot --acp`) and Cursor (`cursor-agent acp`) resolve to a `LaunchSpec` and share `AcpCodec`. Reattach is `HostAttach::resume` with `Binding.native_resume_id`, not Gemini `session/load`. `AttachRunner` spawn is not in this crate yet.
 
 ### Outbound `AgentCommand` (Hearth → agent)
 

@@ -5,8 +5,9 @@
 - **Codec:** `AcpCodec` — generic / catalog profile (`AgentKind::Acp`)
 - **Profile:** `adapters/grok_build` calls `acp::map_*` and keeps `GrokBuildCodec` / `AgentKind::GrokBuild`
 
-Catalog agents (Cursor, Copilot, …) should start here. Per-binary launch argv
-is a later catalog slice — this folder is map + codec only.
+Catalog agents (Cursor, Copilot) start here and share `AcpCodec`. Launch
+argv is data in `src/catalog/builtin.toml` (`profile` → `LaunchSpec`), not a
+second codec and not a process spawn.
 
 ## Caps defaults
 

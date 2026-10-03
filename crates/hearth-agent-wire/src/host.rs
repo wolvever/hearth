@@ -149,6 +149,7 @@ impl<A: CodingAgent> HostAttach<A> {
     }
 
     /// Resume is attach: same Binding id, same native resume token if present.
+    /// Not Gemini-style `session/load` — catalog profiles do not add a load RPC.
     pub fn resume(binding: Binding, agent: AgentId, coding: A) -> Self {
         Self::attach(binding, agent, coding)
     }

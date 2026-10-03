@@ -1,0 +1,17 @@
+# Curated ACP catalog. Profiles resolve to LaunchSpec data.
+# Both rows share AcpCodec (jsonrpc-content-length). No process spawn.
+# Attach is HostAttach::resume (native_resume_id), not Gemini session/load.
+# caps_override stays off the file: fast-mode / extMethod toggles are Host
+# (SetFeature), not a CursorCodec or CopilotCodec fork.
+
+[[profile]]
+id = "copilot"
+label = "GitHub Copilot"
+command = ["copilot", "--acp"]
+extends = "acp"
+
+[[profile]]
+id = "cursor"
+label = "Cursor"
+command = ["cursor-agent", "acp"]
+extends = "acp"

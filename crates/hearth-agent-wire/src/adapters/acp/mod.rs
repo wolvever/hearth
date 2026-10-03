@@ -2,7 +2,8 @@
 //!
 //! Shared `session/update` + `session/request_permission` surface used by
 //! catalog agents and by [`crate::adapters::grok_build`]. Per-binary launch
-//! argv is out of scope — that lives in a later catalog slice.
+//! argv lives in [`crate::catalog`] (`builtin.toml` → `LaunchSpec`); this
+//! codec does not spawn and does not encode `session/load`.
 
 use crate::adapters::AdapterCodec;
 use crate::transport::WireFrame;
