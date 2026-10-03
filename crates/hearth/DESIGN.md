@@ -191,7 +191,7 @@ Writes take the claiming `BindingId`. `transfer_claim(from, to)` moves the claim
 
 ## Agent wire (`hearth-agent-wire`)
 
-Adapter layer so Host can talk to external coding agents (Grok Build ACP, Codex App Server, Pi harness, OpenCode SSE) through one `AgentEvent` / `AgentCommand` surface. **Not a seventh kernel noun.** Host↔Goose remains the runtime child over ypipe. This crate normalizes *external* agents so Session/EventLog can record and steer them uniformly. No Queue type — buffers stay transport-local only (`LoopbackAgent`, `FramedAgent`).
+Adapter layer so Host can talk to external coding agents (Grok Build ACP, Codex App Server, Pi JSONL RPC, OpenCode SSE) through one `AgentEvent` / `AgentCommand` surface. **Not a seventh kernel noun.** Host↔Goose remains the runtime child over ypipe. This crate normalizes *external* agents so Session/EventLog can record and steer them uniformly. No Queue type — buffers stay transport-local only (`LoopbackAgent`, `FramedAgent`).
 
 Same composition class as `PlaceMemory` / `FakeSandbox`: `HostAttach` holds an existing `Binding` plus a `CodingAgent`. Bind once (`HostAttach::bind` → `session.bind_host`); attach/resume reuse that `Binding.id` (no remint). Native resume tokens stay on `Binding.native_resume_id`. Subagent/task ids correlate on the EventLog; they do not mint child Sessions or Bindings.
 
@@ -205,7 +205,7 @@ crates/hearth-agent-wire/
   CONTRIBUTING.md
   REDESIGN.md          # Transport vs Codec rules (stdio scrape banned)
   src/lib.rs           # AgentEvent, AgentCommand, CodingAgent, FramedAgent, LoopbackAgent
-  src/transport/       # WireFrame, Transport, jsonrpc / sse / websocket
+  src/transport/       # WireFrame, WireKind, Transport, jsonrpc / sse / websocket / jsonl
   src/host.rs          # HostAttach, event_bodies
   src/adapters/<name>/
     README.md
@@ -218,8 +218,9 @@ crates/hearth-agent-wire/
 | `JsonRpcTransport` | LSP/ACP `Content-Length` or u32 length-prefix | NDJSON, missing length, invalid JSON, SSE frames |
 | `SseTransport` | WHATWG EventSource (`event` / `data` / `id`) | Single-line `data:` strip inside adapters, non-JSON data (except `[DONE]`) |
 | `WebSocketJsonTransport` | one WS text message | concatenated JSON values, SSE frames |
+| `JsonlRpcTransport` | `jsonl-rpc` — newline frame delimiter + `rpc_chunk` reassembly | banner / invalid JSON as events, NDJSON log scrape, SSE frames |
 
-`FramedAgent<T, C>` is `Transport` + `AdapterCodec`. Decoded path: `JsonRpcTransport::push_decoded` / `SseTransport::push_frame`. Byte path: `try_decode_content_length` / `parse_event_block` / `decode_text`, then `push_decoded`. Live process spawn is optional and not required for the kernel bar.
+`FramedAgent<T, C>` is `Transport` + `AdapterCodec`. Decoded path: `JsonRpcTransport::push_decoded` / `SseTransport::push_frame` / `JsonlRpcTransport::push_decoded`. Byte path: `try_decode_content_length` / `parse_event_block` / `decode_text` / `JsonlRpcTransport::push_bytes`, then codec. Live process spawn is optional and not required for the kernel bar.
 
 ### Outbound `AgentCommand` (Hearth → agent)
 

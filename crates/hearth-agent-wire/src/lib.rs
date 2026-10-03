@@ -9,7 +9,7 @@
 //! where writes matter, Binding ids not reminted on attach or resume.
 //!
 //! # Architecture
-//! - **Transport** owns framing (Content-Length JSON-RPC, SSE EventSource, WS JSON).
+//! - **Transport** owns framing (Content-Length JSON-RPC, SSE EventSource, WS JSON, JSONL RPC).
 //! - **AdapterCodec** maps typed [`transport::WireFrame`]s ↔ [`AgentEvent`] / [`AgentCommand`].
 //! - Prefer [`FramedAgent<T, C>`] for live attach. [`LoopbackAgent`] stays for Host tests.
 //! - Never scrape unstructured stdout/stderr or regex logs for events.
@@ -25,7 +25,8 @@ pub use adapters::{lookup, registry, AdapterCodec, AdapterInfo};
 pub use capabilities::CapabilityFlags;
 pub use host::{binding_kind, event_bodies, host_for, AttachError, AttachResult, HostAttach};
 pub use transport::{
-    JsonRpcTransport, SseFrame, SseTransport, Transport, WebSocketJsonTransport, WireFrame,
+    JsonlProblem, JsonlRpcTransport, JsonRpcTransport, SseFrame, SseTransport, Transport,
+    WebSocketJsonTransport, WireFrame, WireKind,
 };
 
 use serde::{Deserialize, Serialize};
@@ -512,6 +513,19 @@ mod tests {
     }
 
     #[test]
+    fn pi_rpc_dialect_maps() {
+        let ev = pi::map_event(&serde_json::json!({"type":"turn_start"})).unwrap();
+        assert!(matches!(ev, AgentEvent::TurnStarted { .. }));
+        let ev = pi::map_event(&serde_json::json!({
+            "type": "tool_execution_start",
+            "toolCallId": "c1",
+            "toolName": "bash"
+        }))
+        .unwrap();
+        assert!(matches!(ev, AgentEvent::ToolCall { .. }));
+    }
+
+    #[test]
     fn opencode_permission_maps() {
         let raw = serde_json::json!({
             "type": "permission.asked",
@@ -687,9 +701,25 @@ mod tests {
     fn registry_discoverable() {
         assert_eq!(crate::registry().len(), 5);
         assert!(crate::lookup(AgentKind::Pi).unwrap().flags.subagent);
+        assert_eq!(crate::lookup(AgentKind::Pi).unwrap().wire, "jsonl-rpc");
         assert_eq!(
             crate::lookup(AgentKind::Acp).unwrap().wire,
             "jsonrpc-content-length"
         );
+    }
+
+    #[test]
+    fn framed_agent_jsonl_pi_rpc() {
+        use crate::adapters::pi::PiCodec;
+        use crate::transport::JsonlRpcTransport;
+
+        let mut agent = FramedAgent::new(JsonlRpcTransport::new(), PiCodec);
+        agent.transport_mut().push_decoded(serde_json::json!({
+            "type": "tool_execution_start",
+            "toolCallId": "c1",
+            "toolName": "bash"
+        }));
+        let ev = agent.try_recv().unwrap().unwrap();
+        assert!(matches!(ev, AgentEvent::ToolCall { .. }));
     }
 }

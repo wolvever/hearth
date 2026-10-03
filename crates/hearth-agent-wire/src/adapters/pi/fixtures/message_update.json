@@ -1,0 +1,6 @@
+{
+  "type": "message_update",
+  "sessionId": "s1",
+  "message": {"role": "assistant", "content": []},
+  "assistantMessageEvent": {"type": "text_delta", "delta": "hello"}
+}

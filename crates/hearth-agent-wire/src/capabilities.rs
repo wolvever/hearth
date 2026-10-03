@@ -121,7 +121,7 @@ impl CapabilityFlags {
         session_listing: false,
         dynamic_modes: false,
         mcp_servers: false,
-        reasoning_stream: false,
+        reasoning_stream: true,
         tool_invocations: true,
         rewind_conversation: false,
         rewind_files: false,
@@ -131,7 +131,7 @@ impl CapabilityFlags {
         plan: false,
         permission: false,
         question: false,
-        compact: false,
+        compact: true,
         subagent: true,
     };
 

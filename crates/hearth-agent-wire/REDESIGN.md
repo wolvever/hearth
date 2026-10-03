@@ -15,7 +15,7 @@
 |------|--------|
 | Split **Transport** vs **Codec/Adapter** | Transport frames bytes ↔ `WireFrame`. Codec maps `WireFrame` ↔ `AgentEvent` / `AgentCommand`. |
 | Ban unstructured scrape | No NDJSON-of-stdout, no regex-of-logs, no generic `map_wire_line(kind, &str)` that strips `data:` and parses “a line”. |
-| Allowed wires | (1) Content-Length or length-prefixed JSON-RPC (LSP/ACP), (2) HTTP+SSE typed EventSource, (3) WebSocket JSON — each a `Transport` impl. |
+| Allowed wires | (1) Content-Length or length-prefixed JSON-RPC (LSP/ACP), (2) HTTP+SSE typed EventSource, (3) WebSocket JSON, (4) JSONL RPC (`jsonl-rpc`, newline frames + `rpc_chunk`) — each a `Transport` impl. |
 | Contrib shape | `adapters/<name>/{mod.rs,README.md,fixtures/*.json}` + `map_*` tests + `registry()` row + `CAPABILITIES.md` column. |
 | Host surface | Prefer `FramedAgent<T, C>`; LoopbackAgent stays for Host unit tests. |
 
@@ -23,7 +23,7 @@
 
 ```text
 process/socket bytes
-    → Transport::try_decode_*  (Content-Length / EventSource block / WS message)
+    → Transport::try_decode_*  (Content-Length / EventSource / WS / JSONL+rpc_chunk)
     → WireFrame::Json | WireFrame::Sse { event, data }
     → AdapterCodec::decode_event
     → AgentEvent
@@ -121,7 +121,7 @@ Discovery: `registry()` / `lookup(kind)` / `CAPABILITIES.md`.
 
 ## Toy crate status after this redesign
 
-- Transports: `JsonRpcTransport`, `SseTransport`, `WebSocketJsonTransport`
+- Transports: `JsonRpcTransport`, `SseTransport`, `WebSocketJsonTransport`, `JsonlRpcTransport`
 - Codecs: `GrokBuildCodec`, `CodexCodec`, `PiCodec`, `OpenCodeCodec`
 - `FramedAgent<T, C>: CodingAgent`
 - Docs: `CONTRIBUTING.md`, `CAPABILITIES.md`, this file; `BRIEF.md` updated

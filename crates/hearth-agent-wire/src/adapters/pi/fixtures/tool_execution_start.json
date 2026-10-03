@@ -1,0 +1,7 @@
+{
+  "type": "tool_execution_start",
+  "sessionId": "s1",
+  "toolCallId": "c1",
+  "toolName": "bash",
+  "args": {"command": "ls"}
+}
