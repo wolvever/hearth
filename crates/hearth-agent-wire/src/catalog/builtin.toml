@@ -1,5 +1,6 @@
 # Curated ACP catalog. Profiles resolve to LaunchSpec data.
-# Both rows share AcpCodec (jsonrpc-content-length). No process spawn.
+# Both rows share AcpCodec on jsonl-rpc (newline-delimited JSON-RPC).
+# Not Content-Length. Pi rpc_chunk reassembly is not used. No process spawn.
 # Attach is HostAttach::resume (native_resume_id), not Gemini session/load.
 # caps_override stays off the file: fast-mode / extMethod toggles are Host
 # (SetFeature), not a CursorCodec or CopilotCodec fork.

@@ -19,7 +19,7 @@ drifts from these tables (or if a `CapabilityFlags` field has no column).
 
 | Agent | Folder | Wire | session | message | tool | thinking | plan | permission | question | compact | subagent/task |
 |-------|--------|------|:-------:|:-------:|:----:|:--------:|:----:|:----------:|:--------:|:-------:|:-------------:|
-| ACP (generic) | adapters/acp | jsonrpc-content-length | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | | stub | |
+| ACP (generic) | adapters/acp | jsonl-rpc | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | | stub | |
 | Grok Build | adapters/grok_build | jsonrpc-content-length | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | | stub | |
 | Codex | adapters/codex | jsonrpc-content-length | ✓ | ✓ | ✓ | ✓ | | stub | | ✓ | |
 | Pi | adapters/pi | jsonl-rpc | ✓ | ✓ | ✓ | ✓ | | | | ✓ | ✓ |

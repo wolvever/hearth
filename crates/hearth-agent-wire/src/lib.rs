@@ -12,7 +12,8 @@
 //! - **Transport** owns framing (Content-Length JSON-RPC, SSE EventSource, WS JSON, JSONL RPC).
 //! - **AdapterCodec** maps typed [`transport::WireFrame`]s ↔ [`AgentEvent`] / [`AgentCommand`].
 //! - **Catalog** maps an ACP profile (Copilot, Cursor) to [`catalog::LaunchSpec`] data.
-//!   Shared [`adapters::acp::AcpCodec`]. No process spawn.
+//!   Shared [`adapters::acp::AcpCodec`] on newline-delimited JSON-RPC (`jsonl-rpc`),
+//!   not Content-Length. No process spawn. Pi `rpc_chunk` is not used for ACP.
 //! - Prefer [`FramedAgent<T, C>`] for live attach. [`LoopbackAgent`] stays for Host tests.
 //! - Never scrape unstructured stdout/stderr or regex logs for events.
 //! - There is no public `map_wire_line` / `push_line`.
@@ -709,8 +710,9 @@ mod tests {
         assert_eq!(crate::registry().len(), 5);
         assert!(crate::lookup(AgentKind::Pi).unwrap().flags.subagent);
         assert_eq!(crate::lookup(AgentKind::Pi).unwrap().wire, "jsonl-rpc");
+        assert_eq!(crate::lookup(AgentKind::Acp).unwrap().wire, "jsonl-rpc");
         assert_eq!(
-            crate::lookup(AgentKind::Acp).unwrap().wire,
+            crate::lookup(AgentKind::GrokBuild).unwrap().wire,
             "jsonrpc-content-length"
         );
     }

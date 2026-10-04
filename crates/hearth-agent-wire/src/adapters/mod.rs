@@ -80,7 +80,7 @@ const REGISTRY: &[AdapterInfo] = &[
     AdapterInfo {
         kind: AgentKind::Acp,
         name: "acp",
-        wire: crate::transport::WireKind::JsonRpc.as_str(),
+        wire: crate::transport::WireKind::JsonlRpc.as_str(),
         folder: "adapters/acp",
         flags: CapabilityFlags::for_agent(AgentKind::Acp),
     },
@@ -140,8 +140,13 @@ mod tests {
             .wire
             .contains("jsonrpc"));
         assert_eq!(lookup(AgentKind::OpenCode).unwrap().wire, "http-sse");
+        assert_eq!(lookup(AgentKind::Acp).unwrap().wire, "jsonl-rpc");
         assert_eq!(
-            lookup(AgentKind::Acp).unwrap().wire,
+            lookup(AgentKind::GrokBuild).unwrap().wire,
+            "jsonrpc-content-length"
+        );
+        assert_eq!(
+            lookup(AgentKind::Codex).unwrap().wire,
             "jsonrpc-content-length"
         );
         assert_eq!(lookup(AgentKind::Pi).unwrap().wire, "jsonl-rpc");

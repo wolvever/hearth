@@ -1,12 +1,13 @@
 //! ACP catalog: a profile resolves to [`LaunchSpec`] data.
 //!
 //! Builtin Copilot and Cursor rows live in [`builtin.toml`](builtin.toml).
-//! Both extend [`crate::adapters::acp::AcpCodec`] on
-//! `jsonrpc-content-length`. This module does not spawn, and it is not a
-//! kernel noun or a Queue.
+//! Both extend [`crate::adapters::acp::AcpCodec`] on newline-delimited
+//! JSON-RPC ([`WireKind::JsonlRpc`]). Pi `rpc_chunk` reassembly is not
+//! used. This module does not spawn, and it is not a kernel noun or a Queue.
 //!
 //! Reattach is [`crate::host::HostAttach::resume`] (`native_resume_id`),
-//! never Gemini-style `session/load`.
+//! never Gemini-style `session/load`. Live capability gating (a profile may
+//! advertise `loadSession` and still lack `resume`) belongs to AttachRunner.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -31,7 +32,8 @@ pub struct CatalogProfile {
     pub label: String,
     pub command: Vec<String>,
     pub extends: CatalogExtends,
-    /// Allowed framed wire. ACP profiles are [`WireKind::JsonRpc`].
+    /// Allowed framed wire. ACP stdio profiles are [`WireKind::JsonlRpc`]
+    /// (one line, one JSON value — not Content-Length, not Pi `rpc_chunk`).
     pub wire: WireKind,
     /// Host may set this later. Builtin rows leave it `None` so flags stay
     /// the shared ACP defaults — not a per-vendor codec.
@@ -123,7 +125,7 @@ fn parse_extends(id: &str, extends: &str) -> Result<CatalogExtends, BusError> {
 fn parse_wire(id: &str, extends: CatalogExtends, wire: Option<&str>) -> Result<WireKind, BusError> {
     let kind = match wire {
         None => match extends {
-            CatalogExtends::Acp => WireKind::JsonRpc,
+            CatalogExtends::Acp => WireKind::JsonlRpc,
         },
         Some(name) => WireKind::parse(name).ok_or_else(|| {
             BusError::Decode(format!(
@@ -131,10 +133,11 @@ fn parse_wire(id: &str, extends: CatalogExtends, wire: Option<&str>) -> Result<W
             ))
         })?,
     };
-    if extends == CatalogExtends::Acp && kind != WireKind::JsonRpc {
+    if extends == CatalogExtends::Acp && kind != WireKind::JsonlRpc {
         return Err(BusError::Decode(format!(
-            "catalog profile {id}: acp profiles use {}",
-            WireKind::JsonRpc.as_str()
+            "catalog profile {id}: acp stdio profiles use {} (newline-delimited JSON-RPC), not {}",
+            WireKind::JsonlRpc.as_str(),
+            kind.as_str()
         )));
     }
     Ok(kind)
@@ -218,6 +221,7 @@ mod tests {
     use crate::adapters::AdapterCodec;
     use crate::transport::WireFrame;
     use crate::{registry, AgentEvent, AgentKind, BusError};
+    use std::io::Write;
 
     fn builtin_fixture_text() -> String {
         let path = format!("{}/src/catalog/builtin.toml", env!("CARGO_MANIFEST_DIR"));
@@ -255,7 +259,7 @@ mod tests {
                 args: vec!["--acp".into()],
                 cwd: None,
                 env: vec![],
-                wire: WireKind::JsonRpc,
+                wire: WireKind::JsonlRpc,
             }
         );
         let cursor_spec = cursor.launch_spec().unwrap();
@@ -266,11 +270,13 @@ mod tests {
                 args: vec!["acp".into()],
                 cwd: None,
                 env: vec![],
-                wire: WireKind::JsonRpc,
+                wire: WireKind::JsonlRpc,
             }
         );
-        assert_eq!(copilot_spec.wire.as_str(), "jsonrpc-content-length");
-        assert_eq!(cursor_spec.wire.as_str(), "jsonrpc-content-length");
+        assert_eq!(copilot_spec.wire.as_str(), "jsonl-rpc");
+        assert_eq!(cursor_spec.wire.as_str(), "jsonl-rpc");
+        assert_ne!(copilot_spec.wire, WireKind::JsonRpc);
+        assert_ne!(cursor_spec.wire, WireKind::JsonRpc);
         assert!(WireKind::parse(copilot_spec.wire.as_str()).is_some());
         assert!(WireKind::parse(cursor_spec.wire.as_str()).is_some());
     }
@@ -283,7 +289,8 @@ mod tests {
         assert_eq!(copilot.kind(), AgentKind::Acp);
         assert_eq!(cursor.kind(), AgentKind::Acp);
         assert_eq!(copilot.wire(), cursor.wire());
-        assert_eq!(copilot.wire(), WireKind::JsonRpc.as_str());
+        assert_eq!(copilot.wire(), WireKind::JsonlRpc.as_str());
+        assert_ne!(copilot.wire(), WireKind::JsonRpc.as_str());
         let left = copilot.decode_event(&frame).unwrap();
         let right = cursor.decode_event(&frame).unwrap();
         assert_eq!(left, right);
@@ -307,9 +314,10 @@ mod tests {
         for profile in builtin_profiles() {
             let spec = profile.launch_spec().unwrap();
             assert_eq!(WireKind::parse(spec.wire.as_str()), Some(spec.wire));
+            assert_eq!(spec.wire, WireKind::JsonlRpc);
             assert_eq!(
                 WireKind::parse(profile.codec().wire()),
-                Some(WireKind::JsonRpc)
+                Some(WireKind::JsonlRpc)
             );
         }
     }
@@ -373,5 +381,170 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, BusError::Decode(_)));
+        let err = load_profiles_str(
+            r#"
+            [[profile]]
+            id = "clen"
+            label = "Content-Length"
+            command = ["agent", "acp"]
+            extends = "acp"
+            wire = "jsonrpc-content-length"
+            "#,
+        )
+        .unwrap_err();
+        match err {
+            BusError::Decode(msg) => assert!(msg.contains("jsonl-rpc"), "{msg}"),
+            other => panic!("expected decode error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn acp_profiles_frame_commands_as_newline_jsonrpc_not_content_length() {
+        use crate::transport::{JsonlRpcTransport, Transport};
+        use crate::AgentCommand;
+
+        for id in ["copilot", "cursor"] {
+            let profile = lookup_profile(id).unwrap();
+            assert_eq!(profile.wire, WireKind::JsonlRpc);
+            let frame = profile
+                .codec()
+                .encode_command(&AgentCommand::UserMessage {
+                    session_id: "s".into(),
+                    text: "hi".into(),
+                })
+                .unwrap();
+            let value = frame.as_json().expect("json").clone();
+            let bytes = JsonlRpcTransport::encode_jsonl(&value).unwrap();
+            assert!(bytes.ends_with(b"\n"), "{id}");
+            let text = std::str::from_utf8(&bytes).unwrap();
+            assert!(!text.contains("Content-Length"), "{id}: {text}");
+            assert!(
+                text.lines().count() == 1
+                    || text.ends_with('\n') && text.matches('\n').count() == 1
+            );
+            let mut plain = JsonlRpcTransport::without_rpc_chunks();
+            plain.push_bytes(&bytes);
+            let decoded = plain.try_recv_frame().unwrap().unwrap();
+            assert_eq!(decoded.as_json().unwrap()["method"], "session/prompt");
+        }
+    }
+
+    /// One `initialize` round-trip against a real ACP stdio agent, framed as
+    /// newline JSON-RPC (no Content-Length). Skips when the toy agent or
+    /// runtime is not on this machine so `cargo test` still passes.
+    #[test]
+    fn acp_stdio_initialize_roundtrip_newline_jsonrpc() {
+        let Some(mut cmd) = acp_stdio_command() else {
+            eprintln!(
+                "skip acp_stdio_initialize_roundtrip_newline_jsonrpc: no ACP stdio agent on this machine"
+            );
+            return;
+        };
+        let init = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"protocolVersion": 1, "clientCapabilities": {}}
+        });
+        let bytes = crate::transport::JsonlRpcTransport::encode_jsonl(&init).unwrap();
+        assert!(
+            !bytes
+                .windows(b"Content-Length".len())
+                .any(|w| w == b"Content-Length"),
+            "initialize must not be Content-Length framed"
+        );
+
+        cmd.stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        let mut child = cmd.spawn().expect("spawn ACP stdio agent");
+        let mut stdin = child.stdin.take().expect("stdin");
+        let stdout = child.stdout.take().expect("stdout");
+        let guard = KillChild(child);
+
+        stdin.write_all(&bytes).expect("write initialize");
+        stdin.flush().expect("flush initialize");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(stdout);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match std::io::BufRead::read_line(&mut reader, &mut line) {
+                    Ok(0) | Err(_) => {
+                        let _ = tx.send(None);
+                        break;
+                    }
+                    Ok(_) => {
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                            let _ = tx.send(Some(v));
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        let msg = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap_or_else(|_| panic!("ACP initialize timed out (newline JSON-RPC)"));
+        drop(stdin);
+        drop(guard);
+
+        let msg = msg.expect("ACP agent closed stdout before a JSON-RPC message");
+        let code = msg.pointer("/error/code").and_then(|c| c.as_i64());
+        assert_ne!(
+            code,
+            Some(-32700),
+            "parse error on newline initialize: {msg}"
+        );
+        assert!(
+            msg.get("result").is_some(),
+            "expected JSON-RPC result, got {msg}"
+        );
+        assert_eq!(msg.get("id").and_then(|id| id.as_i64()), Some(1), "{msg}");
+    }
+
+    fn acp_stdio_command() -> Option<std::process::Command> {
+        let toy = std::path::Path::new("/workspace/experiments/2026-10-05-hearth/agent.mjs");
+        if toy.is_file() {
+            let node_ok = std::process::Command::new("node")
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if node_ok {
+                let mut cmd = std::process::Command::new("node");
+                cmd.arg(toy);
+                return Some(cmd);
+            }
+        }
+        let codex_ok = std::process::Command::new("codex-acp")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if codex_ok {
+            return Some(std::process::Command::new("codex-acp"));
+        }
+        None
+    }
+
+    struct KillChild(std::process::Child);
+
+    impl Drop for KillChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
     }
 }

@@ -54,17 +54,44 @@ struct Assembly {
 }
 
 /// In-memory JSONL RPC transport: bytes ↔ [`WireFrame::Json`].
-#[derive(Debug, Default)]
+///
+/// [`Self::new`] reassembles Pi / Paseo `rpc_chunk` lines. ACP stdio uses
+/// [`Self::without_rpc_chunks`]: one newline, one JSON value, no reassembly.
+#[derive(Debug)]
 pub struct JsonlRpcTransport {
     line_buf: Vec<u8>,
     inbound: VecDeque<Result<Value, JsonlProblem>>,
     outbound: Vec<Value>,
     assembly: Option<Assembly>,
+    /// Pi / Paseo only. ACP catalog profiles leave this off.
+    assemble_chunks: bool,
+}
+
+impl Default for JsonlRpcTransport {
+    fn default() -> Self {
+        Self {
+            line_buf: Vec::new(),
+            inbound: VecDeque::new(),
+            outbound: Vec::new(),
+            assembly: None,
+            assemble_chunks: true,
+        }
+    }
 }
 
 impl JsonlRpcTransport {
+    /// Pi / Paseo JSONL RPC, including `rpc_chunk` reassembly.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Plain newline-delimited JSON-RPC (ACP stdio). One line is one JSON
+    /// value. Does not reassemble Pi `rpc_chunk` frames.
+    pub fn without_rpc_chunks() -> Self {
+        Self {
+            assemble_chunks: false,
+            ..Self::default()
+        }
     }
 
     /// Push an already-decoded JSON object (tests / Host helpers).
@@ -120,7 +147,7 @@ impl JsonlRpcTransport {
             self.inbound.push_back(Err(JsonlProblem::InvalidJson));
             return;
         };
-        if v.get("type").and_then(|t| t.as_str()) == Some("rpc_chunk") {
+        if self.assemble_chunks && v.get("type").and_then(|t| t.as_str()) == Some("rpc_chunk") {
             self.consume_chunk(&v);
             return;
         }
@@ -455,6 +482,23 @@ mod tests {
             })
             .unwrap_err();
         assert!(err.to_string().contains("SSE"));
+    }
+
+    #[test]
+    fn plain_newline_does_not_reassemble_rpc_chunk() {
+        let line = serde_json::json!({
+            "type": "rpc_chunk",
+            "chunkId": "1",
+            "index": 0,
+            "count": 2,
+            "data": "abc"
+        });
+        let mut t = JsonlRpcTransport::without_rpc_chunks();
+        t.push_bytes(&JsonlRpcTransport::encode_jsonl(&line).unwrap());
+        let v = recv_ok(&mut t);
+        assert_eq!(v["type"], "rpc_chunk");
+        assert_eq!(v["chunkId"], "1");
+        assert!(t.try_recv_result().is_none());
     }
 
     fn encode_base64(bytes: &[u8]) -> String {

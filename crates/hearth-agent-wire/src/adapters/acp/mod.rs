@@ -217,7 +217,9 @@ impl AdapterCodec for AcpCodec {
     }
 
     fn wire(&self) -> &'static str {
-        "jsonrpc-content-length"
+        // ACP stdio is newline-delimited JSON-RPC, not Content-Length.
+        // Pi `rpc_chunk` stays off — see `JsonlRpcTransport::without_rpc_chunks`.
+        crate::transport::WireKind::JsonlRpc.as_str()
     }
 
     fn decode_event(&self, frame: &WireFrame) -> Result<Option<AgentEvent>, BusError> {
