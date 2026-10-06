@@ -33,9 +33,11 @@ src/adapters/<name>/
    `SseTransport`, `WebSocketJsonTransport`, or `JsonlRpcTransport`. Add a
    new transport only if none fit — still framed, never log-scraping.
 2. **Copy a sibling folder.** Start from `adapters/acp` for catalog / generic
-   ACP agents (Cursor, Copilot, …). Use `grok_build` for a Grok-specific ACP
-   profile, `opencode` for SSE, `pi` for JSONL RPC (Paseo `rpc-types` +
-   harness snapshot/watch).
+   ACP agents. Copilot and Cursor are rows in `src/catalog/builtin.toml`
+   (`id`, `label`, `command`, `extends = "acp"`) that resolve to `LaunchSpec`
+   and share `AcpCodec` — do not fork a codec. Use `grok_build` for a
+   Grok-specific ACP profile, `opencode` for SSE, `pi` for JSONL RPC (Paseo
+   `rpc-types` + harness snapshot/watch).
 3. **Drop 2–3 fixtures** under `fixtures/` from a real session capture
    (already-decoded JSON objects, not raw process dumps).
 4. **Implement** `map_*` / `map_notification` and `AdapterCodec`

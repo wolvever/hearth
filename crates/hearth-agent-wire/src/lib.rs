@@ -11,6 +11,9 @@
 //! # Architecture
 //! - **Transport** owns framing (Content-Length JSON-RPC, SSE EventSource, WS JSON, JSONL RPC).
 //! - **AdapterCodec** maps typed [`transport::WireFrame`]s ↔ [`AgentEvent`] / [`AgentCommand`].
+//! - **Catalog** maps an ACP profile (Copilot, Cursor) to [`catalog::LaunchSpec`] data.
+//!   Shared [`adapters::acp::AcpCodec`] on newline-delimited JSON-RPC (`jsonl-rpc`),
+//!   not Content-Length. No process spawn. Pi `rpc_chunk` is not used for ACP.
 //! - Prefer [`FramedAgent<T, C>`] for live attach. [`LoopbackAgent`] stays for Host tests.
 //! - Never scrape unstructured stdout/stderr or regex logs for events.
 //! - There is no public `map_wire_line` / `push_line`.
@@ -18,11 +21,16 @@
 
 pub mod adapters;
 pub mod capabilities;
+pub mod catalog;
 pub mod host;
 pub mod transport;
 
 pub use adapters::{lookup, registry, AdapterCodec, AdapterInfo};
 pub use capabilities::CapabilityFlags;
+pub use catalog::{
+    builtin_profiles, load_profiles, load_profiles_str, lookup_profile, CatalogExtends,
+    CatalogProfile, LaunchSpec,
+};
 pub use host::{binding_kind, event_bodies, host_for, AttachError, AttachResult, HostAttach};
 pub use transport::{
     JsonlProblem, JsonlRpcTransport, JsonRpcTransport, SseFrame, SseTransport, Transport,
@@ -702,8 +710,9 @@ mod tests {
         assert_eq!(crate::registry().len(), 5);
         assert!(crate::lookup(AgentKind::Pi).unwrap().flags.subagent);
         assert_eq!(crate::lookup(AgentKind::Pi).unwrap().wire, "jsonl-rpc");
+        assert_eq!(crate::lookup(AgentKind::Acp).unwrap().wire, "jsonl-rpc");
         assert_eq!(
-            crate::lookup(AgentKind::Acp).unwrap().wire,
+            crate::lookup(AgentKind::GrokBuild).unwrap().wire,
             "jsonrpc-content-length"
         );
     }

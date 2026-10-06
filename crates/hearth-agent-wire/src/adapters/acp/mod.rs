@@ -2,7 +2,8 @@
 //!
 //! Shared `session/update` + `session/request_permission` surface used by
 //! catalog agents and by [`crate::adapters::grok_build`]. Per-binary launch
-//! argv is out of scope — that lives in a later catalog slice.
+//! argv lives in [`crate::catalog`] (`builtin.toml` → `LaunchSpec`); this
+//! codec does not spawn and does not encode `session/load`.
 
 use crate::adapters::AdapterCodec;
 use crate::transport::WireFrame;
@@ -216,7 +217,9 @@ impl AdapterCodec for AcpCodec {
     }
 
     fn wire(&self) -> &'static str {
-        "jsonrpc-content-length"
+        // ACP stdio is newline-delimited JSON-RPC, not Content-Length.
+        // Pi `rpc_chunk` stays off — see `JsonlRpcTransport::without_rpc_chunks`.
+        crate::transport::WireKind::JsonlRpc.as_str()
     }
 
     fn decode_event(&self, frame: &WireFrame) -> Result<Option<AgentEvent>, BusError> {

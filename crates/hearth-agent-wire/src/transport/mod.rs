@@ -30,7 +30,11 @@ pub enum WireKind {
     Sse,
     /// One JSON value per WebSocket message.
     WebSocket,
-    /// Newline-delimited JSON-RPC with `rpc_chunk` reassembly (Pi / Paseo).
+    /// Newline-delimited JSON-RPC (one line, one JSON value).
+    ///
+    /// Pi / Paseo turn on `rpc_chunk` reassembly via [`JsonlRpcTransport::new`].
+    /// ACP stdio uses the same framing with reassembly off
+    /// ([`JsonlRpcTransport::without_rpc_chunks`]).
     JsonlRpc,
 }
 

@@ -1,12 +1,13 @@
 # acp adapter (generic ACP)
 
 - **Source:** Agent Client Protocol — shared `session/update` + `session/request_permission` map
-- **Wire:** `jsonrpc-content-length` via `JsonRpcTransport`
+- **Wire:** `jsonl-rpc` (newline-delimited JSON-RPC). ACP stdio is not Content-Length. Do not enable Pi `rpc_chunk` reassembly (`JsonlRpcTransport::without_rpc_chunks`).
 - **Codec:** `AcpCodec` — generic / catalog profile (`AgentKind::Acp`)
 - **Profile:** `adapters/grok_build` calls `acp::map_*` and keeps `GrokBuildCodec` / `AgentKind::GrokBuild`
 
-Catalog agents (Cursor, Copilot, …) should start here. Per-binary launch argv
-is a later catalog slice — this folder is map + codec only.
+Catalog agents (Cursor, Copilot) start here and share `AcpCodec`. Launch
+argv is data in `src/catalog/builtin.toml` (`profile` → `LaunchSpec`), not a
+second codec and not a process spawn.
 
 ## Caps defaults
 
@@ -20,7 +21,7 @@ reserved flags stay unset until a profile or later slice overrides. See
 ## Rules
 
 Adapters map **typed frames** only. Do not scrape stdout lines or strip `data:` here.
-Use `transport::JsonRpcTransport::try_decode_content_length` at the I/O boundary.
+Use `JsonlRpcTransport::without_rpc_chunks` at the I/O boundary (one line, one JSON value). Do not frame ACP stdio with Content-Length.
 
 ## Fixtures
 
