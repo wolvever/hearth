@@ -13,7 +13,11 @@
 //! - **AdapterCodec** maps typed [`transport::WireFrame`]s ↔ [`AgentEvent`] / [`AgentCommand`].
 //! - **Catalog** maps an ACP profile (Copilot, Cursor) to [`catalog::LaunchSpec`] data.
 //!   Shared [`adapters::acp::AcpCodec`] on newline-delimited JSON-RPC (`jsonl-rpc`),
-//!   not Content-Length. No process spawn. Pi `rpc_chunk` is not used for ACP.
+//!   not Content-Length. Pi `rpc_chunk` is not used for ACP.
+//! - **Runner** ([`runner::AttachRunner`]) spawns/pumps framed stdio from a
+//!   [`LaunchSpec`]. ACP uses [`JsonlRpcTransport::without_rpc_chunks`]. Remint
+//!   is resume-not-load + fail-closed (never `session/new` / `session/load`
+//!   under an existing Session).
 //! - Prefer [`FramedAgent<T, C>`] for live attach. [`LoopbackAgent`] stays for Host tests.
 //! - Never scrape unstructured stdout/stderr or regex logs for events.
 //! - There is no public `map_wire_line` / `push_line`.
@@ -23,6 +27,7 @@ pub mod adapters;
 pub mod capabilities;
 pub mod catalog;
 pub mod host;
+pub mod runner;
 pub mod transport;
 
 pub use adapters::{lookup, registry, AdapterCodec, AdapterInfo};
@@ -32,6 +37,10 @@ pub use catalog::{
     CatalogProfile, LaunchSpec,
 };
 pub use host::{binding_kind, event_bodies, host_for, AttachError, AttachResult, HostAttach};
+pub use runner::{
+    encode_remint_rpc, transport_for_wire, AttachRunner, LiveCaps, RemintError, RemintEvent,
+    RemintEventKind, RemintOutcome, RemintSession, RemintWireMethod, RunnerTransport,
+};
 pub use transport::{
     JsonlProblem, JsonlRpcTransport, JsonRpcTransport, SseFrame, SseTransport, Transport,
     WebSocketJsonTransport, WireFrame, WireKind,

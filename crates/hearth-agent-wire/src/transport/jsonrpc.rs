@@ -14,6 +14,8 @@ use std::collections::VecDeque;
 pub struct JsonRpcTransport {
     inbound: VecDeque<Value>,
     outbound: Vec<Value>,
+    /// Partial Content-Length bytes awaiting a complete frame.
+    byte_buf: Vec<u8>,
 }
 
 impl JsonRpcTransport {
@@ -28,6 +30,21 @@ impl JsonRpcTransport {
 
     pub fn outbound(&self) -> &[Value] {
         &self.outbound
+    }
+
+    /// Feed stdout / socket bytes. Complete Content-Length frames are
+    /// decoded into the inbound queue; leftovers stay buffered. Bare
+    /// NDJSON without a Content-Length header stays buffered (never
+    /// line-scraped into events).
+    pub fn push_bytes(&mut self, bytes: &[u8]) -> Result<(), BusError> {
+        self.byte_buf.extend_from_slice(bytes);
+        loop {
+            match Self::try_decode_content_length(&mut self.byte_buf)? {
+                Some(v) => self.inbound.push_back(v),
+                None => break,
+            }
+        }
+        Ok(())
     }
 
     /// Encode one message as LSP/ACP Content-Length framed bytes.
@@ -164,5 +181,27 @@ mod tests {
             Some(WireFrame::Json(v)) => assert_eq!(v["a"], 1),
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn push_bytes_decodes_content_length_frames() {
+        let msg = serde_json::json!({"jsonrpc":"2.0","method":"ping"});
+        let bytes = JsonRpcTransport::encode_content_length(&msg).unwrap();
+        let mut t = JsonRpcTransport::new();
+        // Split header/body to exercise the byte buffer.
+        t.push_bytes(&bytes[..10]).unwrap();
+        assert!(t.try_recv_frame().unwrap().is_none());
+        t.push_bytes(&bytes[10..]).unwrap();
+        match t.try_recv_frame().unwrap() {
+            Some(WireFrame::Json(v)) => assert_eq!(v["method"], "ping"),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn push_bytes_does_not_line_scrape_ndjson() {
+        let mut t = JsonRpcTransport::new();
+        t.push_bytes(b"{\"method\":\"nope\"}\n").unwrap();
+        assert!(t.try_recv_frame().unwrap().is_none());
     }
 }

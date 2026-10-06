@@ -18,6 +18,10 @@ without touching Host/Session/Binding or scraping logs.
    - **JSONL RPC** (`jsonl-rpc`) — newline is the frame delimiter, with
      optional `rpc_chunk` reassembly. Not NDJSON-of-logs.
 4. SoftExpiring / Flush-before-dispatch stay **parked** — do not land them here.
+5. **Remint is fail-closed.** `runner::AttachRunner` / `RemintSession` may
+   `session/resume` (same agent session id) or append a typed fail-closed
+   Event — never `session/new` under an existing Session, never
+   `session/load` as fallback, never silent prompt resubmit.
 
 ## Afternoon checklist
 
@@ -65,6 +69,14 @@ agent.send(AgentCommand::UserMessage { .. })?;
 
 Never: `wire.push_line(stdout_line)` / `map_wire_line`. Banner text is a
 transport decode problem, not an event.
+
+## AttachRunner
+
+`src/runner/` spawns/pumps a `LaunchSpec`. ACP catalog profiles use
+`JsonlRpcTransport::without_rpc_chunks()`. Remint policy (resume-not-load,
+cancel-before-reattach, permission resurface, tool finalize, truncated
+resync, stale-teardown skip, fail-closed guard) is `runner::remint`.
+Binding ids stay Host-owned via `HostAttach`.
 
 ## Review bar
 
