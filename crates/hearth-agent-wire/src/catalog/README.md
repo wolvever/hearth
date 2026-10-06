@@ -2,7 +2,7 @@
 
 ACP profile list. **Data only** — a profile resolves to a `LaunchSpec`
 (program, args, env, `WireKind`). Nothing here spawns a process.
-`AttachRunner` is a later slice.
+`AttachRunner` lives in `src/runner/` (slice 5).
 
 | id | command | extends | codec | wire |
 |----|---------|---------|-------|------|
@@ -18,8 +18,8 @@ enable Pi `rpc_chunk` reassembly (`JsonlRpcTransport::without_rpc_chunks`).
 
 Resume reuses `HostAttach::resume` and `Binding.native_resume_id`. This
 catalog does not encode Gemini-style `session/load`. Live capability gating
-(Copilot advertises `loadSession` but not `resume`) is AttachRunner, not
-this catalog.
+(Copilot advertises `loadSession` but not `resume`) is `runner::LiveCaps` +
+fail-closed remint, not this catalog.
 
 ```bash
 cargo test -p hearth-agent-wire catalog::

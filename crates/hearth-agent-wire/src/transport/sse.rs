@@ -91,8 +91,8 @@ impl SseTransport {
         if payload == "[DONE]" {
             return Ok(None);
         }
-        let data: Value =
-            serde_json::from_str(&payload).map_err(|e| BusError::Decode(format!("SSE data JSON: {e}")))?;
+        let data: Value = serde_json::from_str(&payload)
+            .map_err(|e| BusError::Decode(format!("SSE data JSON: {e}")))?;
         Ok(Some(SseFrame { event, id, data }))
     }
 }

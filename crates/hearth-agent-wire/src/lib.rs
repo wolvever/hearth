@@ -13,7 +13,11 @@
 //! - **AdapterCodec** maps typed [`transport::WireFrame`]s ↔ [`AgentEvent`] / [`AgentCommand`].
 //! - **Catalog** maps an ACP profile (Copilot, Cursor) to [`catalog::LaunchSpec`] data.
 //!   Shared [`adapters::acp::AcpCodec`] on newline-delimited JSON-RPC (`jsonl-rpc`),
-//!   not Content-Length. No process spawn. Pi `rpc_chunk` is not used for ACP.
+//!   not Content-Length. Pi `rpc_chunk` is not used for ACP.
+//! - **Runner** ([`runner::AttachRunner`]) spawns/pumps framed stdio from a
+//!   [`LaunchSpec`]. ACP uses [`JsonlRpcTransport::without_rpc_chunks`]. Remint
+//!   is resume-not-load + fail-closed (never `session/new` / `session/load`
+//!   under an existing Session).
 //! - Prefer [`FramedAgent<T, C>`] for live attach. [`LoopbackAgent`] stays for Host tests.
 //! - Never scrape unstructured stdout/stderr or regex logs for events.
 //! - There is no public `map_wire_line` / `push_line`.
@@ -23,6 +27,7 @@ pub mod adapters;
 pub mod capabilities;
 pub mod catalog;
 pub mod host;
+pub mod runner;
 pub mod transport;
 
 pub use adapters::{lookup, registry, AdapterCodec, AdapterInfo};
@@ -32,8 +37,12 @@ pub use catalog::{
     CatalogProfile, LaunchSpec,
 };
 pub use host::{binding_kind, event_bodies, host_for, AttachError, AttachResult, HostAttach};
+pub use runner::{
+    encode_remint_rpc, transport_for_wire, AttachRunner, LiveCaps, RemintError, RemintEvent,
+    RemintEventKind, RemintOutcome, RemintSession, RemintWireMethod, RunnerTransport,
+};
 pub use transport::{
-    JsonlProblem, JsonlRpcTransport, JsonRpcTransport, SseFrame, SseTransport, Transport,
+    JsonRpcTransport, JsonlProblem, JsonlRpcTransport, SseFrame, SseTransport, Transport,
     WebSocketJsonTransport, WireFrame, WireKind,
 };
 
@@ -62,12 +71,28 @@ pub enum AgentKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum AgentCommand {
-    CreateProject { name: String, cwd: String },
-    OpenSession { project_id: ProjectId, cwd: Option<String> },
-    CloseSession { session_id: SessionId },
-    UserMessage { session_id: SessionId, text: String },
-    Steer { session_id: SessionId, text: String },
-    Abort { session_id: SessionId },
+    CreateProject {
+        name: String,
+        cwd: String,
+    },
+    OpenSession {
+        project_id: ProjectId,
+        cwd: Option<String>,
+    },
+    CloseSession {
+        session_id: SessionId,
+    },
+    UserMessage {
+        session_id: SessionId,
+        text: String,
+    },
+    Steer {
+        session_id: SessionId,
+        text: String,
+    },
+    Abort {
+        session_id: SessionId,
+    },
     ReplyPermission {
         session_id: SessionId,
         permission_id: PermissionId,
@@ -80,15 +105,23 @@ pub enum AgentCommand {
         answers: Vec<String>,
     },
     /// Condense context — pair with Hearth PreCompactHandoff first.
-    Compact { session_id: SessionId },
+    Compact {
+        session_id: SessionId,
+    },
     SpawnTask {
         session_id: SessionId,
         prompt: String,
         background: bool,
     },
-    CancelTask { session_id: SessionId, task_id: TaskId },
+    CancelTask {
+        session_id: SessionId,
+        task_id: TaskId,
+    },
     /// Switch the session mode (plan / ask / …). Encode is a stub until slice 7.
-    SetMode { session_id: SessionId, mode_id: String },
+    SetMode {
+        session_id: SessionId,
+        mode_id: String,
+    },
     /// Opaque provider feature toggle. Encode is a stub until slice 7.
     SetFeature {
         session_id: SessionId,
@@ -100,9 +133,18 @@ pub enum AgentCommand {
         session_id: SessionId,
         servers: serde_json::Value,
     },
-    RevertConversation { session_id: SessionId, message_id: String },
-    RevertFiles { session_id: SessionId, message_id: String },
-    RevertBoth { session_id: SessionId, message_id: String },
+    RevertConversation {
+        session_id: SessionId,
+        message_id: String,
+    },
+    RevertFiles {
+        session_id: SessionId,
+        message_id: String,
+    },
+    RevertBoth {
+        session_id: SessionId,
+        message_id: String,
+    },
 }
 
 impl AgentCommand {
@@ -143,11 +185,25 @@ pub enum ToolStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum AgentEvent {
-    ProjectReady { project_id: ProjectId, cwd: String },
-    SessionStarted { session_id: SessionId, project_id: Option<ProjectId> },
-    SessionEnded { session_id: SessionId },
-    TurnStarted { session_id: SessionId, turn_id: TurnId },
-    TurnCompleted { session_id: SessionId, turn_id: TurnId },
+    ProjectReady {
+        project_id: ProjectId,
+        cwd: String,
+    },
+    SessionStarted {
+        session_id: SessionId,
+        project_id: Option<ProjectId>,
+    },
+    SessionEnded {
+        session_id: SessionId,
+    },
+    TurnStarted {
+        session_id: SessionId,
+        turn_id: TurnId,
+    },
+    TurnCompleted {
+        session_id: SessionId,
+        turn_id: TurnId,
+    },
     Message {
         session_id: SessionId,
         item_id: ItemId,
@@ -225,8 +281,12 @@ pub enum AgentEvent {
         session_id: SessionId,
         child_session_id: SessionId,
     },
-    CompactStarted { session_id: SessionId },
-    Compacted { session_id: SessionId },
+    CompactStarted {
+        session_id: SessionId,
+    },
+    Compacted {
+        session_id: SessionId,
+    },
     /// Session mode list / current mode. Decoders may emit this before encode lands.
     ModeChanged {
         session_id: SessionId,
@@ -393,21 +453,26 @@ impl CodingAgent for LoopbackAgent {
                 });
             }
             AgentCommand::Compact { session_id } => {
-                self.out
-                    .push(AgentEvent::CompactStarted { session_id: session_id.clone() });
+                self.out.push(AgentEvent::CompactStarted {
+                    session_id: session_id.clone(),
+                });
                 self.out.push(AgentEvent::Compacted { session_id });
             }
-            AgentCommand::ReplyPermission { session_id, allow, .. } => {
+            AgentCommand::ReplyPermission {
+                session_id, allow, ..
+            } => {
                 self.out.push(AgentEvent::Status {
                     session_id,
                     busy: false,
-                    detail: Some(if allow { "allowed".into() } else { "denied".into() }),
+                    detail: Some(if allow {
+                        "allowed".into()
+                    } else {
+                        "denied".into()
+                    }),
                 });
             }
             AgentCommand::SpawnTask {
-                session_id,
-                prompt,
-                ..
+                session_id, prompt, ..
             } => {
                 self.out.push(AgentEvent::TaskStarted {
                     session_id: session_id.clone(),
@@ -478,7 +543,12 @@ mod tests {
         });
         let ev = grok_build::map_notification(&raw).unwrap();
         match ev {
-            AgentEvent::ToolCall { item_id, name, status, .. } => {
+            AgentEvent::ToolCall {
+                item_id,
+                name,
+                status,
+                ..
+            } => {
                 assert_eq!(item_id, "c1");
                 assert_eq!(name, "read");
                 assert_eq!(status, ToolStatus::Pending);
@@ -656,21 +726,19 @@ mod tests {
         use crate::transport::JsonRpcTransport;
 
         let mut agent = FramedAgent::new(JsonRpcTransport::new(), GrokBuildCodec);
-        agent
-            .transport_mut()
-            .push_decoded(serde_json::json!({
-                "jsonrpc": "2.0",
-                "method": "session/update",
-                "params": {
-                    "sessionId": "s1",
-                    "update": {
-                        "sessionUpdate": "tool_call_update",
-                        "toolCallId": "c1",
-                        "title": "read",
-                        "status": "pending"
-                    }
+        agent.transport_mut().push_decoded(serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "s1",
+                "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "c1",
+                    "title": "read",
+                    "status": "pending"
                 }
-            }));
+            }
+        }));
         let ev = agent.try_recv().unwrap().unwrap();
         assert!(matches!(ev, AgentEvent::ToolCall { .. }));
 

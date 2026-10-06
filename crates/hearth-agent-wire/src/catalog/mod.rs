@@ -7,7 +7,7 @@
 //!
 //! Reattach is [`crate::host::HostAttach::resume`] (`native_resume_id`),
 //! never Gemini-style `session/load`. Live capability gating (a profile may
-//! advertise `loadSession` and still lack `resume`) belongs to AttachRunner.
+//! advertise `loadSession` and still lack `resume`) belongs to `runner::LiveCaps`.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -41,7 +41,7 @@ pub struct CatalogProfile {
     pub env: Vec<(String, String)>,
 }
 
-/// Spawn inputs for a later runner. Constructing this does not start a process.
+/// Spawn inputs for [`crate::runner::AttachRunner`]. Constructing this does not start a process.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchSpec {
     pub program: String,

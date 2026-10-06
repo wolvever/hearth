@@ -268,7 +268,7 @@ fn chunk_part_bytes(data: &str) -> Result<Vec<u8>, ()> {
 
 fn looks_like_base64(data: &str) -> bool {
     !data.is_empty()
-        && data.len() % 4 == 0
+        && data.len().is_multiple_of(4)
         && data.bytes().all(|b| {
             matches!(
                 b,
@@ -289,7 +289,7 @@ fn decode_base64(data: &str) -> Option<Vec<u8>> {
             _ => return None,
         })
     }
-    if data.len() % 4 != 0 {
+    if !data.len().is_multiple_of(4) {
         return None;
     }
     let pad = data.bytes().rev().take_while(|&b| b == b'=').count();
