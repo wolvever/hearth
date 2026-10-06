@@ -82,9 +82,13 @@ pub fn event_bodies(agent: AgentId, ev: &AgentEvent) -> Vec<EventBody> {
             }]
         }
         AgentEvent::ToolCall {
-            name, arguments, ..
+            item_id,
+            name,
+            arguments,
+            ..
         } => vec![EventBody::ToolCall {
             agent,
+            tool_call_id: item_id.clone(),
             name: name.clone(),
             input: arguments.to_string(),
         }],
@@ -92,6 +96,8 @@ pub fn event_bodies(agent: AgentId, ev: &AgentEvent) -> Vec<EventBody> {
             item_id, output, ..
         } => vec![EventBody::ToolResult {
             agent,
+            tool_call_id: item_id.clone(),
+            // Wire ToolResult has no tool name; keep id as display name.
             name: item_id.clone(),
             output: output.to_string(),
         }],
@@ -288,8 +294,18 @@ impl<A: CodingAgent> HostAttach<A> {
             AgentEvent::TurnCompleted { .. } => Ok(vec![session.turn_end(self.agent)?]),
             _ => {
                 let mut appended = Vec::new();
+                let log = session.events()?;
                 for body in event_bodies(self.agent, &ev) {
-                    appended.push(session.append(body)?);
+                    // Drop late ToolResult once tool_call_id is already
+                    // terminal (ToolResult or ToolCallInterrupted) so one
+                    // call never gets two terminals (2026-10-07 remint).
+                    if let EventBody::ToolResult { tool_call_id, .. } = &body {
+                        if hearth::tool_call_is_terminal(&log, tool_call_id) {
+                            continue;
+                        }
+                    }
+                    let ev = session.append(body)?;
+                    appended.push(ev);
                 }
                 Ok(appended)
             }

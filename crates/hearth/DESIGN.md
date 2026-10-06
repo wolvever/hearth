@@ -43,8 +43,9 @@ A member is `UserId` or `AgentId`. One agent may sit in many sessions; one sessi
 - `UserMessage { user, text }`
 - `AgentMessage { agent, text }`
 - `AgentThink { agent, text }`
-- `ToolCall { agent, name, input }`
-- `ToolResult { agent, name, output }`
+- `ToolCall { agent, tool_call_id, name, input }`
+- `ToolResult { agent, tool_call_id, name, output }`
+- `ToolCallInterrupted { agent, tool_call_id, name, status }` — remint terminal for an orphan; `status` is `Indeterminate` (not Cancelled)
 - `AskUser { agent, prompt }`
 - `PermissionAsked { agent, request }`
 - `PermissionDecided { request, allowed, by }`
@@ -54,7 +55,7 @@ A member is `UserId` or `AgentId`. One agent may sit in many sessions; one sessi
 - `Compact { start, end, summary }` — replaces `[start, end]` (inclusive `EventId` range in log order) in `surface`; full log keeps originals and the marker. Product path (`compact_with_handoff`) sets `summary` to a Place-path bridge after flushing `memory/handoff.md`; `compact` alone is the EventLog primitive and does not write memory.
 - `Wake { source }` — Runtime timer/trigger marker (`WakeSource`: `UserQuery` / `Timer` / `Trigger { name }`). Not model-visible. User queries are `UserMessage` alone so they are not doubled.
 
-`events()` is the full log. `surface()` / `surface_of` / `is_model_visible` keep only `UserMessage`, `AgentMessage`, `ToolCall`, `ToolResult`, `Compact`, and hide events whose `id` lies in any Compact's inclusive log-order range (`start`/`end` EventIds; missing ids hide nothing). Think, permission, bind, membership, turn, `StepCompleted`, and `Wake` stay in `events()` only. `SessionData` holds `next_turn_id` and `next_seq_id` (next unused, start at 1), plus `last_read` and `current_turn`. `push`/`append` assign a new `EventId`, `seq: None`, and `turn: current_turn` without bumping those counters. `open_turn_of` / `Session::open_turn` / `restore_open_turn` recover a `TurnStart` without `TurnEnd` from the log. `step_result_of` / `Session::step_result` look up a memoized step payload.
+`events()` is the full log. `surface()` / `surface_of` / `is_model_visible` keep only `UserMessage`, `AgentMessage`, `ToolCall`, `ToolResult`, `ToolCallInterrupted`, `Compact`, and hide events whose `id` lies in any Compact's inclusive log-order range (`start`/`end` EventIds; missing ids hide nothing). Think, permission, bind, membership, turn, `StepCompleted`, and `Wake` stay in `events()` only. `SessionData` holds `next_turn_id` and `next_seq_id` (next unused, start at 1), plus `last_read` and `current_turn`. `push`/`append` assign a new `EventId`, `seq: None`, and `turn: current_turn` without bumping those counters. `open_turn_of` / `Session::open_turn` / `restore_open_turn` recover a `TurnStart` without `TurnEnd` from the log. `step_result_of` / `Session::step_result` look up a memoized step payload.
 
 There is no Place attach/detach event. `attach_place` / `detach_place` mutate session state only.
 

@@ -10,9 +10,10 @@
 //!    before AttachResume; idle skips cancel.
 //! 3. **Rehydrate-pending-permission** — [`RemintEvent::PermissionResurface`]
 //!    from Host pending; do not cancel healthy HITL.
-//! 4. **Finalize-orphaned-toolcalls** — after mid-turn cancel,
-//!    [`RemintEvent::ToolCallInterrupted`] (cancelled) for non-terminal
-//!    tools; do not finalize healthy HITL.
+//! 4. **Finalize-orphaned-toolcalls** — after mid-turn cancel, append Host
+//!    [`hearth::EventBody::ToolCallInterrupted`] (Indeterminate) for each
+//!    unmatched `tool_call_id` in the Host EventLog; idempotent across a
+//!    second remint; do not finalize healthy HITL. (2026-10-07 typed EventLog)
 //! 5. **Truncated-replay-resync** — producer `truncated:true` → hydrate
 //!    from Host EventLog watermark (`ResyncFromHost`), not partial tail
 //!    or replay-from-zero.
@@ -25,10 +26,15 @@
 //!    (mark turn interrupted). Gate resume on live `initialize` caps.
 //!
 //! SoftExpiring / Flush / Stage / Evidence / EffectId / Queue / seventh
-//! noun / Gemini `session/load` stay parked.
+//! noun / Gemini `session/load` stay parked. Typed remint keys orphans by
+//! Host `tool_call_id` (2026-10-07) — never by tool name / string lists.
 
 use std::sync::Mutex;
 
+use hearth::{
+    tool_call_is_terminal, unmatched_tool_calls, AgentId, Event, EventBody, InMemory, Member,
+    Session as HostSession, ToolInterruptStatus, UserId,
+};
 use serde_json::Value;
 
 /// Live agent capabilities from an ACP `initialize` result (not static
@@ -131,14 +137,14 @@ pub type Seq = u64;
 pub enum RemintEventKind {
     User,
     Agent,
-    ToolCall,
-    ToolCallInterrupted,
+    /// Remint-policy marker only. Tool terminals live on the Host EventLog
+    /// as [`EventBody::ToolCallInterrupted`] (not here).
     TurnCancelled,
     PermissionRequested,
     PermissionResurface,
     PermissionResolved,
     ResyncFromHost,
-    /// Typed fail-closed marker in Host EventLog (never silent fork).
+    /// Typed fail-closed marker (never silent fork).
     FailClosed,
     AttachResumeHeld,
 }
@@ -181,6 +187,9 @@ pub enum RemintError {
     PromptResubmitBlocked,
     /// Session was closed / gone.
     SessionGone,
+    /// `resolve_permission` permission_id does not match the pending id
+    /// (late answer to an earlier request after remint resurface).
+    StalePermission,
 }
 
 impl RemintError {
@@ -192,6 +201,7 @@ impl RemintError {
             Self::LoadFallbackBlocked => "LoadFallbackBlocked",
             Self::PromptResubmitBlocked => "PromptResubmitBlocked",
             Self::SessionGone => "SessionGone",
+            Self::StalePermission => "StalePermission",
         }
     }
 }
@@ -201,12 +211,13 @@ pub enum ToolStatus {
     Pending,
     Running,
     Completed,
-    Cancelled,
+    /// Orphan interrupted — indeterminate external fate (not Cancelled).
+    Interrupted,
 }
 
 impl ToolStatus {
     pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Completed | Self::Cancelled)
+        matches!(self, Self::Completed | Self::Interrupted)
     }
 }
 
@@ -262,33 +273,31 @@ pub struct TeardownOutcome {
     pub binding_id: BindingId,
 }
 
-#[derive(Debug)]
-struct OpenTool {
-    id: ToolCallId,
-    title: String,
-    status: ToolStatus,
-}
-
-#[derive(Debug)]
 struct Inner {
     session_id: SessionId,
     binding_id: BindingId,
     next_binding: u64,
     agent_session_id: AgentSessionId,
     live_caps: LiveCaps,
+    /// Remint-policy markers (FailClosed, AttachResumeHeld, …). Tool
+    /// Call / Result / Interrupted live only on [`Self::host_session`].
     events: Vec<RemintEvent>,
     next_event: Seq,
     turn_in_flight: bool,
     /// In-flight user prompt text (never auto-resubmitted after remint).
     in_flight_prompt: Option<String>,
     pending_permission: Option<PendingPermission>,
-    open_tools: Vec<OpenTool>,
     attach_cursor: Seq,
     transport_owner: TransportOwner,
     closed: bool,
     /// Producer bounded ring for truncated-replay tests.
     producer_ring: Vec<RemintEvent>,
     producer_ring_cap: usize,
+    /// Keep InMemory alive for the Host Session EventLog.
+    _store: InMemory,
+    host_session: HostSession,
+    host_agent: AgentId,
+    host_user: UserId,
 }
 
 /// Host-owned remint state for AttachRunner. Session-first: remint never
@@ -305,6 +314,16 @@ impl RemintSession {
     ) -> (Self, SessionId, BindingId) {
         let session_id = session_id.into();
         let binding_id = "bind-1".to_string();
+        let host_store = InMemory::new();
+        let host_user = host_store.create_user("remint-user");
+        let host_agent = host_store.create_agent("remint-agent", "");
+        let host_session = host_store.create_session();
+        host_session
+            .join(Member::User(host_user.id))
+            .expect("join remint user");
+        host_session
+            .join(Member::Agent(host_agent.id))
+            .expect("join remint agent");
         let store = Self {
             inner: Mutex::new(Inner {
                 session_id: session_id.clone(),
@@ -317,12 +336,15 @@ impl RemintSession {
                 turn_in_flight: false,
                 in_flight_prompt: None,
                 pending_permission: None,
-                open_tools: Vec::new(),
                 attach_cursor: 0,
                 transport_owner: TransportOwner::Binding(binding_id.clone()),
                 closed: false,
                 producer_ring: Vec::new(),
                 producer_ring_cap: 3,
+                _store: host_store,
+                host_session,
+                host_agent: host_agent.id,
+                host_user: host_user.id,
             }),
         };
         (store, session_id, binding_id)
@@ -377,14 +399,53 @@ impl RemintSession {
         self.inner.lock().unwrap().pending_permission.clone()
     }
 
+    /// Derive tool statuses from the Host EventLog (keyed by tool_call_id).
     pub fn open_tool_statuses(&self) -> Vec<(ToolCallId, ToolStatus)> {
+        let g = self.inner.lock().unwrap();
+        let events = g.host_session.events().expect("host events");
+        let mut statuses: Vec<(ToolCallId, ToolStatus)> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for e in &events {
+            if let EventBody::ToolCall { tool_call_id, .. } = &e.body {
+                if seen.insert(tool_call_id.clone()) {
+                    let st = if tool_call_is_terminal(&events, tool_call_id) {
+                        // Distinguish Result vs Interrupted.
+                        let interrupted = events.iter().any(|x| {
+                            matches!(
+                                &x.body,
+                                EventBody::ToolCallInterrupted {
+                                    tool_call_id: id,
+                                    ..
+                                } if id == tool_call_id
+                            )
+                        });
+                        if interrupted {
+                            ToolStatus::Interrupted
+                        } else {
+                            ToolStatus::Completed
+                        }
+                    } else {
+                        ToolStatus::Running
+                    };
+                    statuses.push((tool_call_id.clone(), st));
+                }
+            }
+        }
+        statuses
+    }
+
+    /// Host EventLog (tool Call / Result / Interrupted live here).
+    pub fn host_events(&self) -> Vec<Event> {
         self.inner
             .lock()
             .unwrap()
-            .open_tools
-            .iter()
-            .map(|t| (t.id.clone(), t.status.clone()))
-            .collect()
+            .host_session
+            .events()
+            .expect("host events")
+    }
+
+    pub fn host_agent_id(&self) -> AgentId {
+        self.inner.lock().unwrap().host_agent
     }
 
     pub fn turn_in_flight(&self) -> bool {
@@ -456,41 +517,104 @@ impl RemintSession {
         g.turn_in_flight = true;
     }
 
-    pub fn resolve_permission(&self, option_id: &str) -> Result<(), RemintError> {
+    /// Resolve the pending permission. `permission_id` must match the
+    /// current pending id so a late answer to an earlier request cannot
+    /// resolve the current one after remint resurfaces.
+    pub fn resolve_permission(
+        &self,
+        permission_id: &str,
+        option_id: &str,
+    ) -> Result<(), RemintError> {
         let mut g = self.inner.lock().unwrap();
-        let Some(pending) = g.pending_permission.take() else {
+        let Some(pending) = g.pending_permission.clone() else {
             return Err(RemintError::SessionGone);
         };
+        if pending.id != permission_id {
+            // Do not take() — keep current pending for the matching id.
+            return Err(RemintError::StalePermission);
+        }
+        g.pending_permission = None;
         Self::push_event(
             &mut g,
             RemintEventKind::PermissionResolved,
             format!("{}:{option_id}", pending.id),
+        );
+        let _ = g.host_session.decide_permission(
+            format!("{}:{}", pending.id, pending.title),
+            option_id == "allow" || option_id.starts_with("allow"),
+            g.host_user,
         );
         g.turn_in_flight = false;
         g.in_flight_prompt = None;
         Ok(())
     }
 
+    /// Append a Host [`EventBody::ToolCall`] keyed by `tool_call_id`.
     pub fn start_tool(&self, tool_call_id: &str, title: &str) {
         let mut g = self.inner.lock().unwrap();
-        g.open_tools.push(OpenTool {
-            id: tool_call_id.into(),
-            title: title.into(),
-            status: ToolStatus::Running,
-        });
-        Self::push_event(
-            &mut g,
-            RemintEventKind::ToolCall,
-            format!("{tool_call_id}:{title}"),
-        );
+        g.host_session
+            .append(EventBody::ToolCall {
+                agent: g.host_agent,
+                tool_call_id: tool_call_id.into(),
+                name: title.into(),
+                input: "{}".into(),
+            })
+            .expect("append ToolCall");
         g.turn_in_flight = true;
     }
 
-    pub fn complete_tool(&self, tool_call_id: &str) {
-        let mut g = self.inner.lock().unwrap();
-        if let Some(t) = g.open_tools.iter_mut().find(|t| t.id == tool_call_id) {
-            t.status = ToolStatus::Completed;
+    /// Append a Host [`EventBody::ToolResult`]. No-op (dropped) if the
+    /// call is already terminal (including ToolCallInterrupted).
+    pub fn complete_tool(&self, tool_call_id: &str) -> bool {
+        self.append_tool_result(tool_call_id, "ok")
+    }
+
+    /// Append ToolResult by tool_call_id. Returns false if dropped as stale
+    /// after an interrupted marker (one call never gets two terminals).
+    pub fn append_tool_result(&self, tool_call_id: &str, output: &str) -> bool {
+        let g = self.inner.lock().unwrap();
+        let events = g.host_session.events().expect("host events");
+        if tool_call_is_terminal(&events, tool_call_id) {
+            return false;
         }
+        // Recover tool name from the matching ToolCall when present.
+        let name = events
+            .iter()
+            .rev()
+            .find_map(|e| match &e.body {
+                EventBody::ToolCall {
+                    tool_call_id: id,
+                    name,
+                    ..
+                } if id == tool_call_id => Some(name.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| tool_call_id.to_string());
+        g.host_session
+            .append(EventBody::ToolResult {
+                agent: g.host_agent,
+                tool_call_id: tool_call_id.into(),
+                name,
+                output: output.into(),
+            })
+            .expect("append ToolResult");
+        true
+    }
+
+    /// Count Host ToolCallInterrupted events for `tool_call_id`.
+    pub fn interrupted_marker_count(&self, tool_call_id: &str) -> usize {
+        self.host_events()
+            .iter()
+            .filter(|e| {
+                matches!(
+                    &e.body,
+                    EventBody::ToolCallInterrupted {
+                        tool_call_id: id,
+                        ..
+                    } if id == tool_call_id
+                )
+            })
+            .count()
     }
 
     pub fn set_attach_cursor(&self, seq: Seq) {
@@ -570,23 +694,25 @@ impl RemintSession {
             Self::push_event(&mut g, RemintEventKind::TurnCancelled, "mid-turn");
             turn_interrupted = true;
 
-            // Finalize-orphaned-toolcalls (09-30).
-            let to_cancel: Vec<(String, String)> = g
-                .open_tools
-                .iter()
-                .filter(|t| !t.status.is_terminal())
-                .map(|t| (t.id.clone(), t.title.clone()))
-                .collect();
-            for (tool_id, title) in &to_cancel {
-                if let Some(tool) = g.open_tools.iter_mut().find(|t| t.id == *tool_id) {
-                    tool.status = ToolStatus::Cancelled;
+            // Finalize-orphaned-toolcalls (09-30 / 10-07): Host EventLog
+            // by tool_call_id. Idempotent — already-interrupted ids skip.
+            let host_log = g.host_session.events().expect("host events");
+            let orphans = unmatched_tool_calls(&host_log);
+            for (agent, tool_id, name) in orphans {
+                // Re-check terminal under the same lock (double remint).
+                let latest = g.host_session.events().expect("host events");
+                if tool_call_is_terminal(&latest, &tool_id) {
+                    continue;
                 }
+                g.host_session
+                    .append(EventBody::ToolCallInterrupted {
+                        agent,
+                        tool_call_id: tool_id,
+                        name,
+                        status: ToolInterruptStatus::Indeterminate,
+                    })
+                    .expect("append ToolCallInterrupted");
                 tools_finalized += 1;
-                Self::push_event(
-                    &mut g,
-                    RemintEventKind::ToolCallInterrupted,
-                    format!("{tool_id}:{title}:cancelled"),
-                );
             }
             g.turn_in_flight = false;
             // NEVER resubmit in-flight prompt after remint.
@@ -925,19 +1051,184 @@ mod tests {
         s.begin_turn("work");
         s.start_tool("t1", "bash");
         s.start_tool("t2", "read");
-        s.complete_tool("t2");
+        assert!(s.complete_tool("t2"));
         let out = s.remint_and_attach().unwrap();
         assert_eq!(out.tools_finalized, 1);
         let statuses = s.open_tool_statuses();
         assert!(statuses
             .iter()
-            .any(|(id, st)| id == "t1" && *st == ToolStatus::Cancelled));
+            .any(|(id, st)| id == "t1" && *st == ToolStatus::Interrupted));
         assert!(statuses
             .iter()
             .any(|(id, st)| id == "t2" && *st == ToolStatus::Completed));
-        assert!(s.observe().iter().any(
-            |e| e.kind == RemintEventKind::ToolCallInterrupted && e.text == "t1:bash:cancelled"
-        ));
+        assert_eq!(s.interrupted_marker_count("t1"), 1);
+        assert!(s.host_events().iter().any(|e| matches!(
+            &e.body,
+            EventBody::ToolCallInterrupted {
+                tool_call_id,
+                status: ToolInterruptStatus::Indeterminate,
+                ..
+            } if tool_call_id == "t1"
+        )));
+        // Interrupted is Host Event — not a RemintEvent string list.
+        assert!(!s
+            .observe()
+            .iter()
+            .any(|e| e.text.contains("cancelled") || e.text.contains("t1:bash")));
+    }
+
+    #[test]
+    fn orphans_keyed_by_tool_call_id_parallel_same_name() {
+        let (s, _, _) = RemintSession::open("sess-1", "agent-1", caps_resume());
+        s.begin_turn("parallel");
+        s.start_tool("x1", "bash");
+        s.start_tool("x2", "bash");
+        assert!(s.complete_tool("x1"));
+        let out = s.remint_and_attach().unwrap();
+        assert_eq!(out.tools_finalized, 1);
+        assert_eq!(s.interrupted_marker_count("x2"), 1);
+        assert_eq!(s.interrupted_marker_count("x1"), 0);
+        let statuses = s.open_tool_statuses();
+        assert!(statuses
+            .iter()
+            .any(|(id, st)| id == "x1" && *st == ToolStatus::Completed));
+        assert!(statuses
+            .iter()
+            .any(|(id, st)| id == "x2" && *st == ToolStatus::Interrupted));
+    }
+
+    #[test]
+    fn double_remint_writes_one_interrupted_marker() {
+        let (s, _, _) = RemintSession::open("sess-1", "agent-1", caps_resume());
+        s.begin_turn("work");
+        s.start_tool("t1", "bash");
+        s.start_tool("t2", "bash");
+        assert!(s.complete_tool("t1"));
+        let o1 = s.remint_and_attach().unwrap();
+        assert_eq!(o1.tools_finalized, 1);
+        // Second remint: turn no longer in-flight; marker already terminal.
+        let o2 = s.remint_and_attach().unwrap();
+        assert_eq!(o2.tools_finalized, 0);
+        assert_eq!(s.interrupted_marker_count("t2"), 1);
+        assert_eq!(s.interrupted_marker_count("t1"), 0);
+    }
+
+    #[test]
+    fn late_tool_result_after_interrupted_is_dropped() {
+        let (s, _, _) = RemintSession::open("sess-1", "agent-1", caps_resume());
+        s.begin_turn("work");
+        s.start_tool("t2", "bash");
+        let _ = s.remint_and_attach().unwrap();
+        assert_eq!(s.interrupted_marker_count("t2"), 1);
+        // Straggler result from old Binding — must not create a second terminal.
+        assert!(!s.append_tool_result("t2", "late-ok"));
+        let terminals = s
+            .host_events()
+            .iter()
+            .filter(|e| {
+                matches!(
+                    &e.body,
+                    EventBody::ToolResult {
+                        tool_call_id,
+                        ..
+                    }
+                    | EventBody::ToolCallInterrupted {
+                        tool_call_id,
+                        ..
+                    } if tool_call_id == "t2"
+                )
+            })
+            .count();
+        assert_eq!(terminals, 1);
+    }
+
+    #[test]
+    fn resolve_permission_bound_to_pending_id() {
+        let (s, _, _) = RemintSession::open("sess-1", "agent-1", caps_resume());
+        s.begin_turn("need-perm");
+        s.request_permission("p1", "Allow shell?", &["allow", "deny"]);
+        let _ = s.remint_and_attach().unwrap();
+        // Late answer for an earlier id must not resolve current pending.
+        let err = s.resolve_permission("p0-stale", "allow").unwrap_err();
+        assert_eq!(err, RemintError::StalePermission);
+        assert!(s.pending_permission().is_some());
+        s.resolve_permission("p1", "allow").unwrap();
+        assert!(s.pending_permission().is_none());
+    }
+
+    /// Fake ACP peer that refuses `session/new` under an existing Session.
+    /// Double remint keeps the same agent session id and one interrupted marker.
+    #[test]
+    fn fake_acp_refuses_session_new_double_remint() {
+        struct FakeAcp {
+            methods: Vec<String>,
+            agent_session_id: String,
+        }
+        impl FakeAcp {
+            fn dispatch(
+                &mut self,
+                method: &str,
+                session: &RemintSession,
+            ) -> Result<(), RemintError> {
+                self.methods.push(method.to_string());
+                match method {
+                    "session/new" => Err(session.refuse_session_new()),
+                    "session/load" => Err(session.refuse_session_load()),
+                    "session/resume" => {
+                        assert_eq!(session.agent_session_id(), self.agent_session_id);
+                        Ok(())
+                    }
+                    "session/cancel" | "session/close" => Ok(()),
+                    other => panic!("unexpected method {other}"),
+                }
+            }
+        }
+
+        let (s, _, _) = RemintSession::open("sess-1", "S-stable", caps_resume());
+        let mut peer = FakeAcp {
+            methods: Vec::new(),
+            agent_session_id: "S-stable".into(),
+        };
+        s.begin_turn("work");
+        s.start_tool("t1", "bash");
+        s.start_tool("t2", "bash");
+        assert!(s.complete_tool("t1"));
+
+        let o1 = s.remint_and_attach().unwrap();
+        for a in &o1.wire_actions {
+            let method = match a {
+                WireAction::SessionClose => "session/close",
+                WireAction::SessionCancel => "session/cancel",
+                WireAction::AttachResume => "session/resume",
+                WireAction::None => continue,
+            };
+            peer.dispatch(method, &s).unwrap();
+        }
+        assert_eq!(s.interrupted_marker_count("t2"), 1);
+
+        let o2 = s.remint_and_attach().unwrap();
+        for a in &o2.wire_actions {
+            if let WireAction::AttachResume = a {
+                peer.dispatch("session/resume", &s).unwrap();
+            }
+        }
+        assert_eq!(s.interrupted_marker_count("t2"), 1);
+        assert_eq!(s.agent_session_id(), "S-stable");
+
+        // Remint wire path never emitted session/new — only close + resume.
+        assert!(peer.methods.iter().all(|m| m != "session/new"));
+        assert!(peer.methods.iter().any(|m| m == "session/resume"));
+        assert!(peer.methods.iter().any(|m| m == "session/close"));
+        // acpx CLI would session/new here — fake ACP + remint refuse.
+        let err = peer.dispatch("session/new", &s).unwrap_err();
+        assert_eq!(err, RemintError::SilentForkBlocked);
+        assert_eq!(
+            peer.methods.iter().filter(|m| *m == "session/new").count(),
+            1
+        );
+        // encode helper still never produces session/new.
+        let allowed = encode_remint_rpc(RemintWireMethod::SessionResume, "S-stable", 1);
+        assert_ne!(allowed["method"], "session/new");
     }
 
     #[test]
