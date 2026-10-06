@@ -60,8 +60,8 @@ impl LiveCaps {
             || method_listed(&caps, "session/resume");
         let cancel = flag(&caps, &["sessionCancel", "cancel", "promptCancel"])
             || method_listed(&caps, "session/cancel");
-        let close = flag(&caps, &["sessionClose", "close"])
-            || method_listed(&caps, "session/close");
+        let close =
+            flag(&caps, &["sessionClose", "close"]) || method_listed(&caps, "session/close");
         Self {
             resume,
             load_session,
@@ -106,7 +106,9 @@ fn flag(caps: &Value, names: &[&str]) -> bool {
 fn truthy(v: Option<&Value>) -> bool {
     match v {
         Some(Value::Bool(true)) => true,
-        Some(obj) if obj.is_object() => obj.get("supported").and_then(|s| s.as_bool()) == Some(true),
+        Some(obj) if obj.is_object() => {
+            obj.get("supported").and_then(|s| s.as_bool()) == Some(true)
+        }
         _ => false,
     }
 }
@@ -114,11 +116,7 @@ fn truthy(v: Option<&Value>) -> bool {
 fn method_listed(caps: &Value, method: &str) -> bool {
     caps.get("methods")
         .and_then(|m| m.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str())
-                .any(|m| m == method)
-        })
+        .map(|a| a.iter().filter_map(|v| v.as_str()).any(|m| m == method))
         .unwrap_or(false)
 }
 
@@ -410,6 +408,16 @@ impl RemintSession {
         ev
     }
 
+    /// On fail-closed remint that abandons an in-flight turn, mark it
+    /// interrupted before returning — never leave `turn_in_flight` sticky.
+    fn mark_interrupted_if_in_flight(g: &mut Inner, why: &str) {
+        if g.turn_in_flight {
+            Self::push_event(g, RemintEventKind::TurnCancelled, why);
+            g.turn_in_flight = false;
+            g.in_flight_prompt = None;
+        }
+    }
+
     pub fn append_turn(&self, user: &str, agent: &str) {
         let mut g = self.inner.lock().unwrap();
         Self::push_event(&mut g, RemintEventKind::User, user);
@@ -501,8 +509,8 @@ impl RemintSession {
     pub fn producer_events_since(&self, last_seen: Seq) -> ReplaySlice {
         let g = self.inner.lock().unwrap();
         let first_retained = g.producer_ring.first().map(|e| e.id).unwrap_or(0);
-        let truncated = last_seen + 1 < first_retained && !g.producer_ring.is_empty()
-            || (last_seen > 0 && first_retained > last_seen + 1);
+        let truncated =
+            (last_seen > 0 || !g.producer_ring.is_empty()) && last_seen + 1 < first_retained;
         let events: Vec<_> = g
             .producer_ring
             .iter()
@@ -535,6 +543,7 @@ impl RemintSession {
                 RemintError::ResumeNotSupported
             };
             Self::push_event(&mut g, RemintEventKind::FailClosed, reason.as_event_text());
+            Self::mark_interrupted_if_in_flight(&mut g, reason.as_event_text());
             return Err(reason);
         }
 
@@ -554,6 +563,7 @@ impl RemintSession {
             } else {
                 let reason = RemintError::CancelNotSupported;
                 Self::push_event(&mut g, RemintEventKind::FailClosed, reason.as_event_text());
+                Self::mark_interrupted_if_in_flight(&mut g, reason.as_event_text());
                 return Err(reason);
             };
             wire_actions.push(action);
@@ -587,9 +597,7 @@ impl RemintSession {
         let cursor = g.attach_cursor;
         let first_retained = g.producer_ring.first().map(|e| e.id).unwrap_or(0);
         let host_wm = g.events.last().map(|e| e.id).unwrap_or(0);
-        let truncated = cursor > 0
-            && !g.producer_ring.is_empty()
-            && first_retained > cursor + 1;
+        let truncated = cursor > 0 && !g.producer_ring.is_empty() && first_retained > cursor + 1;
         let mut resynced_from_host = false;
         if truncated {
             // Hydrate from Host EventLog after cursor — not producer tail.
@@ -695,7 +703,11 @@ impl RemintSession {
         Self::push_event(&mut g, RemintEventKind::FailClosed, err.as_event_text());
         // Mark turn interrupted; do not clear EventLog.
         if g.turn_in_flight {
-            Self::push_event(&mut g, RemintEventKind::TurnCancelled, "prompt-resubmit-blocked");
+            Self::push_event(
+                &mut g,
+                RemintEventKind::TurnCancelled,
+                "prompt-resubmit-blocked",
+            );
             g.turn_in_flight = false;
             g.in_flight_prompt = None;
         }
@@ -748,11 +760,7 @@ impl RemintSession {
 }
 
 /// Encode ACP wire JSON for remint actions (tests / AttachRunner write path).
-pub fn encode_remint_rpc(
-    method: RemintWireMethod,
-    agent_session_id: &str,
-    id: u64,
-) -> Value {
+pub fn encode_remint_rpc(method: RemintWireMethod, agent_session_id: &str, id: u64) -> Value {
     let method_str = match method {
         RemintWireMethod::SessionResume => "session/resume",
         RemintWireMethod::SessionCancel => "session/cancel",
@@ -842,8 +850,7 @@ mod tests {
         assert!(s
             .observe()
             .iter()
-            .any(|e| e.kind == RemintEventKind::FailClosed
-                && e.text == "ResumeNotSupported"));
+            .any(|e| e.kind == RemintEventKind::FailClosed && e.text == "ResumeNotSupported"));
         assert_eq!(s.event_count(), n0 + 1);
     }
 
@@ -861,10 +868,7 @@ mod tests {
         s.append_turn("u", "a");
         let err = s.remint_and_attach().unwrap_err();
         assert_eq!(err, RemintError::LoadFallbackBlocked);
-        assert!(s
-            .observe()
-            .iter()
-            .any(|e| e.text == "LoadFallbackBlocked"));
+        assert!(s.observe().iter().any(|e| e.text == "LoadFallbackBlocked"));
     }
 
     #[test]
@@ -925,13 +929,15 @@ mod tests {
         let out = s.remint_and_attach().unwrap();
         assert_eq!(out.tools_finalized, 1);
         let statuses = s.open_tool_statuses();
-        assert!(statuses.iter().any(|(id, st)| id == "t1" && *st == ToolStatus::Cancelled));
-        assert!(statuses.iter().any(|(id, st)| id == "t2" && *st == ToolStatus::Completed));
-        assert!(s
-            .observe()
+        assert!(statuses
             .iter()
-            .any(|e| e.kind == RemintEventKind::ToolCallInterrupted
-                && e.text == "t1:bash:cancelled"));
+            .any(|(id, st)| id == "t1" && *st == ToolStatus::Cancelled));
+        assert!(statuses
+            .iter()
+            .any(|(id, st)| id == "t2" && *st == ToolStatus::Completed));
+        assert!(s.observe().iter().any(
+            |e| e.kind == RemintEventKind::ToolCallInterrupted && e.text == "t1:bash:cancelled"
+        ));
     }
 
     #[test]
@@ -946,7 +952,9 @@ mod tests {
         assert!(out.permission_resurfaced);
         assert!(!out.turn_interrupted);
         let statuses = s.open_tool_statuses();
-        assert!(statuses.iter().any(|(id, st)| id == "t1" && *st == ToolStatus::Running));
+        assert!(statuses
+            .iter()
+            .any(|(id, st)| id == "t1" && *st == ToolStatus::Running));
     }
 
     #[test]
@@ -1026,10 +1034,7 @@ mod tests {
         let err = s.refuse_session_new();
         assert_eq!(err, RemintError::SilentForkBlocked);
         assert_eq!(s.agent_session_id(), aid0);
-        assert!(s
-            .observe()
-            .iter()
-            .any(|e| e.text == "SilentForkBlocked"));
+        assert!(s.observe().iter().any(|e| e.text == "SilentForkBlocked"));
     }
 
     #[test]
@@ -1088,6 +1093,62 @@ mod tests {
         let err = s.remint_and_attach().unwrap_err();
         assert_eq!(err, RemintError::CancelNotSupported);
         assert_eq!(s.binding_id(), bid0);
+        // Must mark interrupted before return — sticky in-flight is a hole.
+        assert!(!s.turn_in_flight());
+        assert!(s
+            .observe()
+            .iter()
+            .any(|e| e.kind == RemintEventKind::TurnCancelled));
+    }
+
+    #[test]
+    fn mid_turn_resume_not_supported_marks_interrupted() {
+        let (s, _, bid0) = RemintSession::open(
+            "sess-1",
+            "agent-1",
+            LiveCaps {
+                resume: false,
+                load_session: false,
+                cancel: true,
+                close: true,
+            },
+        );
+        s.begin_turn("in-flight");
+        let err = s.remint_and_attach().unwrap_err();
+        assert_eq!(err, RemintError::ResumeNotSupported);
+        assert_eq!(s.binding_id(), bid0);
+        assert!(!s.turn_in_flight());
+        assert!(s
+            .observe()
+            .iter()
+            .any(|e| e.kind == RemintEventKind::TurnCancelled));
+        assert!(s
+            .observe()
+            .iter()
+            .any(|e| e.kind == RemintEventKind::FailClosed && e.text == "ResumeNotSupported"));
+    }
+
+    #[test]
+    fn mid_turn_load_only_fail_closed_marks_interrupted() {
+        let (s, _, bid0) = RemintSession::open(
+            "sess-1",
+            "agent-1",
+            LiveCaps {
+                resume: false,
+                load_session: true,
+                cancel: true,
+                close: true,
+            },
+        );
+        s.begin_turn("in-flight");
+        let err = s.remint_and_attach().unwrap_err();
+        assert_eq!(err, RemintError::LoadFallbackBlocked);
+        assert_eq!(s.binding_id(), bid0);
+        assert!(!s.turn_in_flight());
+        assert!(s
+            .observe()
+            .iter()
+            .any(|e| e.kind == RemintEventKind::TurnCancelled));
     }
 
     #[test]

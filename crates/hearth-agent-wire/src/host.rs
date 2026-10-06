@@ -362,8 +362,12 @@ mod tests {
             EventBody::AgentMessage { text, .. } if text == "echo:hi"
         )));
         let surface = session.surface().unwrap();
-        assert!(surface.iter().any(|e| matches!(e.body, EventBody::UserMessage { .. })));
-        assert!(surface.iter().any(|e| matches!(e.body, EventBody::AgentMessage { .. })));
+        assert!(surface
+            .iter()
+            .any(|e| matches!(e.body, EventBody::UserMessage { .. })));
+        assert!(surface
+            .iter()
+            .any(|e| matches!(e.body, EventBody::AgentMessage { .. })));
         assert!(!surface
             .iter()
             .any(|e| matches!(e.body, EventBody::TurnStart { .. })));
@@ -391,7 +395,11 @@ mod tests {
             )
             .unwrap();
         let id = first.id;
-        let attach = HostAttach::attach(first.clone(), agent.id, LoopbackAgent::new(AgentKind::GrokBuild));
+        let attach = HostAttach::attach(
+            first.clone(),
+            agent.id,
+            LoopbackAgent::new(AgentKind::GrokBuild),
+        );
         assert_eq!(attach.binding().id, id);
         assert_eq!(attach.native_session(), Some("native-1"));
         let again = HostAttach::resume(first, agent.id, LoopbackAgent::new(AgentKind::GrokBuild));
@@ -425,7 +433,9 @@ mod tests {
             .id;
         let end = events
             .iter()
-            .find(|e| matches!(&e.body, EventBody::AgentMessage { text, .. } if text == "echo:old-a"))
+            .find(
+                |e| matches!(&e.body, EventBody::AgentMessage { text, .. } if text == "echo:old-a"),
+            )
             .unwrap()
             .id;
 

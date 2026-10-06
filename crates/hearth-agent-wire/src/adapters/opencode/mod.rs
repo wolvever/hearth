@@ -148,7 +148,6 @@ pub fn map_event(msg: &Value) -> Result<AgentEvent, BusError> {
     }
 }
 
-
 use crate::adapters::AdapterCodec;
 use crate::transport::WireFrame;
 use crate::AgentCommand;

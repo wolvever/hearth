@@ -75,7 +75,6 @@ pub fn map_notification(msg: &Value) -> Result<AgentEvent, BusError> {
     }
 }
 
-
 fn map_item(method: &str, session_id: &str, params: &Value) -> Result<AgentEvent, BusError> {
     let item = params.get("item").cloned().unwrap_or(Value::Null);
     let ty = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -108,7 +107,11 @@ fn map_item(method: &str, session_id: &str, params: &Value) -> Result<AgentEvent
         }),
         "commandExecution" | "mcpToolCall" | "dynamicToolCall" | "fileChange" => {
             let status = if method.ends_with("completed") {
-                match item.get("status").and_then(|s| s.as_str()).unwrap_or("completed") {
+                match item
+                    .get("status")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("completed")
+                {
                     "failed" => ToolStatus::Failed,
                     _ => ToolStatus::Completed,
                 }
@@ -142,7 +145,6 @@ fn map_item(method: &str, session_id: &str, params: &Value) -> Result<AgentEvent
         }),
     }
 }
-
 
 use crate::adapters::AdapterCodec;
 use crate::transport::WireFrame;
@@ -179,10 +181,9 @@ impl AdapterCodec for CodexCodec {
                 "thread/compact",
                 serde_json::json!({ "threadId": session_id }),
             ),
-            AgentCommand::Abort { session_id } => (
-                "turn/abort",
-                serde_json::json!({ "threadId": session_id }),
-            ),
+            AgentCommand::Abort { session_id } => {
+                ("turn/abort", serde_json::json!({ "threadId": session_id }))
+            }
             _ => return Err(BusError::Unsupported(cmd.name())),
         };
         Ok(WireFrame::Json(serde_json::json!({

@@ -38,11 +38,8 @@ impl JsonRpcTransport {
     /// line-scraped into events).
     pub fn push_bytes(&mut self, bytes: &[u8]) -> Result<(), BusError> {
         self.byte_buf.extend_from_slice(bytes);
-        loop {
-            match Self::try_decode_content_length(&mut self.byte_buf)? {
-                Some(v) => self.inbound.push_back(v),
-                None => break,
-            }
+        while let Some(v) = Self::try_decode_content_length(&mut self.byte_buf)? {
+            self.inbound.push_back(v);
         }
         Ok(())
     }

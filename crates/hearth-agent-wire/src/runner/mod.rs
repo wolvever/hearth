@@ -13,7 +13,9 @@
 pub mod remint;
 
 use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::time::Duration;
 
 use crate::catalog::LaunchSpec;
 use crate::transport::{JsonRpcTransport, JsonlRpcTransport, WireKind};
@@ -24,6 +26,10 @@ pub use remint::{
     RemintSession, RemintWireMethod, ReplaySlice, TeardownOutcome, TeardownSnapshot,
     TransportOwner, WireAction,
 };
+
+/// Cap how long a Real-child stdout read may block. A silent agent must
+/// not hang the Host pump forever (same class as Copilot Content-Length hang).
+const READ_STDOUT_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// Build the transport matching a [`LaunchSpec`] wire.
 ///
@@ -102,7 +108,10 @@ impl AttachRunner {
             .spawn()
             .map_err(|e| BusError::Transport(format!("spawn {}: {e}", spec.program)))?;
         let stdin = child.stdin.take();
-        let stdout = child.stdout.take();
+        let mut stdout = child.stdout.take();
+        if let Some(out) = stdout.as_mut() {
+            set_nonblocking(out)?;
+        }
         Ok(Self {
             io: ChildIo::Real {
                 child,
@@ -177,7 +186,9 @@ impl AttachRunner {
                     .map_err(|e| BusError::Transport(format!("flush stdin: {e}")))?;
                 Ok(())
             }
-            ChildIo::Fake { stdin_log, alive, .. } => {
+            ChildIo::Fake {
+                stdin_log, alive, ..
+            } => {
                 if !*alive {
                     return Err(BusError::Transport("fake child exited".into()));
                 }
@@ -252,6 +263,10 @@ impl AttachRunner {
                 let Some(out) = stdout.as_mut() else {
                     return Ok(Vec::new());
                 };
+                if !poll_readable(out.as_raw_fd(), READ_STDOUT_TIMEOUT)? {
+                    // Timeout / no data — return empty rather than hang.
+                    return Ok(Vec::new());
+                }
                 let mut buf = [0u8; 4096];
                 match out.read(&mut buf) {
                     Ok(0) => Ok(Vec::new()),
@@ -262,10 +277,7 @@ impl AttachRunner {
                 }
             }
             ChildIo::Fake {
-                stdout,
-                pos,
-                alive,
-                ..
+                stdout, pos, alive, ..
             } => {
                 if *pos >= stdout.len() {
                     *alive = false;
@@ -284,6 +296,48 @@ impl AttachRunner {
     }
 }
 
+fn set_nonblocking(out: &ChildStdout) -> Result<(), BusError> {
+    let fd = out.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(BusError::Transport(format!(
+            "fcntl F_GETFL: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let rc = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    if rc < 0 {
+        return Err(BusError::Transport(format!(
+            "fcntl F_SETFL O_NONBLOCK: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
+}
+
+fn poll_readable(fd: libc::c_int, timeout: Duration) -> Result<bool, BusError> {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ms = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
+    loop {
+        let rc = unsafe { libc::poll(&mut pfd, 1, ms) };
+        if rc < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(BusError::Transport(format!("poll stdout: {err}")));
+        }
+        if rc == 0 {
+            return Ok(false);
+        }
+        return Ok((pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)) != 0);
+    }
+}
+
 impl Drop for AttachRunner {
     fn drop(&mut self) {
         let _ = self.kill();
@@ -295,7 +349,7 @@ mod tests {
     use super::*;
     use crate::adapters::acp::AcpCodec;
     use crate::adapters::AdapterCodec;
-    use crate::catalog::lookup_profile;
+    use crate::catalog::{lookup_profile, LaunchSpec};
     use crate::transport::{Transport, WireFrame};
     use crate::{AgentEvent, CodingAgent, FramedAgent};
     use remint::{LiveCaps, RemintSession, RemintWireMethod, WireAction};
@@ -308,13 +362,15 @@ mod tests {
         let mut transport = transport_for_wire(spec.wire);
         let t = transport.as_jsonl_mut().expect("jsonl");
         // without_rpc_chunks: rpc_chunk line is plain JSON, not reassembled.
-        t.push_bytes(
-            br#"{"type":"rpc_chunk","id":"x","index":0,"count":1,"data":"e30="}"#,
-        );
+        t.push_bytes(br#"{"type":"rpc_chunk","id":"x","index":0,"count":1,"data":"e30="}"#);
         t.push_bytes(b"\n");
         let frame = t.try_recv_frame().unwrap().unwrap();
         assert_eq!(
-            frame.as_json().unwrap().get("type").and_then(|t| t.as_str()),
+            frame
+                .as_json()
+                .unwrap()
+                .get("type")
+                .and_then(|t| t.as_str()),
             Some("rpc_chunk")
         );
     }
@@ -390,10 +446,7 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(
-            got.unwrap().as_json().unwrap()["params"]["sessionId"],
-            "s1"
-        );
+        assert_eq!(got.unwrap().as_json().unwrap()["params"]["sessionId"], "s1");
     }
 
     #[test]
@@ -424,11 +477,7 @@ mod tests {
         assert_eq!(out.agent_session_id, "S-stable");
         assert!(out.wire_actions.contains(&WireAction::AttachResume));
 
-        let resumed = encode_remint_rpc(
-            RemintWireMethod::SessionResume,
-            &out.agent_session_id,
-            2,
-        );
+        let resumed = encode_remint_rpc(RemintWireMethod::SessionResume, &out.agent_session_id, 2);
         let mut runner = AttachRunner::spawn_fake(
             WireKind::JsonlRpc,
             JsonlRpcTransport::encode_jsonl(&serde_json::json!({
@@ -518,5 +567,33 @@ mod tests {
         let mut t = JsonRpcTransport::new();
         runner.pump_jsonrpc(&mut t).unwrap();
         assert!(t.try_recv_frame().unwrap().is_none());
+    }
+
+    #[test]
+    fn silent_child_read_stdout_returns_within_timeout() {
+        use std::time::Instant;
+        let spec = LaunchSpec {
+            program: "sleep".into(),
+            args: vec!["30".into()],
+            cwd: None,
+            env: Vec::new(),
+            wire: WireKind::JsonlRpc,
+        };
+        let mut runner = AttachRunner::spawn(spec).expect("spawn sleep");
+        let mut t = JsonlRpcTransport::without_rpc_chunks();
+        let start = Instant::now();
+        let n = runner.pump_jsonl(&mut t).expect("pump");
+        let elapsed = start.elapsed();
+        assert_eq!(n, 0, "silent child must yield no bytes");
+        // Must return near READ_STDOUT_TIMEOUT, never hang for the child lifetime.
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "read_stdout hung: elapsed={elapsed:?}"
+        );
+        assert!(
+            elapsed >= READ_STDOUT_TIMEOUT / 2,
+            "expected a bounded wait, got {elapsed:?}"
+        );
+        let _ = runner.kill();
     }
 }
