@@ -117,6 +117,14 @@ pub enum WakeSource {
     Trigger { name: String },
 }
 
+/// Fate recorded on [`EventBody::ToolCallInterrupted`].
+/// Orphans after mid-turn remint are Indeterminate — not Cancelled.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum ToolInterruptStatus {
+    /// External effect fate unknown after Binding remint / cancel.
+    Indeterminate,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum EventBody {
     MemberJoin { member: Member },
@@ -125,8 +133,29 @@ pub enum EventBody {
     UserMessage { user: UserId, text: String },
     AgentMessage { agent: AgentId, text: String },
     AgentThink { agent: AgentId, text: String },
-    ToolCall { agent: AgentId, name: String, input: String },
-    ToolResult { agent: AgentId, name: String, output: String },
+    ToolCall {
+        agent: AgentId,
+        /// Stable id for this call (ACP `toolCallId` / wire `item_id`).
+        /// Remint orphans and terminals key on this — never tool name alone.
+        tool_call_id: String,
+        name: String,
+        input: String,
+    },
+    ToolResult {
+        agent: AgentId,
+        tool_call_id: String,
+        name: String,
+        output: String,
+    },
+    /// Terminal for an in-flight tool after remint. Fate is
+    /// [`ToolInterruptStatus::Indeterminate`] — Host must not invent
+    /// Cancelled for an unknown external effect (Code Librarian).
+    ToolCallInterrupted {
+        agent: AgentId,
+        tool_call_id: String,
+        name: String,
+        status: ToolInterruptStatus,
+    },
     AskUser { agent: AgentId, prompt: String },
     PermissionAsked { agent: AgentId, request: String },
     PermissionDecided { request: String, allowed: bool, by: UserId },
@@ -223,6 +252,7 @@ pub fn is_model_visible(body: &EventBody) -> bool {
             | EventBody::AgentMessage { .. }
             | EventBody::ToolCall { .. }
             | EventBody::ToolResult { .. }
+            | EventBody::ToolCallInterrupted { .. }
             | EventBody::Compact { .. }
     )
 }
@@ -278,6 +308,56 @@ pub fn step_result_of(events: &[Event], turn_id: u64, step_id: &str) -> Option<S
         } if *t == turn_id && s == step_id => Some(result.clone()),
         _ => None,
     })
+}
+
+/// Whether `tool_call_id` already has a terminal EventLog body
+/// ([`EventBody::ToolResult`] or [`EventBody::ToolCallInterrupted`]).
+pub fn tool_call_is_terminal(events: &[Event], tool_call_id: &str) -> bool {
+    events.iter().any(|e| match &e.body {
+        EventBody::ToolResult {
+            tool_call_id: id, ..
+        }
+        | EventBody::ToolCallInterrupted {
+            tool_call_id: id, ..
+        } => id == tool_call_id,
+        _ => false,
+    })
+}
+
+/// ToolCall events that have no ToolResult / ToolCallInterrupted yet,
+/// keyed by `tool_call_id` (parallel same-name tools stay distinct).
+/// Scan order matches the toy: walk newest-first to collect terminals,
+/// then emit unmatched ToolCalls in log order.
+pub fn unmatched_tool_calls(events: &[Event]) -> Vec<(AgentId, String, String)> {
+    let mut terminal: HashSet<String> = HashSet::new();
+    for e in events.iter().rev() {
+        match &e.body {
+            EventBody::ToolResult {
+                tool_call_id, ..
+            }
+            | EventBody::ToolCallInterrupted {
+                tool_call_id, ..
+            } => {
+                terminal.insert(tool_call_id.clone());
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for e in events {
+        if let EventBody::ToolCall {
+            agent,
+            tool_call_id,
+            name,
+            ..
+        } = &e.body
+        {
+            if !terminal.contains(tool_call_id) {
+                out.push((*agent, tool_call_id.clone(), name.clone()));
+            }
+        }
+    }
+    out
 }
 
 // --- store ---
@@ -990,6 +1070,7 @@ mod tests {
         session
             .append(EventBody::ToolCall {
                 agent: agent.id,
+                tool_call_id: "tc-ls".into(),
                 name: "ls".into(),
                 input: "{}".into(),
             })
@@ -997,6 +1078,7 @@ mod tests {
         session
             .append(EventBody::ToolResult {
                 agent: agent.id,
+                tool_call_id: "tc-ls".into(),
                 name: "ls".into(),
                 output: "ok".into(),
             })
@@ -1016,6 +1098,52 @@ mod tests {
         assert!(matches!(surface[1].body, EventBody::ToolCall { .. }));
         assert!(matches!(surface[2].body, EventBody::ToolResult { .. }));
         assert!(matches!(surface[3].body, EventBody::AgentMessage { .. }));
+    }
+
+    #[test]
+    fn unmatched_tool_calls_key_by_tool_call_id_not_name() {
+        let store = InMemory::new();
+        let agent = store.create_agent("coder", "");
+        let session = store.create_session();
+        session.join(Member::Agent(agent.id)).unwrap();
+        session
+            .append(EventBody::ToolCall {
+                agent: agent.id,
+                tool_call_id: "x1".into(),
+                name: "bash".into(),
+                input: "{}".into(),
+            })
+            .unwrap();
+        session
+            .append(EventBody::ToolCall {
+                agent: agent.id,
+                tool_call_id: "x2".into(),
+                name: "bash".into(),
+                input: "{}".into(),
+            })
+            .unwrap();
+        session
+            .append(EventBody::ToolResult {
+                agent: agent.id,
+                tool_call_id: "x1".into(),
+                name: "bash".into(),
+                output: "ok".into(),
+            })
+            .unwrap();
+        let orphans = unmatched_tool_calls(&session.events().unwrap());
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].1, "x2");
+        session
+            .append(EventBody::ToolCallInterrupted {
+                agent: agent.id,
+                tool_call_id: "x2".into(),
+                name: "bash".into(),
+                status: ToolInterruptStatus::Indeterminate,
+            })
+            .unwrap();
+        assert!(unmatched_tool_calls(&session.events().unwrap()).is_empty());
+        assert!(tool_call_is_terminal(&session.events().unwrap(), "x2"));
+        assert!(tool_call_is_terminal(&session.events().unwrap(), "x1"));
     }
 
     #[test]
@@ -1449,6 +1577,7 @@ mod environment {
         session
             .append(EventBody::ToolCall {
                 agent: claude.id,
+                tool_call_id: "tc-claude-write".into(),
                 name: "write".into(),
                 input: "path=/note.txt\nbody=from-claude".into(),
             })
@@ -1456,13 +1585,20 @@ mod environment {
         session
             .append(EventBody::ToolCall {
                 agent: codex.id,
+                tool_call_id: "tc-codex-write".into(),
                 name: "write".into(),
                 input: "path=/other.txt\nbody=from-codex".into(),
             })
             .unwrap();
 
         for e in session.events().unwrap() {
-            if let EventBody::ToolCall { agent, name, input } = e.body {
+            if let EventBody::ToolCall {
+                agent,
+                tool_call_id,
+                name,
+                input,
+            } = e.body
+            {
                 if name != "write" {
                     continue;
                 }
@@ -1476,6 +1612,7 @@ mod environment {
                 session
                     .append(EventBody::ToolResult {
                         agent,
+                        tool_call_id,
                         name: "write".into(),
                         output: out,
                     })

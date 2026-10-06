@@ -35,6 +35,7 @@ fn main() {
     session
         .append(EventBody::ToolCall {
             agent: claude.id,
+            tool_call_id: "tc-a".into(),
             name: "write".into(),
             input: "path=/a.txt\nbody=hello".into(),
         })
@@ -48,5 +49,9 @@ fn main() {
         session.live_sandbox_ids().unwrap(),
         place.read(sid, "/a.txt")
     );
-    println!("session still {} members={}", session.id().0, session.members().unwrap().len());
+    println!(
+        "session still {} members={}",
+        session.id().0,
+        session.members().unwrap().len()
+    );
 }

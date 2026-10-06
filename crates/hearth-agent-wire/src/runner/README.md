@@ -11,6 +11,11 @@ Host-adjacent spawn / pump / remint. **Not a kernel noun.**
 
 ## Remint (fail-closed)
 
+Orphan tool calls are finalized on the **Host EventLog** as
+`EventBody::ToolCallInterrupted { tool_call_id, status: Indeterminate }`
+(keyed by `tool_call_id`, idempotent across a second remint; late
+`ToolResult` after interrupt is dropped). Not cancelled — fate is unknown.
+
 On an existing Session, remint outcomes are only:
 
 1. `session/resume` with the **same** agent session id, or
