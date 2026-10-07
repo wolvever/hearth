@@ -1248,8 +1248,6 @@ mod tests {
         assert!(crate::tool_call_is_terminal(&log, "t-open"));
         assert!(crate::tool_call_is_terminal(&log, "t-done"));
         assert!(crate::unmatched_tool_calls(&log).is_empty());
-        // Host drain path drops late ToolResult once terminal (same gate).
-        assert!(crate::tool_call_is_terminal(&log, "t-open"));
     }
 
     #[test]
