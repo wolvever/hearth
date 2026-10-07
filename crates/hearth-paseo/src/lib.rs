@@ -83,6 +83,7 @@ pub fn permission_requested(agent: hearth::AgentId, request: impl Into<String>) 
     EventBody::PermissionAsked {
         agent,
         request: request.into(),
+        rpc: None,
     }
 }
 
@@ -96,6 +97,8 @@ pub fn permission_resolved(
         request: request.into(),
         allowed,
         by,
+        rpc: None,
+        option_id: None,
     }
 }
 

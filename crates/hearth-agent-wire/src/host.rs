@@ -8,10 +8,15 @@
 //!
 //! SoftExpiring / DualGate / AdmitCommit / Flush-before-dispatch stay parked.
 
-use crate::{AgentCommand, AgentEvent, AgentKind, BusError, CodingAgent, LoopbackAgent};
+use std::collections::HashMap;
+
+use crate::{
+    AgentCommand, AgentEvent, AgentKind, BusError, CodingAgent, LoopbackAgent, PermissionOption,
+    RpcId,
+};
 use hearth::{
-    AgentId, Binding, Event, EventBody, EventId, Host, HostKind, PlaceMemory, Session, UserId,
-    WorkingState,
+    AgentId, Binding, BindingId, Event, EventBody, EventId, Host, HostKind, PermissionRpc,
+    PlaceMemory, Session, UserId, WorkingState,
 };
 use thiserror::Error;
 
@@ -21,6 +26,41 @@ pub enum AttachError {
     Hearth(#[from] hearth::Error),
     #[error(transparent)]
     Bus(#[from] BusError),
+    /// No pending ask on this Binding with that JSON-RPC id (already
+    /// answered, cancelled, or never asked).
+    #[error("no pending permission ask with rpc id {0}")]
+    UnknownPermission(RpcId),
+    /// The reply names an optionId the agent did not offer on that ask.
+    #[error("optionId {option_id:?} was not offered on permission ask {rpc_id}")]
+    OptionNotOffered { rpc_id: RpcId, option_id: String },
+    /// Agent reused a JSON-RPC id that is still awaiting a response.
+    #[error("permission ask rpc id {0} is already pending")]
+    DuplicateRpcId(RpcId),
+}
+
+/// One in-flight JSON-RPC permission ask the agent is blocked on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingAsk {
+    pub rpc_id: RpcId,
+    /// Display / correlation only — not unique (copilot-cli #989).
+    pub tool_call_id: Option<String>,
+    pub title: String,
+    pub options: Vec<PermissionOption>,
+}
+
+impl PendingAsk {
+    fn offers(&self, option_id: &str) -> Option<&PermissionOption> {
+        self.options.iter().find(|o| o.option_id == option_id)
+    }
+}
+
+/// ACP option kinds `allow_once` / `allow_always` are allows; reject_* are not.
+pub(crate) fn option_allows(opt: &PermissionOption) -> bool {
+    if opt.kind.is_empty() {
+        opt.option_id.starts_with("allow")
+    } else {
+        opt.kind.starts_with("allow")
+    }
 }
 
 pub type AttachResult<T> = std::result::Result<T, AttachError>;
@@ -55,7 +95,11 @@ pub fn host_for(
 /// uses [`Session::turn_start`] / [`Session::turn_end`] for turns, records the
 /// native session id without reminting Binding, and never auto-appends
 /// [`EventBody::Compact`] (that is PreCompactHandoff's job).
-pub fn event_bodies(agent: AgentId, ev: &AgentEvent) -> Vec<EventBody> {
+///
+/// A JSON-RPC permission ask becomes [`EventBody::PermissionAsked`] with a
+/// typed [`PermissionRpc`] (`binding`, `rpc_id`, `tool_call_id`) — not an
+/// `"id:title"` string.
+pub fn event_bodies(binding: BindingId, agent: AgentId, ev: &AgentEvent) -> Vec<EventBody> {
     match ev {
         AgentEvent::Message { role, text, .. }
             if role == "assistant" || role == "agent" || role == "model" =>
@@ -108,9 +152,10 @@ pub fn event_bodies(agent: AgentId, ev: &AgentEvent) -> Vec<EventBody> {
             }]
         }
         AgentEvent::PermissionAsk {
-            permission_id,
             title,
             description,
+            tool_item_id,
+            rpc_id,
             ..
         } => {
             let request = description
@@ -119,7 +164,12 @@ pub fn event_bodies(agent: AgentId, ev: &AgentEvent) -> Vec<EventBody> {
                 .unwrap_or_else(|| title.clone());
             vec![EventBody::PermissionAsked {
                 agent,
-                request: format!("{permission_id}:{request}"),
+                request,
+                rpc: rpc_id.as_ref().map(|id| PermissionRpc {
+                    binding,
+                    rpc_id: id.to_string(),
+                    tool_call_id: tool_item_id.clone(),
+                }),
             }]
         }
         AgentEvent::QuestionAsk { prompts, .. } => vec![EventBody::AskUser {
@@ -135,11 +185,16 @@ pub fn event_bodies(agent: AgentId, ev: &AgentEvent) -> Vec<EventBody> {
 }
 
 /// One existing Binding plus a [`CodingAgent`]. Not a kernel noun.
+///
+/// In-flight JSON-RPC permission asks are keyed by `(Binding, rpc id)` —
+/// never "the current one" (claude-agent-acp #851) and never by
+/// `toolCallId` alone (copilot-cli #989).
 pub struct HostAttach<A: CodingAgent> {
     binding: Binding,
     agent: AgentId,
     coding: A,
     native_session: Option<String>,
+    pending: HashMap<(BindingId, RpcId), PendingAsk>,
 }
 
 impl<A: CodingAgent> HostAttach<A> {
@@ -151,6 +206,7 @@ impl<A: CodingAgent> HostAttach<A> {
             agent,
             coding,
             native_session,
+            pending: HashMap::new(),
         }
     }
 
@@ -239,22 +295,116 @@ impl<A: CodingAgent> HostAttach<A> {
         Ok(ev)
     }
 
-    pub fn reply_permission(
+    /// In-flight permission asks on this Binding, ordered by rpc id.
+    pub fn pending_permissions(&self) -> Vec<PendingAsk> {
+        let mut v: Vec<PendingAsk> = self
+            .pending
+            .iter()
+            .filter(|((b, _), _)| *b == self.binding.id)
+            .map(|(_, a)| a.clone())
+            .collect();
+        v.sort_by(|a, b| a.rpc_id.cmp(&b.rpc_id));
+        v
+    }
+
+    fn permission_rpc(&self, ask: &PendingAsk) -> PermissionRpc {
+        PermissionRpc {
+            binding: self.binding.id,
+            rpc_id: ask.rpc_id.to_string(),
+            tool_call_id: ask.tool_call_id.clone(),
+        }
+    }
+
+    /// Answer one ask on its JSON-RPC id with `{outcome:"selected", optionId}`.
+    ///
+    /// Order (Pep, PR #16): validate → occupancy check + Host
+    /// `PermissionDecided` append ([`Session::decide_permission_rpc`]) →
+    /// wire send → drop the pending entry. On any error nothing goes out and
+    /// the ask stays pending:
+    /// - unknown key → [`AttachError::UnknownPermission`];
+    /// - `option_id` not offered → [`AttachError::OptionNotOffered`];
+    /// - `by` not occupying the Session → [`AttachError::Hearth`], no
+    ///   decision written, no frame sent.
+    ///
+    /// If the send itself fails, the decision is already on the EventLog
+    /// (it cannot be un-appended) but the ask stays pending for a retry.
+    pub fn answer_permission(
         &mut self,
         session: &Session,
-        request: impl Into<String>,
-        allowed: bool,
         by: UserId,
-        permission_id: impl Into<String>,
+        rpc_id: &RpcId,
+        option_id: &str,
     ) -> AttachResult<Event> {
-        let ev = session.decide_permission(request, allowed, by)?;
+        let key = (self.binding.id, rpc_id.clone());
+        let ask = self
+            .pending
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| AttachError::UnknownPermission(rpc_id.clone()))?;
+        let Some(opt) = ask.offers(option_id) else {
+            return Err(AttachError::OptionNotOffered {
+                rpc_id: rpc_id.clone(),
+                option_id: option_id.into(),
+            });
+        };
+        let allowed = option_allows(opt);
+        // require_user + append BEFORE anything reaches the wire.
+        let ev = session.decide_permission_rpc(
+            ask.title.clone(),
+            allowed,
+            by,
+            self.permission_rpc(&ask),
+            Some(option_id.into()),
+        )?;
         self.coding.send(AgentCommand::ReplyPermission {
             session_id: self.wire_session(),
-            permission_id: permission_id.into(),
+            permission_id: rpc_id.to_string(),
             allow: allowed,
-            option_id: None,
+            option_id: Some(option_id.into()),
+            rpc_id: Some(rpc_id.clone()),
         })?;
+        self.pending.remove(&key);
         Ok(ev)
+    }
+
+    /// Cancel the turn: answer **every** pending ask on this Binding with
+    /// `{outcome:"cancelled"}` (ACP MUST), then send [`AgentCommand::Abort`]
+    /// (`session/cancel`). Returns the Host decisions recorded.
+    ///
+    /// Decisions (occupancy check + `PermissionDecided`) are all recorded
+    /// before any frame is sent, so a `by` who does not occupy the Session
+    /// fails on the first ask: typed error, nothing sent, nothing written,
+    /// every ask stays pending. Each pending entry is dropped only after
+    /// its cancelled reply was sent.
+    pub fn cancel(&mut self, session: &Session, by: UserId) -> AttachResult<Vec<Event>> {
+        let asks = self.pending_permissions();
+        let mut out = Vec::with_capacity(asks.len());
+        for ask in &asks {
+            out.push(session.decide_permission_rpc(
+                ask.title.clone(),
+                false,
+                by,
+                self.permission_rpc(ask),
+                None,
+            )?);
+        }
+        for ask in &asks {
+            self.coding.send(AgentCommand::ReplyPermission {
+                session_id: self.wire_session(),
+                permission_id: ask.rpc_id.to_string(),
+                allow: false,
+                option_id: None,
+                rpc_id: Some(ask.rpc_id.clone()),
+            })?;
+            self.pending.remove(&(self.binding.id, ask.rpc_id.clone()));
+        }
+        match self.coding.send(AgentCommand::Abort {
+            session_id: self.wire_session(),
+        }) {
+            Ok(()) | Err(BusError::Unsupported(_)) => {}
+            Err(e) => return Err(e.into()),
+        }
+        Ok(out)
     }
 
     /// PreCompactHandoff (Place `handoff.md` + EventLog Compact) then
@@ -292,10 +442,38 @@ impl<A: CodingAgent> HostAttach<A> {
             }
             AgentEvent::TurnStarted { .. } => Ok(vec![session.turn_start(self.agent)?]),
             AgentEvent::TurnCompleted { .. } => Ok(vec![session.turn_end(self.agent)?]),
+            AgentEvent::PermissionAsk {
+                rpc_id: Some(rpc_id),
+                tool_item_id,
+                title,
+                options,
+                ..
+            } => {
+                let key = (self.binding.id, rpc_id.clone());
+                if self.pending.contains_key(&key) {
+                    return Err(AttachError::DuplicateRpcId(rpc_id.clone()));
+                }
+                // EventLog append first; track the ask only once it is on
+                // the log, so a failed append leaves no phantom pending entry.
+                let mut appended = Vec::new();
+                for body in event_bodies(self.binding.id, self.agent, &ev) {
+                    appended.push(session.append(body)?);
+                }
+                self.pending.insert(
+                    key,
+                    PendingAsk {
+                        rpc_id: rpc_id.clone(),
+                        tool_call_id: tool_item_id.clone(),
+                        title: title.clone(),
+                        options: options.clone(),
+                    },
+                );
+                Ok(appended)
+            }
             _ => {
                 let mut appended = Vec::new();
                 let log = session.events()?;
-                for body in event_bodies(self.agent, &ev) {
+                for body in event_bodies(self.binding.id, self.agent, &ev) {
                     // Drop late ToolResult once tool_call_id is already
                     // terminal (ToolResult or ToolCallInterrupted) so one
                     // call never gets two terminals (2026-10-07 remint).
@@ -546,5 +724,248 @@ mod tests {
             &e.body,
             EventBody::ToolCall { name, .. } if name == "read"
         )));
+    }
+
+    fn acp_attach(
+        session: &Session,
+        agent: AgentId,
+    ) -> HostAttach<crate::FramedAgent<crate::JsonlRpcTransport, crate::adapters::acp::AcpCodec>>
+    {
+        let binding = session
+            .bind_host(
+                Some(agent),
+                host_for(AgentKind::Acp, Some("S-1".into()), None),
+            )
+            .unwrap();
+        HostAttach::attach(
+            binding,
+            agent,
+            crate::FramedAgent::new(
+                crate::JsonlRpcTransport::without_rpc_chunks(),
+                crate::adapters::acp::AcpCodec,
+            ),
+        )
+    }
+
+    fn push_ask(
+        attach: &mut HostAttach<
+            crate::FramedAgent<crate::JsonlRpcTransport, crate::adapters::acp::AcpCodec>,
+        >,
+        rpc_id: serde_json::Value,
+        tool_call_id: &str,
+    ) {
+        let raw = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": rpc_id,
+            "method": "session/request_permission",
+            "params": {
+                "sessionId": "S-1",
+                "toolCall": {"toolCallId": tool_call_id, "title": "bash"},
+                "options": [
+                    {"optionId": "allow-once", "name": "Allow", "kind": "allow_once"},
+                    {"optionId": "reject-once", "name": "Reject", "kind": "reject_once"}
+                ]
+            }
+        });
+        attach
+            .coding
+            .transport_mut()
+            .push_bytes(&crate::JsonlRpcTransport::encode_jsonl(&raw).unwrap());
+    }
+
+    #[test]
+    fn acp_permission_asks_keyed_by_binding_and_rpc_id() {
+        let (_store, user, agent, session) = room();
+        let mut attach = acp_attach(&session, agent.id);
+        let bid = attach.binding().id;
+        // copilot-cli #989: both asks share toolCallId.
+        push_ask(&mut attach, serde_json::json!(1), "shell-permission");
+        push_ask(&mut attach, serde_json::json!("1"), "shell-permission");
+        attach.drain(&session).unwrap();
+        assert_eq!(attach.pending_permissions().len(), 2);
+
+        let asked: Vec<PermissionRpc> = session
+            .events()
+            .unwrap()
+            .into_iter()
+            .filter_map(|e| match e.body {
+                EventBody::PermissionAsked { rpc, request, .. } => {
+                    assert_eq!(request, "bash", "no \"id:title\" string");
+                    rpc
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            asked,
+            vec![
+                PermissionRpc {
+                    binding: bid,
+                    rpc_id: "1".into(),
+                    tool_call_id: Some("shell-permission".into()),
+                },
+                PermissionRpc {
+                    binding: bid,
+                    rpc_id: "\"1\"".into(),
+                    tool_call_id: Some("shell-permission".into()),
+                },
+            ]
+        );
+
+        // Unoffered option / unknown id → typed errors, nothing written.
+        let err = attach
+            .answer_permission(&session, user.id, &RpcId::Num(1), "allow")
+            .unwrap_err();
+        assert!(matches!(err, AttachError::OptionNotOffered { .. }));
+        let err = attach
+            .answer_permission(&session, user.id, &RpcId::Num(9), "allow-once")
+            .unwrap_err();
+        assert!(matches!(err, AttachError::UnknownPermission(RpcId::Num(9))));
+        assert!(attach.coding.transport().outbound().is_empty());
+        assert_eq!(attach.pending_permissions().len(), 2);
+
+        let decided = attach
+            .answer_permission(&session, user.id, &RpcId::Str("1".into()), "reject-once")
+            .unwrap();
+        assert!(matches!(
+            &decided.body,
+            EventBody::PermissionDecided { allowed: false, option_id: Some(o), rpc: Some(r), .. }
+                if o == "reject-once" && r.rpc_id == "\"1\""
+        ));
+        let out = attach.coding.transport().outbound().to_vec();
+        assert_eq!(
+            out,
+            vec![serde_json::json!({"jsonrpc": "2.0", "id": "1",
+                "result": {"outcome": {"outcome": "selected", "optionId": "reject-once"}}})]
+        );
+        assert_eq!(attach.pending_permissions().len(), 1);
+        attach
+            .answer_permission(&session, user.id, &RpcId::Num(1), "allow-once")
+            .unwrap();
+        assert!(
+            attach.pending_permissions().is_empty(),
+            "map empty after answer"
+        );
+        assert_eq!(attach.coding.transport().outbound()[1]["id"], 1);
+    }
+
+    #[test]
+    fn acp_cancel_answers_all_pending_then_session_cancel() {
+        let (_store, user, agent, session) = room();
+        let mut attach = acp_attach(&session, agent.id);
+        push_ask(&mut attach, serde_json::json!(7), "call_ctrl");
+        push_ask(&mut attach, serde_json::json!(8), "toolu_sub");
+        attach.drain(&session).unwrap();
+        let decided = attach.cancel(&session, user.id).unwrap();
+        assert_eq!(decided.len(), 2);
+        assert!(
+            attach.pending_permissions().is_empty(),
+            "map empty after cancel"
+        );
+        let out = attach.coding.transport().outbound().to_vec();
+        assert_eq!(out.len(), 3);
+        for (frame, id) in out.iter().zip([7, 8]) {
+            assert_eq!(frame["id"], id);
+            assert_eq!(
+                frame["result"]["outcome"],
+                serde_json::json!({"outcome": "cancelled"})
+            );
+        }
+        assert_eq!(out[2]["method"], "session/cancel");
+    }
+
+    #[test]
+    fn acp_malformed_or_duplicate_ask_is_typed_error() {
+        let (_store, _user, agent, session) = room();
+        let mut attach = acp_attach(&session, agent.id);
+        // Notification-shaped ask (no JSON-RPC id) → Bus decode error.
+        let raw = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/request_permission",
+            "params": {"sessionId": "S-1", "toolCall": {"toolCallId": "t"}, "options": []}
+        });
+        attach
+            .coding
+            .transport_mut()
+            .push_bytes(&crate::JsonlRpcTransport::encode_jsonl(&raw).unwrap());
+        assert!(matches!(
+            attach.drain(&session),
+            Err(AttachError::Bus(BusError::Decode(_)))
+        ));
+        // Reused in-flight rpc id → DuplicateRpcId, first ask kept.
+        push_ask(&mut attach, serde_json::json!(3), "a");
+        push_ask(&mut attach, serde_json::json!(3), "b");
+        assert!(matches!(
+            attach.drain(&session),
+            Err(AttachError::DuplicateRpcId(RpcId::Num(3)))
+        ));
+        let pending = attach.pending_permissions();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].tool_call_id.as_deref(), Some("a"));
+    }
+
+    fn decided_count(session: &Session) -> usize {
+        session
+            .events()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e.body, EventBody::PermissionDecided { .. }))
+            .count()
+    }
+
+    /// Pep Must (PR #16): a user who does not occupy the Session gets a
+    /// typed Err; nothing is sent, the ask stays pending, no decision is
+    /// written. The occupant can still answer afterwards.
+    #[test]
+    fn acp_answer_by_stranger_sends_nothing_and_keeps_ask() {
+        let (store, user, agent, session) = room();
+        let stranger = store.create_user("stranger");
+        let mut attach = acp_attach(&session, agent.id);
+        push_ask(&mut attach, serde_json::json!(4), "call_1");
+        attach.drain(&session).unwrap();
+
+        let err = attach
+            .answer_permission(&session, stranger.id, &RpcId::Num(4), "allow-once")
+            .unwrap_err();
+        assert!(matches!(err, AttachError::Hearth(hearth::Error::NotMember)));
+        assert!(attach.coding.transport().outbound().is_empty());
+        assert_eq!(attach.pending_permissions().len(), 1);
+        assert_eq!(decided_count(&session), 0);
+
+        attach
+            .answer_permission(&session, user.id, &RpcId::Num(4), "allow-once")
+            .unwrap();
+        assert_eq!(attach.coding.transport().outbound().len(), 1);
+        assert_eq!(attach.coding.transport().outbound()[0]["id"], 4);
+        assert!(attach.pending_permissions().is_empty());
+        assert_eq!(decided_count(&session), 1);
+    }
+
+    /// Pep Must (PR #16), cancel path: stranger cancel is a typed Err with
+    /// no replies, no session/cancel, no decisions; every ask stays pending.
+    #[test]
+    fn acp_cancel_by_stranger_sends_nothing_and_keeps_asks() {
+        let (store, user, agent, session) = room();
+        let stranger = store.create_user("stranger");
+        let mut attach = acp_attach(&session, agent.id);
+        push_ask(&mut attach, serde_json::json!(7), "call_ctrl");
+        push_ask(&mut attach, serde_json::json!(8), "toolu_sub");
+        attach.drain(&session).unwrap();
+
+        let err = attach.cancel(&session, stranger.id).unwrap_err();
+        assert!(matches!(err, AttachError::Hearth(hearth::Error::NotMember)));
+        assert!(attach.coding.transport().outbound().is_empty());
+        assert_eq!(attach.pending_permissions().len(), 2);
+        assert_eq!(decided_count(&session), 0);
+
+        let decided = attach.cancel(&session, user.id).unwrap();
+        assert_eq!(decided.len(), 2);
+        assert_eq!(decided_count(&session), 2);
+        let out = attach.coding.transport().outbound().to_vec();
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0]["id"], 7);
+        assert_eq!(out[1]["id"], 8);
+        assert_eq!(out[2]["method"], "session/cancel");
+        assert!(attach.pending_permissions().is_empty());
     }
 }

@@ -8,8 +8,12 @@
 //!    [`RemintError::ResumeNotSupported`] (never `session/load`).
 //! 2. **Cancel-before-reattach** — mid-turn disconnect → close/cancel
 //!    before AttachResume; idle skips cancel.
-//! 3. **Rehydrate-pending-permission** — [`RemintEvent::PermissionResurface`]
-//!    from Host pending; do not cancel healthy HITL.
+//! 3. **Rehydrate-pending-permission** — [`RemintEventKind::PermissionResurface`]
+//!    from Host pending; do not cancel healthy HITL. (2026-10-08) Pending
+//!    asks are a map keyed by `(Binding, JSON-RPC id)`; remint moves the old
+//!    Binding's asks to *resurfaced* and NEVER answers a dead Binding's rpc
+//!    id. A resumed agent's re-ask adopts a resurfaced ask only when its
+//!    `toolCallId` is unique (copilot-cli #989 reuses ids).
 //! 4. **Finalize-orphaned-toolcalls** — after mid-turn cancel, append Host
 //!    [`hearth::EventBody::ToolCallInterrupted`] (Indeterminate) for each
 //!    unmatched `tool_call_id` via [`hearth::Session::finalize_unmatched_tool_calls`]
@@ -26,17 +30,26 @@
 //!    `session/load` as fallback. NEVER resubmit an in-flight prompt
 //!    (mark turn interrupted). Gate resume on live `initialize` caps.
 //!
+//! ACP `session/request_permission` is a JSON-RPC request: answers go out
+//! as [`AgentCommand::ReplyPermission`] on the same rpc id with a nested
+//! `outcome` and only an offered `optionId`; [`RemintSession::cancel_turn`]
+//! answers every pending ask `cancelled` (claude-agent-acp #851).
+//!
 //! SoftExpiring / Flush / Stage / Evidence / EffectId / Queue / seventh
 //! noun / Gemini `session/load` stay parked. Typed remint keys orphans by
 //! Host `tool_call_id` (2026-10-07) — never by tool name / string lists.
 
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 
 use hearth::{
-    tool_call_is_terminal, AgentId, Event, EventBody, InMemory, Member, Session as HostSession,
-    UserId,
+    tool_call_is_terminal, AgentId, Event, EventBody, Host, InMemory, Member, PermissionRpc,
+    Session as HostSession, UserId,
 };
 use serde_json::Value;
+
+use crate::host::option_allows;
+use crate::{AgentCommand, AgentEvent, PermissionOption, RpcId};
 
 /// Live agent capabilities from an ACP `initialize` result (not static
 /// catalog flags alone).
@@ -133,6 +146,16 @@ pub type AgentSessionId = String;
 pub type ToolCallId = String;
 pub type PermissionId = String;
 pub type Seq = u64;
+/// Pending-ask key: the Binding that carried the JSON-RPC request plus its id.
+pub type PermissionKey = (BindingId, RpcId);
+
+/// Typed address of one permission ask on a remint marker (not a string).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionRef {
+    pub binding: BindingId,
+    pub rpc_id: RpcId,
+    pub tool_call_id: Option<ToolCallId>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemintEventKind {
@@ -141,9 +164,16 @@ pub enum RemintEventKind {
     /// Remint-policy marker only. Tool terminals live on the Host EventLog
     /// as [`EventBody::ToolCallInterrupted`] (not here).
     TurnCancelled,
-    PermissionRequested,
-    PermissionResurface,
-    PermissionResolved,
+    PermissionRequested(PermissionRef),
+    /// Old Binding's ask shown again after remint; its rpc id is dead.
+    PermissionResurface(PermissionRef),
+    /// Resumed agent re-asked a resurfaced ask (unique toolCallId match).
+    PermissionReasked {
+        old: PermissionRef,
+        new: PermissionRef,
+    },
+    /// Answered (`text` = optionId) or cancelled (`text` = "cancelled").
+    PermissionResolved(PermissionRef),
     ResyncFromHost,
     /// Typed fail-closed marker (never silent fork).
     FailClosed,
@@ -188,9 +218,21 @@ pub enum RemintError {
     PromptResubmitBlocked,
     /// Session was closed / gone.
     SessionGone,
-    /// `resolve_permission` permission_id does not match the pending id
-    /// (late answer to an earlier request after remint resurface).
+    /// `resolve_permission` key is not pending (already answered /
+    /// cancelled / never asked).
     StalePermission,
+    /// Answer aimed at a dead Binding's rpc id (resurfaced after remint).
+    /// Never written to the wire — the new process reuses rpc ids.
+    DeadBinding,
+    /// `optionId` was not offered on that ask.
+    OptionNotOffered,
+    /// Agent reused a JSON-RPC id that is still pending on this Binding.
+    DuplicateRpcId,
+    /// Event is not a JSON-RPC permission request (no rpc id).
+    NotAPermissionRequest,
+    /// Host EventLog write (PermissionAsked / PermissionDecided) failed;
+    /// the ask's state is unchanged and nothing is written to the wire.
+    HostLog(String),
 }
 
 impl RemintError {
@@ -203,6 +245,11 @@ impl RemintError {
             Self::PromptResubmitBlocked => "PromptResubmitBlocked",
             Self::SessionGone => "SessionGone",
             Self::StalePermission => "StalePermission",
+            Self::DeadBinding => "DeadBinding",
+            Self::OptionNotOffered => "OptionNotOffered",
+            Self::DuplicateRpcId => "DuplicateRpcId",
+            Self::NotAPermissionRequest => "NotAPermissionRequest",
+            Self::HostLog(_) => "HostLog",
         }
     }
 }
@@ -222,11 +269,29 @@ impl ToolStatus {
     }
 }
 
+/// One permission ask awaiting a decision, keyed by `(binding, rpc_id)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingPermission {
-    pub id: PermissionId,
+    pub binding: BindingId,
+    pub rpc_id: RpcId,
+    /// Not unique across concurrent asks (copilot-cli #989).
+    pub tool_call_id: Option<ToolCallId>,
     pub title: String,
-    pub options: Vec<String>,
+    pub options: Vec<PermissionOption>,
+}
+
+impl PendingPermission {
+    pub fn key(&self) -> PermissionKey {
+        (self.binding.clone(), self.rpc_id.clone())
+    }
+
+    pub fn as_ref(&self) -> PermissionRef {
+        PermissionRef {
+            binding: self.binding.clone(),
+            rpc_id: self.rpc_id.clone(),
+            tool_call_id: self.tool_call_id.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -287,7 +352,12 @@ struct Inner {
     turn_in_flight: bool,
     /// In-flight user prompt text (never auto-resubmitted after remint).
     in_flight_prompt: Option<String>,
-    pending_permission: Option<PendingPermission>,
+    /// Live asks on the current Binding — answerable on the wire.
+    pending: BTreeMap<PermissionKey, PendingPermission>,
+    /// Asks from dead Bindings — shown to the user, never answered on wire.
+    resurfaced: BTreeMap<PermissionKey, PendingPermission>,
+    /// Remint Binding id → Host [`hearth::BindingId`] for typed Host Events.
+    host_bindings: HashMap<BindingId, hearth::BindingId>,
     attach_cursor: Seq,
     transport_owner: TransportOwner,
     closed: bool,
@@ -325,18 +395,29 @@ impl RemintSession {
         host_session
             .join(Member::Agent(host_agent.id))
             .expect("join remint agent");
+        let agent_session_id: AgentSessionId = agent_session_id.into();
+        let host_binding = host_session
+            .bind_host(
+                Some(host_agent.id),
+                Host::from_bind("acp", Some(agent_session_id.clone()), None),
+            )
+            .expect("bind remint host");
+        let mut host_bindings = HashMap::new();
+        host_bindings.insert(binding_id.clone(), host_binding.id);
         let store = Self {
             inner: Mutex::new(Inner {
                 session_id: session_id.clone(),
                 binding_id: binding_id.clone(),
                 next_binding: 2,
-                agent_session_id: agent_session_id.into(),
+                agent_session_id,
                 live_caps,
                 events: Vec::new(),
                 next_event: 1,
                 turn_in_flight: false,
                 in_flight_prompt: None,
-                pending_permission: None,
+                pending: BTreeMap::new(),
+                resurfaced: BTreeMap::new(),
+                host_bindings,
                 attach_cursor: 0,
                 transport_owner: TransportOwner::Binding(binding_id.clone()),
                 closed: false,
@@ -396,8 +477,26 @@ impl RemintSession {
         g.events.last().map(|e| e.id).unwrap_or(0)
     }
 
-    pub fn pending_permission(&self) -> Option<PendingPermission> {
-        self.inner.lock().unwrap().pending_permission.clone()
+    /// Live asks on the current Binding, ordered by `(binding, rpc_id)`.
+    pub fn pending_permissions(&self) -> Vec<PendingPermission> {
+        self.inner
+            .lock()
+            .unwrap()
+            .pending
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    /// Asks from dead Bindings shown after remint (never answerable on wire).
+    pub fn resurfaced_permissions(&self) -> Vec<PendingPermission> {
+        self.inner
+            .lock()
+            .unwrap()
+            .resurfaced
+            .values()
+            .cloned()
+            .collect()
     }
 
     /// Derive tool statuses from the Host EventLog (keyed by tool_call_id).
@@ -502,52 +601,214 @@ impl RemintSession {
         g.attach_cursor = g.events.last().map(|e| e.id).unwrap_or(0);
     }
 
-    pub fn request_permission(&self, id: &str, title: &str, options: &[&str]) {
+    fn host_rpc(g: &Inner, p: &PendingPermission) -> Result<PermissionRpc, RemintError> {
+        let binding = g
+            .host_bindings
+            .get(&p.binding)
+            .ok_or_else(|| RemintError::HostLog(format!("no Host Binding for {}", p.binding)))?;
+        Ok(PermissionRpc {
+            binding: *binding,
+            rpc_id: p.rpc_id.to_string(),
+            tool_call_id: p.tool_call_id.clone(),
+        })
+    }
+
+    /// Record a decision on the Host EventLog (`option_id: None` =
+    /// cancelled). Errors propagate (occupancy / store) — callers run this
+    /// before mutating pending state or emitting any wire command.
+    fn host_decide(
+        g: &Inner,
+        p: &PendingPermission,
+        option_id: Option<&str>,
+        allowed: bool,
+    ) -> Result<(), RemintError> {
+        let rpc = Self::host_rpc(g, p)?;
+        g.host_session
+            .decide_permission_rpc(
+                p.title.clone(),
+                allowed,
+                g.host_user,
+                rpc,
+                option_id.map(str::to_string),
+            )
+            .map(|_| ())
+            .map_err(|e| RemintError::HostLog(e.to_string()))
+    }
+
+    /// Record a decoded ACP `session/request_permission` (must carry its
+    /// JSON-RPC id). See [`Self::request_permission`].
+    pub fn on_permission_ask(&self, ev: &AgentEvent) -> Result<PermissionRef, RemintError> {
+        match ev {
+            AgentEvent::PermissionAsk {
+                rpc_id: Some(rpc_id),
+                tool_item_id,
+                title,
+                options,
+                ..
+            } => self.request_permission(
+                rpc_id.clone(),
+                tool_item_id.as_deref(),
+                title,
+                options.clone(),
+            ),
+            _ => Err(RemintError::NotAPermissionRequest),
+        }
+    }
+
+    /// Record an in-flight permission ask on the **current** Binding, keyed
+    /// by `(binding, rpc_id)`. A second concurrent ask never overwrites the
+    /// first. If the resumed agent re-asks a resurfaced ask and its
+    /// `toolCallId` is unique (exactly one resurfaced match and no live ask
+    /// sharing it), that resurfaced entry is adopted (removed); otherwise
+    /// nothing is routed by `toolCallId`.
+    pub fn request_permission(
+        &self,
+        rpc_id: RpcId,
+        tool_call_id: Option<&str>,
+        title: &str,
+        options: Vec<PermissionOption>,
+    ) -> Result<PermissionRef, RemintError> {
         let mut g = self.inner.lock().unwrap();
-        g.pending_permission = Some(PendingPermission {
-            id: id.into(),
+        let key = (g.binding_id.clone(), rpc_id.clone());
+        if g.pending.contains_key(&key) {
+            return Err(RemintError::DuplicateRpcId);
+        }
+        let ask = PendingPermission {
+            binding: key.0.clone(),
+            rpc_id,
+            tool_call_id: tool_call_id.map(str::to_string),
             title: title.into(),
-            options: options.iter().map(|s| (*s).to_string()).collect(),
-        });
+            options,
+        };
+        let new_ref = ask.as_ref();
+        // Host EventLog first: on failure nothing is adopted or tracked.
+        let rpc = Self::host_rpc(&g, &ask)?;
+        g.host_session
+            .ask_permission_rpc(g.host_agent, title.to_string(), rpc)
+            .map_err(|e| RemintError::HostLog(e.to_string()))?;
+        if let Some(tc) = tool_call_id {
+            let live_shares = g
+                .pending
+                .values()
+                .any(|p| p.tool_call_id.as_deref() == Some(tc));
+            let matches: Vec<PermissionKey> = g
+                .resurfaced
+                .iter()
+                .filter(|(_, p)| p.tool_call_id.as_deref() == Some(tc))
+                .map(|(k, _)| k.clone())
+                .collect();
+            if !live_shares && matches.len() == 1 {
+                if let Some(old) = g.resurfaced.remove(&matches[0]) {
+                    Self::push_event(
+                        &mut g,
+                        RemintEventKind::PermissionReasked {
+                            old: old.as_ref(),
+                            new: new_ref.clone(),
+                        },
+                        title,
+                    );
+                }
+            }
+        }
+        g.pending.insert(key, ask);
         Self::push_event(
             &mut g,
-            RemintEventKind::PermissionRequested,
-            format!("{id}:{title}"),
+            RemintEventKind::PermissionRequested(new_ref.clone()),
+            title,
         );
         // Permission-wait is not orphan mid-turn for cancel purposes.
         g.turn_in_flight = true;
+        Ok(new_ref)
     }
 
-    /// Resolve the pending permission. `permission_id` must match the
-    /// current pending id so a late answer to an earlier request cannot
-    /// resolve the current one after remint resurfaces.
+    /// Answer one ask with `{outcome:"selected", optionId}` on its own rpc
+    /// id. Returns the [`AgentCommand::ReplyPermission`] to write on the
+    /// live wire. Errors (nothing is written):
+    /// - [`RemintError::DeadBinding`] — key belongs to a reminted-away Binding;
+    /// - [`RemintError::StalePermission`] — not pending;
+    /// - [`RemintError::OptionNotOffered`] — ask stays pending.
     pub fn resolve_permission(
         &self,
-        permission_id: &str,
+        binding: &str,
+        rpc_id: &RpcId,
         option_id: &str,
-    ) -> Result<(), RemintError> {
+    ) -> Result<AgentCommand, RemintError> {
         let mut g = self.inner.lock().unwrap();
-        let Some(pending) = g.pending_permission.clone() else {
+        if g.closed {
             return Err(RemintError::SessionGone);
-        };
-        if pending.id != permission_id {
-            // Do not take() — keep current pending for the matching id.
-            return Err(RemintError::StalePermission);
         }
-        g.pending_permission = None;
+        let key = (binding.to_string(), rpc_id.clone());
+        if binding != g.binding_id || g.resurfaced.contains_key(&key) {
+            return Err(RemintError::DeadBinding);
+        }
+        let Some(ask) = g.pending.get(&key).cloned() else {
+            return Err(RemintError::StalePermission);
+        };
+        let Some(opt) = ask.options.iter().find(|o| o.option_id == option_id) else {
+            return Err(RemintError::OptionNotOffered);
+        };
+        let allowed = option_allows(opt);
+        // Host decision first: on failure the ask stays pending, no reply.
+        Self::host_decide(&g, &ask, Some(option_id), allowed)?;
+        g.pending.remove(&key);
         Self::push_event(
             &mut g,
-            RemintEventKind::PermissionResolved,
-            format!("{}:{option_id}", pending.id),
+            RemintEventKind::PermissionResolved(ask.as_ref()),
+            option_id,
         );
-        let _ = g.host_session.decide_permission(
-            format!("{}:{}", pending.id, pending.title),
-            option_id == "allow" || option_id.starts_with("allow"),
-            g.host_user,
-        );
+        if g.pending.is_empty() && g.resurfaced.is_empty() {
+            g.turn_in_flight = false;
+            g.in_flight_prompt = None;
+        }
+        Ok(AgentCommand::ReplyPermission {
+            session_id: g.agent_session_id.clone(),
+            permission_id: rpc_id.to_string(),
+            allow: allowed,
+            option_id: Some(option_id.into()),
+            rpc_id: Some(rpc_id.clone()),
+        })
+    }
+
+    /// User cancel: answer **every** live ask `{outcome:"cancelled"}` on its
+    /// own rpc id, then `session/cancel` ([`AgentCommand::Abort`]). Resurfaced
+    /// asks from dead Bindings are dropped as cancelled on the Host log only —
+    /// never written to the wire. Pending and resurfaced maps end empty.
+    ///
+    /// Host decisions are recorded first; if one fails ([`RemintError::HostLog`])
+    /// no command is returned and both maps are left as they were.
+    pub fn cancel_turn(&self) -> Result<Vec<AgentCommand>, RemintError> {
+        let mut g = self.inner.lock().unwrap();
+        for ask in g.pending.values().chain(g.resurfaced.values()) {
+            Self::host_decide(&g, ask, None, false)?;
+        }
+        let mut out = Vec::new();
+        let live = std::mem::take(&mut g.pending);
+        let dead = std::mem::take(&mut g.resurfaced);
+        for ask in live.values() {
+            out.push(AgentCommand::ReplyPermission {
+                session_id: g.agent_session_id.clone(),
+                permission_id: ask.rpc_id.to_string(),
+                allow: false,
+                option_id: None,
+                rpc_id: Some(ask.rpc_id.clone()),
+            });
+        }
+        for ask in live.values().chain(dead.values()) {
+            Self::push_event(
+                &mut g,
+                RemintEventKind::PermissionResolved(ask.as_ref()),
+                "cancelled",
+            );
+        }
+        out.push(AgentCommand::Abort {
+            session_id: g.agent_session_id.clone(),
+        });
+        if g.turn_in_flight {
+            Self::push_event(&mut g, RemintEventKind::TurnCancelled, "cancel");
+        }
         g.turn_in_flight = false;
         g.in_flight_prompt = None;
-        Ok(())
+        Ok(out)
     }
 
     /// Append a Host [`EventBody::ToolCall`] keyed by `tool_call_id`.
@@ -672,7 +933,8 @@ impl RemintSession {
             return Err(reason);
         }
 
-        let permission_pending = g.pending_permission.is_some();
+        // Live or resurfaced asks are healthy HITL (also across a 2nd remint).
+        let permission_pending = !g.pending.is_empty() || !g.resurfaced.is_empty();
         let mid_turn = g.turn_in_flight && !permission_pending;
         let mut wire_actions = Vec::new();
         let mut tools_finalized = 0usize;
@@ -728,24 +990,45 @@ impl RemintSession {
         }
 
         // Remint Binding + AttachResume (09-27). Same agent_session_id.
+        // Host Binding swap first: on failure the remint Binding is unchanged.
+        if let Some(old_host) = g.host_bindings.get(&g.binding_id).copied() {
+            match g.host_session.unbind(old_host) {
+                // Already released (e.g. agent left): release is idempotent.
+                Ok(_) | Err(hearth::Error::UnknownBinding(_)) => {}
+                Err(e) => return Err(RemintError::HostLog(e.to_string())),
+            }
+        }
+        let host_agent = g.host_agent;
+        let host_binding = g
+            .host_session
+            .bind_host(
+                Some(host_agent),
+                Host::from_bind("acp", Some(g.agent_session_id.clone()), None),
+            )
+            .map_err(|e| RemintError::HostLog(e.to_string()))?;
         let new_binding = format!("bind-{}", g.next_binding);
         g.next_binding += 1;
         g.binding_id = new_binding.clone();
+        g.host_bindings.insert(new_binding.clone(), host_binding.id);
         g.transport_owner = TransportOwner::Binding(new_binding.clone());
         wire_actions.push(WireAction::AttachResume);
         let agent_sid = g.agent_session_id.clone();
         Self::push_event(&mut g, RemintEventKind::AttachResumeHeld, agent_sid);
 
-        let mut permission_resurfaced = false;
-        if let Some(ref pending) = g.pending_permission.clone() {
+        // Old Binding's rpc ids are dead: move live asks to resurfaced and
+        // never answer them on the new wire. Pending map ends empty.
+        let moved = std::mem::take(&mut g.pending);
+        g.resurfaced.extend(moved);
+        let resurfaced: Vec<PendingPermission> = g.resurfaced.values().cloned().collect();
+        for ask in &resurfaced {
             Self::push_event(
                 &mut g,
-                RemintEventKind::PermissionResurface,
-                format!("{}:{}", pending.id, pending.title),
+                RemintEventKind::PermissionResurface(ask.as_ref()),
+                ask.title.clone(),
             );
-            permission_resurfaced = true;
-            // Turn stays pending until resolve_permission.
         }
+        // Turn stays pending until the resumed agent re-asks / cancel.
+        let permission_resurfaced = !resurfaced.is_empty();
 
         // Cursor tracks Host watermark after remint markers land.
         g.attach_cursor = g.events.last().map(|e| e.id).unwrap_or(g.attach_cursor);
@@ -891,7 +1174,153 @@ pub fn encode_remint_rpc(method: RemintWireMethod, agent_session_id: &str, id: u
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapters::acp::AcpCodec;
+    use crate::adapters::AdapterCodec;
+    use crate::transport::WireFrame;
     use hearth::ToolInterruptStatus;
+
+    fn opts() -> Vec<PermissionOption> {
+        vec![
+            PermissionOption {
+                option_id: "allow-once".into(),
+                name: "Allow".into(),
+                kind: "allow_once".into(),
+            },
+            PermissionOption {
+                option_id: "reject-once".into(),
+                name: "Reject".into(),
+                kind: "reject_once".into(),
+            },
+        ]
+    }
+
+    /// Fake ACP peer. Refuses `session/new` / `session/load` under an
+    /// existing Session (PR #13) and, like a spec agent, blocks each
+    /// `session/request_permission` until a JSON-RPC *response* with that
+    /// exact id and a nested `result.outcome` arrives. Notifications and
+    /// unknown / dead ids never resolve an ask.
+    struct FakeAcp {
+        methods: Vec<String>,
+        agent_session_id: String,
+        next_rpc: i64,
+        /// rpc id → the agent's own (true) tool call id.
+        waiting: BTreeMap<RpcId, String>,
+        /// (true tool call id, outcome) in delivery order.
+        got: Vec<(String, Value)>,
+        /// Frames that resolved nothing (dead id / notification / bad shape).
+        ignored: Vec<Value>,
+        /// copilot-cli #989: advertise this toolCallId on every ask.
+        shared_tool_call_id: Option<&'static str>,
+    }
+
+    impl FakeAcp {
+        fn new(agent_session_id: &str) -> Self {
+            Self {
+                methods: Vec::new(),
+                agent_session_id: agent_session_id.into(),
+                next_rpc: 100,
+                waiting: BTreeMap::new(),
+                got: Vec::new(),
+                ignored: Vec::new(),
+                shared_tool_call_id: None,
+            }
+        }
+
+        fn dispatch(&mut self, method: &str, session: &RemintSession) -> Result<(), RemintError> {
+            self.methods.push(method.to_string());
+            match method {
+                "session/new" => Err(session.refuse_session_new()),
+                "session/load" => Err(session.refuse_session_load()),
+                "session/resume" => {
+                    assert_eq!(session.agent_session_id(), self.agent_session_id);
+                    Ok(())
+                }
+                "session/cancel" | "session/close" => Ok(()),
+                other => panic!("unexpected method {other}"),
+            }
+        }
+
+        /// Agent → client `session/request_permission` (ACP v1 shape).
+        fn ask(&mut self, tool_call_id: &str, title: &str) -> WireFrame {
+            self.next_rpc += 1;
+            let rpc = RpcId::Num(self.next_rpc);
+            self.waiting.insert(rpc.clone(), tool_call_id.into());
+            let advertised = self.shared_tool_call_id.unwrap_or(tool_call_id);
+            WireFrame::Json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": rpc.to_json(),
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": self.agent_session_id,
+                    "toolCall": {"toolCallId": advertised, "title": title},
+                    "options": [
+                        {"optionId": "allow-once", "name": "Allow", "kind": "allow_once"},
+                        {"optionId": "reject-once", "name": "Reject", "kind": "reject_once"}
+                    ]
+                }
+            }))
+        }
+
+        /// Client → agent frame.
+        fn deliver(&mut self, frame: WireFrame) {
+            let WireFrame::Json(v) = frame else {
+                panic!("ACP is JSON-RPC");
+            };
+            if let Some(method) = v.get("method").and_then(|m| m.as_str()) {
+                if method == "session/cancel" {
+                    self.methods.push(method.into());
+                } else {
+                    self.ignored.push(v);
+                }
+                return;
+            }
+            let Some(rpc) = v.get("id").and_then(RpcId::from_json) else {
+                self.ignored.push(v);
+                return;
+            };
+            let outcome = v.pointer("/result/outcome").cloned();
+            let ok_shape = outcome
+                .as_ref()
+                .and_then(|o| o.get("outcome"))
+                .and_then(|o| o.as_str())
+                .is_some_and(|o| o == "selected" || o == "cancelled");
+            match (self.waiting.contains_key(&rpc), ok_shape) {
+                (true, true) => {
+                    let tc = self.waiting.remove(&rpc).unwrap();
+                    self.got.push((tc, outcome.unwrap()));
+                }
+                _ => self.ignored.push(v),
+            }
+        }
+
+        fn hung(&self) -> bool {
+            !self.waiting.is_empty()
+        }
+
+        fn outcome(&self, tool_call_id: &str) -> Option<&Value> {
+            self.got
+                .iter()
+                .find(|(tc, _)| tc == tool_call_id)
+                .map(|(_, o)| o)
+        }
+    }
+
+    /// Wire path: fake agent frame → AcpCodec decode → RemintSession.
+    fn ask_via_codec(
+        s: &RemintSession,
+        peer: &mut FakeAcp,
+        tool_call_id: &str,
+        title: &str,
+    ) -> Result<PermissionRef, RemintError> {
+        let frame = peer.ask(tool_call_id, title);
+        let ev = AcpCodec.decode_event(&frame).unwrap().unwrap();
+        s.on_permission_ask(&ev)
+    }
+
+    /// Wire path: RemintSession command → AcpCodec encode → fake agent.
+    fn send_via_codec(peer: &mut FakeAcp, cmd: &AgentCommand) {
+        peer.deliver(AcpCodec.encode_command(cmd).unwrap());
+    }
 
     fn caps_resume() -> LiveCaps {
         LiveCaps {
@@ -1021,16 +1450,20 @@ mod tests {
     fn rehydrate_pending_permission_no_cancel() {
         let (s, _, _) = RemintSession::open("sess-1", "agent-1", caps_resume());
         s.begin_turn("need-perm");
-        s.request_permission("p1", "Allow shell?", &["allow", "deny"]);
+        s.request_permission(RpcId::Num(1), Some("t1"), "Allow shell?", opts())
+            .unwrap();
         let out = s.remint_and_attach().unwrap();
         assert!(out.permission_resurfaced);
         assert!(!out.turn_interrupted);
         assert!(!out.wire_actions.contains(&WireAction::SessionCancel));
-        assert!(s
-            .observe()
-            .iter()
-            .any(|e| e.kind == RemintEventKind::PermissionResurface));
-        assert!(s.pending_permission().is_some());
+        assert!(s.observe().iter().any(|e| matches!(
+            &e.kind,
+            RemintEventKind::PermissionResurface(r)
+                if r.binding == "bind-1" && r.rpc_id == RpcId::Num(1)
+                    && r.tool_call_id.as_deref() == Some("t1")
+        )));
+        assert_eq!(s.resurfaced_permissions().len(), 1);
+        assert!(s.pending_permissions().is_empty());
         assert!(s.turn_in_flight());
     }
 
@@ -1132,52 +1565,44 @@ mod tests {
     }
 
     #[test]
-    fn resolve_permission_bound_to_pending_id() {
+    fn resolve_permission_bound_to_binding_and_rpc_id() {
         let (s, _, _) = RemintSession::open("sess-1", "agent-1", caps_resume());
         s.begin_turn("need-perm");
-        s.request_permission("p1", "Allow shell?", &["allow", "deny"]);
-        let _ = s.remint_and_attach().unwrap();
-        // Late answer for an earlier id must not resolve current pending.
-        let err = s.resolve_permission("p0-stale", "allow").unwrap_err();
+        s.request_permission(RpcId::Num(1), Some("t1"), "Allow shell?", opts())
+            .unwrap();
+        let out = s.remint_and_attach().unwrap();
+        // Late answer to the dead Binding's rpc id is refused, never emitted.
+        let err = s
+            .resolve_permission("bind-1", &RpcId::Num(1), "allow-once")
+            .unwrap_err();
+        assert_eq!(err, RemintError::DeadBinding);
+        // Same rpc id on the live Binding was never asked there.
+        let err = s
+            .resolve_permission(&out.binding_id, &RpcId::Num(1), "allow-once")
+            .unwrap_err();
         assert_eq!(err, RemintError::StalePermission);
-        assert!(s.pending_permission().is_some());
-        s.resolve_permission("p1", "allow").unwrap();
-        assert!(s.pending_permission().is_none());
+        assert_eq!(s.resurfaced_permissions().len(), 1);
+        // Resumed agent re-asks on the new Binding (rpc ids restart).
+        s.request_permission(RpcId::Num(1), Some("t1"), "Allow shell?", opts())
+            .unwrap();
+        assert!(s.resurfaced_permissions().is_empty());
+        let cmd = s
+            .resolve_permission(&out.binding_id, &RpcId::Num(1), "allow-once")
+            .unwrap();
+        assert!(matches!(
+            cmd,
+            AgentCommand::ReplyPermission { rpc_id: Some(RpcId::Num(1)), ref option_id, .. }
+                if option_id.as_deref() == Some("allow-once")
+        ));
+        assert!(s.pending_permissions().is_empty());
     }
 
     /// Fake ACP peer that refuses `session/new` under an existing Session.
     /// Double remint keeps the same agent session id and one interrupted marker.
     #[test]
     fn fake_acp_refuses_session_new_double_remint() {
-        struct FakeAcp {
-            methods: Vec<String>,
-            agent_session_id: String,
-        }
-        impl FakeAcp {
-            fn dispatch(
-                &mut self,
-                method: &str,
-                session: &RemintSession,
-            ) -> Result<(), RemintError> {
-                self.methods.push(method.to_string());
-                match method {
-                    "session/new" => Err(session.refuse_session_new()),
-                    "session/load" => Err(session.refuse_session_load()),
-                    "session/resume" => {
-                        assert_eq!(session.agent_session_id(), self.agent_session_id);
-                        Ok(())
-                    }
-                    "session/cancel" | "session/close" => Ok(()),
-                    other => panic!("unexpected method {other}"),
-                }
-            }
-        }
-
         let (s, _, _) = RemintSession::open("sess-1", "S-stable", caps_resume());
-        let mut peer = FakeAcp {
-            methods: Vec::new(),
-            agent_session_id: "S-stable".into(),
-        };
+        let mut peer = FakeAcp::new("S-stable");
         s.begin_turn("work");
         s.start_tool("t1", "bash");
         s.start_tool("t2", "bash");
@@ -1225,7 +1650,8 @@ mod tests {
         let (s, _, _) = RemintSession::open("sess-1", "agent-1", caps_resume());
         s.begin_turn("hitl");
         s.start_tool("t1", "bash");
-        s.request_permission("p1", "Allow?", &["allow"]);
+        s.request_permission(RpcId::Num(1), Some("t1"), "Allow?", opts())
+            .unwrap();
         // Tool left running under healthy HITL — do not cancel/finalize.
         let out = s.remint_and_attach().unwrap();
         assert_eq!(out.tools_finalized, 0);
@@ -1441,5 +1867,391 @@ mod tests {
         assert_ne!(o1.binding_id, o2.binding_id);
         assert_eq!(o1.agent_session_id, aid);
         assert_eq!(o2.agent_session_id, aid);
+    }
+
+    fn assert_maps_empty(s: &RemintSession, when: &str) {
+        assert!(
+            s.pending_permissions().is_empty(),
+            "pending leak {when}: {:?}",
+            s.pending_permissions()
+        );
+        assert!(
+            s.resurfaced_permissions().is_empty(),
+            "resurfaced leak {when}: {:?}",
+            s.resurfaced_permissions()
+        );
+    }
+
+    /// claude-agent-acp #851: controller + background subagent ask at once.
+    /// Each is answered on its own rpc id, out of order; neither hangs.
+    #[test]
+    fn fake_acp_two_concurrent_asks_answered_by_rpc_id() {
+        let (s, _, bid) = RemintSession::open("sess-1", "S-1", caps_resume());
+        let mut peer = FakeAcp::new("S-1");
+        s.begin_turn("work");
+        let ctrl = ask_via_codec(&s, &mut peer, "call_ctrl", "git log").unwrap();
+        let sub = ask_via_codec(&s, &mut peer, "toolu_sub", "npm test").unwrap();
+        assert_ne!(ctrl.rpc_id, sub.rpc_id);
+        assert_eq!(
+            s.pending_permissions().len(),
+            2,
+            "second ask must not overwrite"
+        );
+
+        let c = s
+            .resolve_permission(&bid, &sub.rpc_id, "allow-once")
+            .unwrap();
+        send_via_codec(&mut peer, &c);
+        assert_eq!(s.pending_permissions().len(), 1);
+        let c = s
+            .resolve_permission(&bid, &ctrl.rpc_id, "reject-once")
+            .unwrap();
+        send_via_codec(&mut peer, &c);
+
+        assert!(!peer.hung());
+        assert!(peer.ignored.is_empty());
+        assert_eq!(
+            peer.outcome("toolu_sub").unwrap(),
+            &serde_json::json!({"outcome": "selected", "optionId": "allow-once"})
+        );
+        assert_eq!(
+            peer.outcome("call_ctrl").unwrap(),
+            &serde_json::json!({"outcome": "selected", "optionId": "reject-once"})
+        );
+        assert_maps_empty(&s, "after answers");
+        // Double answer is stale, nothing emitted.
+        assert_eq!(
+            s.resolve_permission(&bid, &sub.rpc_id, "allow-once"),
+            Err(RemintError::StalePermission)
+        );
+    }
+
+    /// copilot-cli #989: both asks advertise toolCallId "shell-permission".
+    /// Routing is by (Binding, rpc id), so each gets its own answer.
+    #[test]
+    fn fake_acp_shared_tool_call_id_routes_by_rpc_id() {
+        let (s, _, bid) = RemintSession::open("sess-1", "S-1", caps_resume());
+        let mut peer = FakeAcp::new("S-1");
+        peer.shared_tool_call_id = Some("shell-permission");
+        s.begin_turn("rm");
+        let a = ask_via_codec(&s, &mut peer, "t1", "rm a").unwrap();
+        let b = ask_via_codec(&s, &mut peer, "t2", "rm b").unwrap();
+        assert_eq!(a.tool_call_id.as_deref(), Some("shell-permission"));
+        assert_eq!(b.tool_call_id.as_deref(), Some("shell-permission"));
+        assert_eq!(s.pending_permissions().len(), 2);
+
+        send_via_codec(
+            &mut peer,
+            &s.resolve_permission(&bid, &a.rpc_id, "allow-once").unwrap(),
+        );
+        send_via_codec(
+            &mut peer,
+            &s.resolve_permission(&bid, &b.rpc_id, "reject-once")
+                .unwrap(),
+        );
+        assert!(!peer.hung());
+        assert_eq!(peer.outcome("t1").unwrap()["optionId"], "allow-once");
+        assert_eq!(peer.outcome("t2").unwrap()["optionId"], "reject-once");
+        assert_maps_empty(&s, "after shared-id answers");
+
+        // Host Event carries typed rpc id + toolCallId, not "id:title".
+        let asked: Vec<_> = s
+            .host_events()
+            .into_iter()
+            .filter_map(|e| match e.body {
+                EventBody::PermissionAsked { rpc: Some(rpc), .. } => Some(rpc),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(asked.len(), 2);
+        assert_eq!(asked[0].rpc_id, a.rpc_id.to_string());
+        assert_eq!(asked[1].rpc_id, b.rpc_id.to_string());
+        assert!(asked
+            .iter()
+            .all(|r| r.tool_call_id.as_deref() == Some("shell-permission")));
+        assert_eq!(asked[0].binding, asked[1].binding);
+        let decided = s
+            .host_events()
+            .into_iter()
+            .filter(|e| matches!(&e.body, EventBody::PermissionDecided { rpc: Some(_), .. }))
+            .count();
+        assert_eq!(decided, 2);
+    }
+
+    /// Only an optionId the agent offered is accepted; the ask stays pending.
+    #[test]
+    fn fake_acp_unoffered_option_is_typed_error() {
+        let (s, _, bid) = RemintSession::open("sess-1", "S-1", caps_resume());
+        let mut peer = FakeAcp::new("S-1");
+        let a = ask_via_codec(&s, &mut peer, "t1", "x").unwrap();
+        assert_eq!(
+            s.resolve_permission(&bid, &a.rpc_id, "allow"),
+            Err(RemintError::OptionNotOffered)
+        );
+        assert_eq!(
+            s.resolve_permission(&bid, &a.rpc_id, ""),
+            Err(RemintError::OptionNotOffered)
+        );
+        assert_eq!(s.pending_permissions().len(), 1);
+        assert!(peer.hung());
+        send_via_codec(
+            &mut peer,
+            &s.resolve_permission(&bid, &a.rpc_id, "allow-once").unwrap(),
+        );
+        assert!(!peer.hung());
+        assert_maps_empty(&s, "after valid answer");
+        // A non-request event (no rpc id) is a typed error too.
+        let notif = AgentEvent::PermissionAsk {
+            session_id: "S-1".into(),
+            permission_id: "perm".into(),
+            title: "x".into(),
+            description: None,
+            tool_item_id: None,
+            options: opts(),
+            rpc_id: None,
+        };
+        assert_eq!(
+            s.on_permission_ask(&notif),
+            Err(RemintError::NotAPermissionRequest)
+        );
+        // Reused in-flight rpc id is refused, not overwritten.
+        s.request_permission(RpcId::Num(7), Some("t7"), "x", opts())
+            .unwrap();
+        assert_eq!(
+            s.request_permission(RpcId::Num(7), Some("t8"), "y", opts()),
+            Err(RemintError::DuplicateRpcId)
+        );
+        assert_eq!(s.pending_permissions().len(), 1);
+    }
+
+    /// session/cancel: every pending ask is answered `cancelled` on its own
+    /// rpc id, then session/cancel goes out; no ask left hanging.
+    #[test]
+    fn fake_acp_cancel_answers_every_pending_ask_cancelled() {
+        let (s, _, _) = RemintSession::open("sess-1", "S-1", caps_resume());
+        let mut peer = FakeAcp::new("S-1");
+        peer.shared_tool_call_id = Some("shell-permission");
+        s.begin_turn("work");
+        ask_via_codec(&s, &mut peer, "t1", "x").unwrap();
+        ask_via_codec(&s, &mut peer, "t2", "y").unwrap();
+        let cmds = s.cancel_turn().unwrap();
+        assert_eq!(cmds.len(), 3);
+        assert!(matches!(cmds.last(), Some(AgentCommand::Abort { .. })));
+        for c in &cmds {
+            send_via_codec(&mut peer, c);
+        }
+        assert!(!peer.hung());
+        assert_eq!(peer.got.len(), 2);
+        assert!(peer
+            .got
+            .iter()
+            .all(|(_, o)| o == &serde_json::json!({"outcome": "cancelled"})));
+        assert!(peer.methods.iter().any(|m| m == "session/cancel"));
+        assert!(!s.turn_in_flight());
+        assert_maps_empty(&s, "after cancel");
+    }
+
+    /// Remint with asks in flight, twice. Old Binding's rpc ids are dead:
+    /// resurfaced, never answered (the new process restarts ids, so 101
+    /// collides). Resumed agent re-asks: unique toolCallId adopts the
+    /// resurfaced ask; shared toolCallId does not. Healthy HITL is not
+    /// cancelled on either remint, no session/new, no interrupted markers.
+    #[test]
+    fn fake_acp_double_remint_never_answers_dead_rpc_id() {
+        let (s, _, bid1) = RemintSession::open("sess-1", "S-stable", caps_resume());
+        let mut old = FakeAcp::new("S-stable");
+        s.begin_turn("deploy");
+        s.start_tool("t1", "deploy");
+        let a1 = ask_via_codec(&s, &mut old, "t1", "deploy").unwrap();
+        let a2 = ask_via_codec(&s, &mut old, "t2", "migrate").unwrap();
+        assert_eq!(a1.rpc_id, RpcId::Num(101));
+        assert_eq!(s.pending_permissions().len(), 2);
+
+        let o1 = s.remint_and_attach().unwrap();
+        assert!(o1.permission_resurfaced);
+        assert!(!o1.turn_interrupted);
+        assert_eq!(o1.tools_finalized, 0);
+        assert!(!o1.wire_actions.contains(&WireAction::SessionCancel));
+        assert!(!o1.wire_actions.contains(&WireAction::SessionClose));
+        assert!(
+            s.pending_permissions().is_empty(),
+            "no pending leak across remint"
+        );
+        assert_eq!(s.resurfaced_permissions().len(), 2);
+        // Late UI answer aimed at the dead Binding: refused, nothing written.
+        assert_eq!(
+            s.resolve_permission(&bid1, &a1.rpc_id, "allow-once"),
+            Err(RemintError::DeadBinding)
+        );
+
+        // Second remint before the agent re-asks: still healthy HITL.
+        let o2 = s.remint_and_attach().unwrap();
+        assert_ne!(o1.binding_id, o2.binding_id);
+        assert!(o2.permission_resurfaced);
+        assert!(!o2.turn_interrupted);
+        assert_eq!(o2.tools_finalized, 0);
+        assert_eq!(s.interrupted_marker_count("t1"), 0);
+        assert!(s.pending_permissions().is_empty());
+        assert_eq!(s.resurfaced_permissions().len(), 2);
+        assert_eq!(
+            s.resolve_permission(&o1.binding_id, &a2.rpc_id, "allow-once"),
+            Err(RemintError::DeadBinding)
+        );
+        let mut peer = FakeAcp::new("S-stable");
+        for a in o2.wire_actions.iter() {
+            if let WireAction::AttachResume = a {
+                peer.dispatch("session/resume", &s).unwrap();
+            }
+        }
+
+        // Resumed process restarts rpc ids: 101 again (collides with dead a1).
+        let r1 = ask_via_codec(&s, &mut peer, "t1", "deploy").unwrap();
+        assert_eq!(r1.rpc_id, a1.rpc_id);
+        assert_eq!(r1.binding, o2.binding_id);
+        assert!(s.observe().iter().any(|e| matches!(
+            &e.kind,
+            RemintEventKind::PermissionReasked { old, new }
+                if old.binding == bid1 && old.rpc_id == a1.rpc_id && new.binding == o2.binding_id
+        )));
+        assert_eq!(s.resurfaced_permissions().len(), 1, "t1 adopted, t2 waits");
+        send_via_codec(
+            &mut peer,
+            &s.resolve_permission(&o2.binding_id, &r1.rpc_id, "allow-once")
+                .unwrap(),
+        );
+        assert_eq!(peer.outcome("t1").unwrap()["optionId"], "allow-once");
+        assert!(!peer.hung());
+        // Old process got nothing — dead ids never answered.
+        assert!(old.got.is_empty() && old.ignored.is_empty());
+        assert!(old.hung());
+
+        let r2 = ask_via_codec(&s, &mut peer, "t2", "migrate").unwrap();
+        send_via_codec(
+            &mut peer,
+            &s.resolve_permission(&o2.binding_id, &r2.rpc_id, "reject-once")
+                .unwrap(),
+        );
+        assert!(!peer.hung());
+        assert_maps_empty(&s, "after re-asks answered");
+        assert!(peer.methods.iter().all(|m| m != "session/new"));
+        assert_eq!(s.agent_session_id(), "S-stable");
+    }
+
+    /// After remint, a shared toolCallId (copilot-cli #989) is ambiguous:
+    /// do not adopt either resurfaced ask by toolCallId. Cancel clears
+    /// resurfaced asks on the Host log only (no wire write to dead ids).
+    #[test]
+    fn fake_acp_remint_shared_tool_call_id_is_not_adopted() {
+        let (s, _, _) = RemintSession::open("sess-1", "S-1", caps_resume());
+        let mut old = FakeAcp::new("S-1");
+        old.shared_tool_call_id = Some("shell-permission");
+        s.begin_turn("rm");
+        ask_via_codec(&s, &mut old, "t1", "rm a").unwrap();
+        ask_via_codec(&s, &mut old, "t2", "rm b").unwrap();
+        let o = s.remint_and_attach().unwrap();
+        assert_eq!(s.resurfaced_permissions().len(), 2);
+
+        let mut peer = FakeAcp::new("S-1");
+        peer.shared_tool_call_id = Some("shell-permission");
+        let r = ask_via_codec(&s, &mut peer, "t1", "rm a").unwrap();
+        assert_eq!(r.binding, o.binding_id);
+        assert_eq!(
+            s.resurfaced_permissions().len(),
+            2,
+            "ambiguous: none adopted"
+        );
+        assert!(!s
+            .observe()
+            .iter()
+            .any(|e| matches!(e.kind, RemintEventKind::PermissionReasked { .. })));
+
+        let cmds = s.cancel_turn().unwrap();
+        // One live ask answered cancelled + session/cancel; dead ids untouched.
+        assert_eq!(cmds.len(), 2);
+        for c in &cmds {
+            send_via_codec(&mut peer, c);
+        }
+        assert!(!peer.hung());
+        assert!(old.got.is_empty());
+        assert_maps_empty(&s, "after cancel post-remint");
+    }
+
+    /// Accept check: the (Binding, rpc id) map is empty after answer, after
+    /// cancel, and after remint (moved to resurfaced, then drained).
+    #[test]
+    fn pending_map_empty_after_answer_cancel_and_remint() {
+        let (s, _, bid) = RemintSession::open("sess-1", "S-1", caps_resume());
+        s.begin_turn("a");
+        s.request_permission(RpcId::Num(1), Some("t1"), "x", opts())
+            .unwrap();
+        s.resolve_permission(&bid, &RpcId::Num(1), "allow-once")
+            .unwrap();
+        assert_maps_empty(&s, "after answer");
+
+        s.begin_turn("b");
+        s.request_permission(RpcId::Num(2), Some("t2"), "x", opts())
+            .unwrap();
+        s.request_permission(RpcId::Str("2".into()), Some("t3"), "y", opts())
+            .unwrap();
+        assert_eq!(s.pending_permissions().len(), 2, "5 and \"5\" are distinct");
+        s.cancel_turn().unwrap();
+        assert_maps_empty(&s, "after cancel");
+
+        s.begin_turn("c");
+        s.request_permission(RpcId::Num(3), Some("t4"), "x", opts())
+            .unwrap();
+        let o = s.remint_and_attach().unwrap();
+        assert!(s.pending_permissions().is_empty(), "after remint");
+        s.request_permission(RpcId::Num(1), Some("t4"), "x", opts())
+            .unwrap();
+        s.resolve_permission(&o.binding_id, &RpcId::Num(1), "reject-once")
+            .unwrap();
+        assert_maps_empty(&s, "after remint + re-ask answered");
+        assert!(!s.turn_in_flight());
+    }
+
+    /// Pep Should 1 (PR #16): Host decision errors propagate. With the Host
+    /// user out of the Session, resolve / cancel return HostLog, emit no
+    /// command, keep the ask pending and write no PermissionDecided.
+    #[test]
+    fn host_decide_error_propagates_and_keeps_ask_pending() {
+        let (s, _, bid) = RemintSession::open("sess-1", "S-1", caps_resume());
+        let mut peer = FakeAcp::new("S-1");
+        let a = ask_via_codec(&s, &mut peer, "t1", "x").unwrap();
+        let host_user = s.inner.lock().unwrap().host_user;
+        s.inner
+            .lock()
+            .unwrap()
+            .host_session
+            .leave(Member::User(host_user))
+            .unwrap();
+        let decided = |s: &RemintSession| {
+            s.host_events()
+                .iter()
+                .filter(|e| matches!(e.body, EventBody::PermissionDecided { .. }))
+                .count()
+        };
+        assert!(matches!(
+            s.resolve_permission(&bid, &a.rpc_id, "allow-once"),
+            Err(RemintError::HostLog(_))
+        ));
+        assert!(matches!(s.cancel_turn(), Err(RemintError::HostLog(_))));
+        assert_eq!(s.pending_permissions().len(), 1);
+        assert_eq!(decided(&s), 0);
+        assert!(peer.hung());
+
+        s.inner
+            .lock()
+            .unwrap()
+            .host_session
+            .join(Member::User(host_user))
+            .unwrap();
+        send_via_codec(
+            &mut peer,
+            &s.resolve_permission(&bid, &a.rpc_id, "allow-once").unwrap(),
+        );
+        assert!(!peer.hung());
+        assert_eq!(decided(&s), 1);
+        assert_maps_empty(&s, "after recovery");
     }
 }

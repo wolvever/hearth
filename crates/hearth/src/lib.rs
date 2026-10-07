@@ -117,6 +117,22 @@ pub enum WakeSource {
     Trigger { name: String },
 }
 
+/// Wire address of one agent permission ask that is a JSON-RPC *request*
+/// (ACP `session/request_permission`): the Binding that carried it, the
+/// JSON-RPC id the agent awaits a response on, and the tool call it gates.
+///
+/// A field of [`EventBody::PermissionAsked`] / [`EventBody::PermissionDecided`],
+/// not a noun. `rpc_id` is the canonical JSON text of the id (`5` vs `"5"`
+/// stay distinct). `tool_call_id` is display / re-ask matching only — agents
+/// may reuse it across concurrent asks (copilot-cli #989), so the key is
+/// `(binding, rpc_id)`.
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub struct PermissionRpc {
+    pub binding: BindingId,
+    pub rpc_id: String,
+    pub tool_call_id: Option<String>,
+}
+
 /// Fate recorded on [`EventBody::ToolCallInterrupted`].
 /// Orphans after mid-turn remint are Indeterminate — not Cancelled.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -179,11 +195,18 @@ pub enum EventBody {
     PermissionAsked {
         agent: AgentId,
         request: String,
+        /// Wire address when the ask is a JSON-RPC request (ACP
+        /// `session/request_permission`). `None` for non-RPC asks.
+        rpc: Option<PermissionRpc>,
     },
     PermissionDecided {
         request: String,
         allowed: bool,
         by: UserId,
+        /// Same address as the matching [`EventBody::PermissionAsked`].
+        rpc: Option<PermissionRpc>,
+        /// Agent-offered option chosen; `None` = cancelled / non-RPC decide.
+        option_id: Option<String>,
     },
     TurnStart {
         agent: AgentId,
@@ -742,6 +765,41 @@ impl Session {
         self.append(EventBody::PermissionAsked {
             agent,
             request: request.into(),
+            rpc: None,
+        })
+    }
+
+    /// Record a JSON-RPC permission ask keyed by `(binding, rpc_id)`.
+    pub fn ask_permission_rpc(
+        &self,
+        agent: AgentId,
+        request: impl Into<String>,
+        rpc: PermissionRpc,
+    ) -> Result<Event> {
+        self.append(EventBody::PermissionAsked {
+            agent,
+            request: request.into(),
+            rpc: Some(rpc),
+        })
+    }
+
+    /// Record the decision for a JSON-RPC permission ask. `option_id: None`
+    /// records a cancelled outcome. The deciding user must occupy this session.
+    pub fn decide_permission_rpc(
+        &self,
+        request: impl Into<String>,
+        allowed: bool,
+        by: UserId,
+        rpc: PermissionRpc,
+        option_id: Option<String>,
+    ) -> Result<Event> {
+        self.require_user(by)?;
+        self.append(EventBody::PermissionDecided {
+            request: request.into(),
+            allowed,
+            by,
+            rpc: Some(rpc),
+            option_id,
         })
     }
 
@@ -757,6 +815,8 @@ impl Session {
             request: request.into(),
             allowed,
             by,
+            rpc: None,
+            option_id: None,
         })
     }
 
@@ -1100,6 +1160,7 @@ mod tests {
             .append(EventBody::PermissionAsked {
                 agent: agent.id,
                 request: "git push".into(),
+                rpc: None,
             })
             .unwrap();
         session.unbind(binding.id).unwrap();
@@ -1108,6 +1169,48 @@ mod tests {
             &e.body,
             EventBody::PermissionAsked { request, .. } if request == "git push"
         )));
+    }
+
+    #[test]
+    fn permission_rpc_ask_and_decide_carry_binding_rpc_id_tool_call() {
+        let store = InMemory::new();
+        let user = store.create_user("cheng");
+        let agent = store.create_agent("acp", "");
+        let session = store.create_session();
+        session.join(Member::User(user.id)).unwrap();
+        session.join(Member::Agent(agent.id)).unwrap();
+        let binding = session.bind("acp", Some("S-1".into()), None).unwrap();
+        let rpc = PermissionRpc {
+            binding: binding.id,
+            rpc_id: "5".into(),
+            tool_call_id: Some("call_001".into()),
+        };
+        session
+            .ask_permission_rpc(agent.id, "read config", rpc.clone())
+            .unwrap();
+        let decided = session
+            .decide_permission_rpc(
+                "read config",
+                true,
+                user.id,
+                rpc.clone(),
+                Some("allow-once".into()),
+            )
+            .unwrap();
+        assert!(matches!(
+            &decided.body,
+            EventBody::PermissionDecided { rpc: Some(r), option_id: Some(o), allowed: true, .. }
+                if *r == rpc && o == "allow-once"
+        ));
+        assert!(session.events().unwrap().iter().any(|e| matches!(
+            &e.body,
+            EventBody::PermissionAsked { rpc: Some(r), .. } if *r == rpc
+        )));
+        // Occupancy still enforced on the RPC decide path.
+        let stranger = store.create_user("stranger");
+        assert!(session
+            .decide_permission_rpc("read config", false, stranger.id, rpc, None)
+            .is_err());
     }
 
     #[test]
@@ -1148,6 +1251,7 @@ mod tests {
             .append(EventBody::PermissionAsked {
                 agent: agent.id,
                 request: "rm".into(),
+                rpc: None,
             })
             .unwrap();
         session

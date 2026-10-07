@@ -1,10 +1,16 @@
 {
   "jsonrpc": "2.0",
+  "id": 5,
   "method": "session/request_permission",
   "params": {
     "sessionId": "s1",
-    "id": "perm-1",
-    "title": "Allow read?",
-    "options": [{"optionId": "allow", "name": "Allow", "kind": "allow_once"}]
+    "toolCall": {
+      "toolCallId": "call_001",
+      "title": "Reading configuration file"
+    },
+    "options": [
+      {"optionId": "allow-once", "name": "Allow once", "kind": "allow_once"},
+      {"optionId": "reject-once", "name": "Reject", "kind": "reject_once"}
+    ]
   }
 }

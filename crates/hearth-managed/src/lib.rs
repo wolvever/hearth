@@ -184,6 +184,7 @@ mod tests {
         room.append(EventBody::PermissionAsked {
             agent: agent.id,
             request: "bash".into(),
+            rpc: None,
         })
         .unwrap();
 
