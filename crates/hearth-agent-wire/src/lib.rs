@@ -36,7 +36,9 @@ pub use catalog::{
     builtin_profiles, load_profiles, load_profiles_str, lookup_profile, CatalogExtends,
     CatalogProfile, LaunchSpec,
 };
-pub use host::{binding_kind, event_bodies, host_for, AttachError, AttachResult, HostAttach};
+pub use host::{
+    binding_kind, event_bodies, host_for, AttachError, AttachResult, HostAttach, PendingAsk,
+};
 pub use runner::{
     encode_remint_rpc, transport_for_wire, AttachRunner, LiveCaps, RemintError, RemintEvent,
     RemintEventKind, RemintOutcome, RemintSession, RemintWireMethod, RunnerTransport,
@@ -93,11 +95,17 @@ pub enum AgentCommand {
     Abort {
         session_id: SessionId,
     },
+    /// Answer a permission ask. ACP: `rpc_id` is required and the reply is
+    /// a JSON-RPC response on that id — `option_id: Some` → `selected`,
+    /// `None` → `cancelled` (`allow` is ignored on ACP). OpenCode keys on
+    /// `permission_id` / `allow`.
     ReplyPermission {
         session_id: SessionId,
         permission_id: PermissionId,
         allow: bool,
         option_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rpc_id: Option<RpcId>,
     },
     ReplyQuestion {
         session_id: SessionId,
@@ -250,6 +258,11 @@ pub enum AgentEvent {
         description: Option<String>,
         tool_item_id: Option<ItemId>,
         options: Vec<PermissionOption>,
+        /// JSON-RPC id when the ask is a request the agent blocks on (ACP
+        /// `session/request_permission`). Answer with
+        /// [`AgentCommand::ReplyPermission`] carrying this same id.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rpc_id: Option<RpcId>,
     },
     QuestionAsk {
         session_id: SessionId,
@@ -314,6 +327,40 @@ pub enum AgentEvent {
         method: String,
         payload: serde_json::Value,
     },
+}
+
+/// JSON-RPC request id (number or string). `5` and `"5"` are distinct ids.
+/// `null` / fractional ids are rejected at decode.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RpcId {
+    Num(i64),
+    Str(String),
+}
+
+impl RpcId {
+    /// Parse a JSON-RPC `id`. Returns `None` for null / float / other shapes.
+    pub fn from_json(v: &serde_json::Value) -> Option<Self> {
+        match v {
+            serde_json::Value::Number(n) => n.as_i64().map(Self::Num),
+            serde_json::Value::String(s) => Some(Self::Str(s.clone())),
+            _ => None,
+        }
+    }
+
+    pub fn to_json(&self) -> serde_json::Value {
+        match self {
+            Self::Num(n) => serde_json::Value::from(*n),
+            Self::Str(s) => serde_json::Value::String(s.clone()),
+        }
+    }
+}
+
+impl std::fmt::Display for RpcId {
+    /// Canonical JSON text (`5`, `"abc"`), so numeric and string ids never collide.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.to_json())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

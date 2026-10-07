@@ -1,12 +1,15 @@
 {
   "jsonrpc": "2.0",
-  "id": 5,
+  "id": "req-7",
   "method": "session/request_permission",
   "params": {
     "sessionId": "s1",
-    "toolCall": {
-      "toolCallId": "call_001",
-      "title": "Reading configuration file"
+    "title": "Allow npm test?",
+    "subject": {
+      "toolCall": {
+        "toolCallId": "toolu_42",
+        "title": "npm test"
+      }
     },
     "options": [
       {"optionId": "allow-once", "name": "Allow once", "kind": "allow_once"},

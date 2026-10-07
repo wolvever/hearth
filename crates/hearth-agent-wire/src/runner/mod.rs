@@ -22,9 +22,9 @@ use crate::transport::{JsonRpcTransport, JsonlRpcTransport, WireKind};
 use crate::BusError;
 
 pub use remint::{
-    encode_remint_rpc, LiveCaps, RemintError, RemintEvent, RemintEventKind, RemintOutcome,
-    RemintSession, RemintWireMethod, ReplaySlice, TeardownOutcome, TeardownSnapshot,
-    TransportOwner, WireAction,
+    encode_remint_rpc, LiveCaps, PendingPermission, PermissionKey, PermissionRef, RemintError,
+    RemintEvent, RemintEventKind, RemintOutcome, RemintSession, RemintWireMethod, ReplaySlice,
+    TeardownOutcome, TeardownSnapshot, TransportOwner, WireAction,
 };
 
 /// Cap how long a Real-child stdout read may block. A silent agent must
@@ -544,10 +544,10 @@ mod tests {
         let raw = serde_json::json!({
             "jsonrpc": "2.0",
             "method": "session/request_permission",
+            "id": 3,
             "params": {
                 "sessionId": "s1",
-                "id": "perm-1",
-                "title": "Allow?",
+                "toolCall": {"toolCallId": "c1", "title": "Allow?"},
                 "options": [{"optionId": "allow", "name": "Allow", "kind": "allow_once"}]
             }
         });
@@ -555,7 +555,13 @@ mod tests {
             .transport_mut()
             .push_bytes(&JsonlRpcTransport::encode_jsonl(&raw).unwrap());
         let ev = agent.try_recv().unwrap().unwrap();
-        assert!(matches!(ev, AgentEvent::PermissionAsk { .. }));
+        assert!(matches!(
+            ev,
+            AgentEvent::PermissionAsk {
+                rpc_id: Some(crate::RpcId::Num(3)),
+                ..
+            }
+        ));
         // silence unused
         let _ = t;
     }

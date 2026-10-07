@@ -114,6 +114,7 @@ pub fn map_event(msg: &Value) -> Result<AgentEvent, BusError> {
                         .collect()
                 })
                 .unwrap_or_default(),
+            rpc_id: None,
         }),
         "question.asked" => Ok(AgentEvent::QuestionAsk {
             session_id,
@@ -185,6 +186,7 @@ impl AdapterCodec for OpenCodeCodec {
                 permission_id,
                 allow,
                 option_id,
+                ..
             } => serde_json::json!({
                 "type": "permission.reply",
                 "sessionID": session_id,

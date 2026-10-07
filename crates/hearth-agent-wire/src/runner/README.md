@@ -25,6 +25,23 @@ On an existing Session, remint outcomes are only:
 Never `session/new` under that Session. Never `session/load` as fallback
 (Copilot load-only → fail closed). Never resubmit an in-flight prompt.
 
+## Permission asks across remint (2026-10-08)
+
+`RemintSession` keeps live asks in a map keyed by `(Binding, JSON-RPC id)`
+(no single slot — a second in-flight ask never overwrites the first).
+`resolve_permission(binding, rpc_id, option_id)` returns the
+`ReplyPermission` to write on that same id; an `optionId` the agent did not
+offer → `OptionNotOffered`. `cancel_turn` answers every live ask
+`cancelled`, then `session/cancel`.
+
+On remint the old Binding's asks move to *resurfaced* (still healthy HITL —
+no cancel / finalize, also on a second remint). A dead Binding's rpc id is
+never answered (`DeadBinding`; the resumed process restarts ids). A re-ask
+from the resumed agent adopts a resurfaced ask only when its `toolCallId`
+is unique; shared ids (copilot-cli #989) are never routed by `toolCallId`.
+Host `PermissionAsked` / `PermissionDecided` carry a typed
+`PermissionRpc { binding, rpc_id, tool_call_id }`.
+
 ## Out of scope
 
 SoftExpiring, Flush-before-dispatch, Stage, Evidence, EffectId, Queue,
