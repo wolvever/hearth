@@ -211,16 +211,19 @@ mod tests {
         let after = room.surface().unwrap();
         assert_eq!(before, after);
         assert_eq!(after.len(), 2);
-        assert!(after
+        assert!(after.iter().all(|e| matches!(
+            e.body,
+            EventBody::UserMessage { .. } | EventBody::AgentMessage { .. }
+        )));
+        assert!(room
+            .events()
+            .unwrap()
             .iter()
-            .all(|e| matches!(e.body, EventBody::UserMessage { .. } | EventBody::AgentMessage { .. })));
-        assert!(room.events().unwrap().iter().any(|e| matches!(
-            e.body,
-            EventBody::BindingReleased { .. }
-        )));
-        assert!(room.events().unwrap().iter().any(|e| matches!(
-            e.body,
-            EventBody::BindingAttached { .. }
-        )));
+            .any(|e| matches!(e.body, EventBody::BindingReleased { .. })));
+        assert!(room
+            .events()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e.body, EventBody::BindingAttached { .. })));
     }
 }

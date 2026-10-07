@@ -120,7 +120,10 @@ mod tests {
         let session = store.create_session();
         let dir = std::env::temp_dir();
         let place = session
-            .attach_place(Place::local_dir(dir.to_string_lossy().into_owned(), PlaceAttach::MustExist))
+            .attach_place(Place::local_dir(
+                dir.to_string_lossy().into_owned(),
+                PlaceAttach::MustExist,
+            ))
             .unwrap();
         let b = session.bind("cli", None, None).unwrap();
         session.unbind(b.id).unwrap();
@@ -136,13 +139,24 @@ mod tests {
         let a = std::env::temp_dir();
         let b = std::env::current_dir().unwrap();
         let pa = session
-            .attach_place(Place::local_dir(a.to_string_lossy().into_owned(), PlaceAttach::MustExist))
+            .attach_place(Place::local_dir(
+                a.to_string_lossy().into_owned(),
+                PlaceAttach::MustExist,
+            ))
             .unwrap();
         let pb = session
-            .attach_place(Place::local_dir(b.to_string_lossy().into_owned(), PlaceAttach::MustExist))
+            .attach_place(Place::local_dir(
+                b.to_string_lossy().into_owned(),
+                PlaceAttach::MustExist,
+            ))
             .unwrap();
         assert_ne!(pa.id, pb.id);
-        let mut ids: Vec<_> = session.places().unwrap().into_iter().map(|p| p.id).collect();
+        let mut ids: Vec<_> = session
+            .places()
+            .unwrap()
+            .into_iter()
+            .map(|p| p.id)
+            .collect();
         ids.sort_by_key(|id| id.0);
         let mut expected = vec![pa.id, pb.id];
         expected.sort_by_key(|id| id.0);
@@ -170,7 +184,10 @@ mod tests {
         let session = store.create_session();
         let dir = std::env::temp_dir();
         let local = session
-            .attach_place(Place::local_dir(dir.to_string_lossy().into_owned(), PlaceAttach::MustExist))
+            .attach_place(Place::local_dir(
+                dir.to_string_lossy().into_owned(),
+                PlaceAttach::MustExist,
+            ))
             .unwrap();
         let cloud = session.attach_place(aws("i-not-a-local-dir")).unwrap();
         assert_eq!(session.places().unwrap().len(), 2);
@@ -184,7 +201,10 @@ mod tests {
         let session = store.create_session();
         let dir = std::env::temp_dir();
         let local = session
-            .attach_place(Place::local_dir(dir.to_string_lossy().into_owned(), PlaceAttach::MustExist))
+            .attach_place(Place::local_dir(
+                dir.to_string_lossy().into_owned(),
+                PlaceAttach::MustExist,
+            ))
             .unwrap();
         let err = session
             .attach_place(Place {
@@ -209,7 +229,10 @@ mod tests {
         let session = store.create_session();
         let dir = std::env::temp_dir();
         let local = session
-            .attach_place(Place::local_dir(dir.to_string_lossy().into_owned(), PlaceAttach::MustExist))
+            .attach_place(Place::local_dir(
+                dir.to_string_lossy().into_owned(),
+                PlaceAttach::MustExist,
+            ))
             .unwrap();
         let cloud = session.attach_place(aws("i-keep")).unwrap();
         let gone = session.detach_place(local.id).unwrap();

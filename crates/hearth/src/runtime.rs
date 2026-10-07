@@ -242,7 +242,9 @@ impl Runtime {
         let sess = self.store.session(session)?;
         ensure_agent_member(&sess, agent)?;
         match classify_session(&sess, agent)? {
-            Liveness::LiveIdle | Liveness::LiveInTurn => Err(Error::Waiting(WaitReason::AlreadyLive)),
+            Liveness::LiveIdle | Liveness::LiveInTurn => {
+                Err(Error::Waiting(WaitReason::AlreadyLive))
+            }
             Liveness::Unknown => Err(Error::Waiting(WaitReason::LivenessUnknown)),
             Liveness::NeverBound | Liveness::PositivelyDead => {
                 Ok(sess.bind_host(Some(agent), host)?.id)
@@ -664,10 +666,7 @@ mod tests {
                 text: "again".into(),
             },
         );
-        assert!(matches!(
-            evs2,
-            Err(Error::Waiting(WaitReason::TurnOpen))
-        ));
+        assert!(matches!(evs2, Err(Error::Waiting(WaitReason::TurnOpen))));
         assert_eq!(session.bindings().unwrap().len(), 1);
         assert_eq!(
             session
@@ -857,7 +856,11 @@ mod tests {
                 },
             );
             match r {
-                Ok(evs) if evs.iter().any(|e| matches!(e.body, EventBody::TurnStart { .. })) => {
+                Ok(evs)
+                    if evs
+                        .iter()
+                        .any(|e| matches!(e.body, EventBody::TurnStart { .. })) =>
+                {
                     linked += 1;
                 }
                 Err(Error::Waiting(WaitReason::TurnOpen)) => waited += 1,
@@ -936,19 +939,33 @@ mod tests {
         assert_eq!(binding2, binding);
 
         let replayed = rt
-            .durable_step(session.id(), host_b.clone(), fence2, turn2, "charge", || {
-                charges.set(charges.get() + 1);
-                Ok("should-not-run".into())
-            })
+            .durable_step(
+                session.id(),
+                host_b.clone(),
+                fence2,
+                turn2,
+                "charge",
+                || {
+                    charges.set(charges.get() + 1);
+                    Ok("should-not-run".into())
+                },
+            )
             .unwrap();
         assert!(matches!(replayed, StepOutcome::Memoized(ref s) if s == "charged"));
         assert_eq!(charges.get(), 1);
 
         let refunded = rt
-            .durable_step(session.id(), host_b.clone(), fence2, turn2, "refund", || {
-                refunds.set(refunds.get() + 1);
-                Ok("refunded".into())
-            })
+            .durable_step(
+                session.id(),
+                host_b.clone(),
+                fence2,
+                turn2,
+                "refund",
+                || {
+                    refunds.set(refunds.get() + 1);
+                    Ok("refunded".into())
+                },
+            )
             .unwrap();
         assert!(matches!(refunded, StepOutcome::Executed(ref s) if s == "refunded"));
         assert_eq!(refunds.get(), 1);
@@ -1024,7 +1041,9 @@ mod tests {
             Err(Error::TurnLeaseLost)
         ));
         let ok = rt
-            .durable_step(session.id(), host_b, fence2, turn2, "b", || Ok("fresh".into()))
+            .durable_step(session.id(), host_b, fence2, turn2, "b", || {
+                Ok("fresh".into())
+            })
             .unwrap();
         assert!(matches!(ok, StepOutcome::Executed(ref s) if s == "fresh"));
     }
@@ -1123,14 +1142,9 @@ mod tests {
         let session = rt.create_session();
         rt.keep(session.id(), agent.id, goose()).unwrap();
         assert!(matches!(
-            rt.durable_step(
-                session.id(),
-                HolderId::new("ghost"),
-                1,
-                1,
-                "x",
-                || Ok("no".into())
-            ),
+            rt.durable_step(session.id(), HolderId::new("ghost"), 1, 1, "x", || Ok(
+                "no".into()
+            )),
             Err(Error::SessionNotOwned)
         ));
         let holder = HolderId::new("host-a");

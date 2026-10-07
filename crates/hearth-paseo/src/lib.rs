@@ -135,11 +135,23 @@ mod tests {
             .unwrap();
         let user = store.create_user("cheng");
         session.join(Member::User(user.id)).unwrap();
-        session.append(permission_requested(agent.id, "ls")).unwrap();
-        session.append(permission_resolved("ls", true, user.id)).unwrap();
+        session
+            .append(permission_requested(agent.id, "ls"))
+            .unwrap();
+        session
+            .append(permission_resolved("ls", true, user.id))
+            .unwrap();
         assert_eq!(session.members().unwrap().len(), 2);
-        assert!(session.events().unwrap().iter().any(|e| matches!(e.body, EventBody::PermissionAsked { .. })));
-        assert!(session.events().unwrap().iter().any(|e| matches!(e.body, EventBody::PermissionDecided { .. })));
+        assert!(session
+            .events()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e.body, EventBody::PermissionAsked { .. })));
+        assert!(session
+            .events()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e.body, EventBody::PermissionDecided { .. })));
     }
 
     #[test]
@@ -165,13 +177,8 @@ mod tests {
                 text: "ok".into(),
             },
         ];
-        let binding = hydrate_from_provider(
-            &session,
-            "paseo-cli",
-            "provider-resume-77",
-            imported,
-        )
-        .unwrap();
+        let binding =
+            hydrate_from_provider(&session, "paseo-cli", "provider-resume-77", imported).unwrap();
         assert_eq!(
             binding.native_resume_id.as_deref(),
             Some("provider-resume-77")

@@ -41,7 +41,10 @@ fn main() {
         session.bindings().unwrap().len(),
         session.members().unwrap().len()
     );
-    println!("live binding kind={} resume={:?}", second.kind, second.native_resume_id);
+    println!(
+        "live binding kind={} resume={:?}",
+        second.kind, second.native_resume_id
+    );
     println!("surface:");
     for e in session.surface().unwrap() {
         println!("  id={:?} seq={:?} {:?}", e.id, e.seq, e.body);
