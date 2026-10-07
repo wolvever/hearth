@@ -12,7 +12,9 @@
 //! Intra-turn durable steps: [`Runtime::begin_turn`] / [`Runtime::end_turn`] hold a
 //! [`SessionTurnLease`] (holder + fence). [`Runtime::durable_step`] memoizes via
 //! [`crate::EventBody::StepCompleted`]. [`Runtime::resume_interrupted_turn`]
-//! reclaims after host crash and does **not** remint Binding.
+//! reclaims after host crash, finalizes unmatched tool calls as
+//! [`crate::EventBody::ToolCallInterrupted`] (Indeterminate) via the same
+//! helper as wire remint, and does **not** remint Binding.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -447,7 +449,11 @@ impl Runtime {
     }
 
     /// After host crash: reclaim the lease, restore the open turn from the
-    /// EventLog (`TurnStart` without `TurnEnd`), return `(turn_id, fence, binding_id)`.
+    /// EventLog (`TurnStart` without `TurnEnd`), finalize unmatched tool
+    /// calls as [`EventBody::ToolCallInterrupted`]
+    /// ([`crate::ToolInterruptStatus::Indeterminate`]) via
+    /// [`Session::finalize_unmatched_tool_calls`] (same helper as wire remint),
+    /// return `(turn_id, fence, binding_id)`.
     /// Does **not** remint Binding. Refuses if a holder is still live.
     pub fn resume_interrupted_turn(
         &self,
@@ -473,6 +479,10 @@ impl Runtime {
 
         let (turn_id, _) = open_turn_of(&sess.events()?).ok_or(Error::TurnNotOpen)?;
         sess.restore_open_turn()?;
+        // Crash reclaim must not leave ToolCalls looking live (tempt a
+        // re-run). Same Indeterminate finalize as wire remint — never
+        // Completed-without-output, never Cancelled.
+        sess.finalize_unmatched_tool_calls()?;
         let binding = binding_for_agent(&sess, agent)?;
         let fence = self.install_lease(session, new_holder, turn_id)?;
         Ok((turn_id, fence, binding))
@@ -1180,6 +1190,127 @@ mod tests {
             Err(Error::TurnNotOpen)
         ));
         let _ = turn;
+    }
+
+    #[test]
+    fn resume_interrupted_turn_finalizes_open_tool_as_indeterminate() {
+        let rt = Runtime::new();
+        let agent = rt.store().create_agent("scribe", "");
+        let session = rt.create_session();
+        rt.keep(session.id(), agent.id, goose()).unwrap();
+        let host_a = HolderId::new("host-a");
+        let (_turn, fence, _) = rt.begin_turn(session.id(), host_a.clone()).unwrap();
+        session
+            .append(EventBody::ToolCall {
+                agent: agent.id,
+                tool_call_id: "t-open".into(),
+                name: "bash".into(),
+                input: "{}".into(),
+            })
+            .unwrap();
+        session
+            .append(EventBody::ToolCall {
+                agent: agent.id,
+                tool_call_id: "t-done".into(),
+                name: "read".into(),
+                input: "{}".into(),
+            })
+            .unwrap();
+        session
+            .append(EventBody::ToolResult {
+                agent: agent.id,
+                tool_call_id: "t-done".into(),
+                name: "read".into(),
+                output: "ok".into(),
+            })
+            .unwrap();
+        rt.end_turn(session.id(), host_a, fence, true).unwrap();
+
+        let host_b = HolderId::new("host-b");
+        rt.resume_interrupted_turn(session.id(), host_b.clone())
+            .unwrap();
+
+        let log = session.events().unwrap();
+        let interrupts: Vec<_> = log
+            .iter()
+            .filter_map(|e| match &e.body {
+                EventBody::ToolCallInterrupted {
+                    tool_call_id,
+                    status,
+                    ..
+                } => Some((tool_call_id.as_str(), *status)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(interrupts.len(), 1);
+        assert_eq!(interrupts[0].0, "t-open");
+        assert_eq!(interrupts[0].1, crate::ToolInterruptStatus::Indeterminate);
+        assert!(crate::tool_call_is_terminal(&log, "t-open"));
+        assert!(crate::tool_call_is_terminal(&log, "t-done"));
+        assert!(crate::unmatched_tool_calls(&log).is_empty());
+        // Host drain path drops late ToolResult once terminal (same gate).
+        assert!(crate::tool_call_is_terminal(&log, "t-open"));
+    }
+
+    #[test]
+    fn second_crash_reclaim_does_not_duplicate_interrupt() {
+        let rt = Runtime::new();
+        let agent = rt.store().create_agent("scribe", "");
+        let session = rt.create_session();
+        rt.keep(session.id(), agent.id, goose()).unwrap();
+        let host_a = HolderId::new("host-a");
+        let (turn, fence, _) = rt.begin_turn(session.id(), host_a.clone()).unwrap();
+        session
+            .append(EventBody::ToolCall {
+                agent: agent.id,
+                tool_call_id: "t1".into(),
+                name: "bash".into(),
+                input: "{}".into(),
+            })
+            .unwrap();
+        rt.end_turn(session.id(), host_a, fence, true).unwrap();
+
+        let host_b = HolderId::new("host-b");
+        let (turn2, fence2, _) = rt
+            .resume_interrupted_turn(session.id(), host_b.clone())
+            .unwrap();
+        assert_eq!(turn2, turn);
+        assert_eq!(
+            session
+                .events()
+                .unwrap()
+                .iter()
+                .filter(|e| matches!(
+                    &e.body,
+                    EventBody::ToolCallInterrupted {
+                        tool_call_id,
+                        ..
+                    } if tool_call_id == "t1"
+                ))
+                .count(),
+            1
+        );
+
+        // Crash again under the new holder; second reclaim must not duplicate.
+        rt.end_turn(session.id(), host_b, fence2, true).unwrap();
+        let host_c = HolderId::new("host-c");
+        rt.resume_interrupted_turn(session.id(), host_c).unwrap();
+        assert_eq!(
+            session
+                .events()
+                .unwrap()
+                .iter()
+                .filter(|e| matches!(
+                    &e.body,
+                    EventBody::ToolCallInterrupted {
+                        tool_call_id,
+                        ..
+                    } if tool_call_id == "t1"
+                ))
+                .count(),
+            1
+        );
+        assert!(crate::unmatched_tool_calls(&session.events().unwrap()).is_empty());
     }
 
     #[test]

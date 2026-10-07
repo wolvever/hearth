@@ -12,8 +12,9 @@
 //!    from Host pending; do not cancel healthy HITL.
 //! 4. **Finalize-orphaned-toolcalls** — after mid-turn cancel, append Host
 //!    [`hearth::EventBody::ToolCallInterrupted`] (Indeterminate) for each
-//!    unmatched `tool_call_id` in the Host EventLog; idempotent across a
-//!    second remint; do not finalize healthy HITL. (2026-10-07 typed EventLog)
+//!    unmatched `tool_call_id` via [`hearth::Session::finalize_unmatched_tool_calls`]
+//!    (shared with crash reclaim / `resume_interrupted_turn`); idempotent
+//!    across a second remint; do not finalize healthy HITL. (2026-10-07)
 //! 5. **Truncated-replay-resync** — producer `truncated:true` → hydrate
 //!    from Host EventLog watermark (`ResyncFromHost`), not partial tail
 //!    or replay-from-zero.
@@ -32,8 +33,8 @@
 use std::sync::Mutex;
 
 use hearth::{
-    tool_call_is_terminal, unmatched_tool_calls, AgentId, Event, EventBody, InMemory, Member,
-    Session as HostSession, ToolInterruptStatus, UserId,
+    tool_call_is_terminal, AgentId, Event, EventBody, InMemory, Member, Session as HostSession,
+    UserId,
 };
 use serde_json::Value;
 
@@ -694,26 +695,13 @@ impl RemintSession {
             Self::push_event(&mut g, RemintEventKind::TurnCancelled, "mid-turn");
             turn_interrupted = true;
 
-            // Finalize-orphaned-toolcalls (09-30 / 10-07): Host EventLog
-            // by tool_call_id. Idempotent — already-interrupted ids skip.
-            let host_log = g.host_session.events().expect("host events");
-            let orphans = unmatched_tool_calls(&host_log);
-            for (agent, tool_id, name) in orphans {
-                // Re-check terminal under the same lock (double remint).
-                let latest = g.host_session.events().expect("host events");
-                if tool_call_is_terminal(&latest, &tool_id) {
-                    continue;
-                }
-                g.host_session
-                    .append(EventBody::ToolCallInterrupted {
-                        agent,
-                        tool_call_id: tool_id,
-                        name,
-                        status: ToolInterruptStatus::Indeterminate,
-                    })
-                    .expect("append ToolCallInterrupted");
-                tools_finalized += 1;
-            }
+            // Finalize-orphaned-toolcalls (09-30 / 10-07): shared Host
+            // helper (same as Runtime::resume_interrupted_turn). Keyed by
+            // tool_call_id; Indeterminate; idempotent.
+            tools_finalized = g
+                .host_session
+                .finalize_unmatched_tool_calls()
+                .expect("finalize unmatched tool calls");
             g.turn_in_flight = false;
             // NEVER resubmit in-flight prompt after remint.
             g.in_flight_prompt = None;
@@ -903,6 +891,7 @@ pub fn encode_remint_rpc(method: RemintWireMethod, agent_session_id: &str, id: u
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hearth::ToolInterruptStatus;
 
     fn caps_resume() -> LiveCaps {
         LiveCaps {
