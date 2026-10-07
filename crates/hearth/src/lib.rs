@@ -916,6 +916,34 @@ impl Session {
         })
     }
 
+    /// Append [`EventBody::ToolCallInterrupted`] with
+    /// [`ToolInterruptStatus::Indeterminate`] for each unmatched
+    /// `tool_call_id` on this Session's EventLog.
+    ///
+    /// Idempotent: already-terminal ids are skipped (at most one interrupt
+    /// per id). Keyed by `tool_call_id`, never tool name. Shared by wire
+    /// remint and [`crate::Runtime::resume_interrupted_turn`] — never
+    /// Completed-without-output, never Cancelled.
+    pub fn finalize_unmatched_tool_calls(&self) -> Result<usize> {
+        self.write(|data| {
+            let orphans = unmatched_tool_calls(&data.events);
+            let mut n = 0usize;
+            for (agent, tool_call_id, name) in orphans {
+                if tool_call_is_terminal(&data.events, &tool_call_id) {
+                    continue;
+                }
+                data.push(EventBody::ToolCallInterrupted {
+                    agent,
+                    tool_call_id,
+                    name,
+                    status: ToolInterruptStatus::Indeterminate,
+                });
+                n += 1;
+            }
+            Ok(n)
+        })
+    }
+
     /// Memoized `StepCompleted` payload for `(turn_id, step_id)`, if present.
     pub fn step_result(&self, turn_id: u64, step_id: &str) -> Result<Option<String>> {
         self.read(|data| step_result_of(&data.events, turn_id, step_id))
@@ -1199,6 +1227,57 @@ mod tests {
         assert!(unmatched_tool_calls(&session.events().unwrap()).is_empty());
         assert!(tool_call_is_terminal(&session.events().unwrap(), "x2"));
         assert!(tool_call_is_terminal(&session.events().unwrap(), "x1"));
+    }
+
+    #[test]
+    fn finalize_unmatched_tool_calls_is_idempotent_indeterminate() {
+        let store = InMemory::new();
+        let agent = store.create_agent("coder", "");
+        let session = store.create_session();
+        session.join(Member::Agent(agent.id)).unwrap();
+        session
+            .append(EventBody::ToolCall {
+                agent: agent.id,
+                tool_call_id: "t1".into(),
+                name: "bash".into(),
+                input: "{}".into(),
+            })
+            .unwrap();
+        session
+            .append(EventBody::ToolCall {
+                agent: agent.id,
+                tool_call_id: "t2".into(),
+                name: "read".into(),
+                input: "{}".into(),
+            })
+            .unwrap();
+        session
+            .append(EventBody::ToolResult {
+                agent: agent.id,
+                tool_call_id: "t2".into(),
+                name: "read".into(),
+                output: "ok".into(),
+            })
+            .unwrap();
+        assert_eq!(session.finalize_unmatched_tool_calls().unwrap(), 1);
+        assert_eq!(session.finalize_unmatched_tool_calls().unwrap(), 0);
+        let interrupts: Vec<_> = session
+            .events()
+            .unwrap()
+            .into_iter()
+            .filter_map(|e| match e.body {
+                EventBody::ToolCallInterrupted {
+                    tool_call_id,
+                    status,
+                    ..
+                } => Some((tool_call_id, status)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(interrupts.len(), 1);
+        assert_eq!(interrupts[0].0, "t1");
+        assert_eq!(interrupts[0].1, ToolInterruptStatus::Indeterminate);
+        assert!(unmatched_tool_calls(&session.events().unwrap()).is_empty());
     }
 
     #[test]
