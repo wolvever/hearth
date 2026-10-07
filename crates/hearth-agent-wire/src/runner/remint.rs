@@ -230,6 +230,9 @@ pub enum RemintError {
     DuplicateRpcId,
     /// Event is not a JSON-RPC permission request (no rpc id).
     NotAPermissionRequest,
+    /// Host EventLog write (PermissionAsked / PermissionDecided) failed;
+    /// the ask's state is unchanged and nothing is written to the wire.
+    HostLog(String),
 }
 
 impl RemintError {
@@ -246,6 +249,7 @@ impl RemintError {
             Self::OptionNotOffered => "OptionNotOffered",
             Self::DuplicateRpcId => "DuplicateRpcId",
             Self::NotAPermissionRequest => "NotAPermissionRequest",
+            Self::HostLog(_) => "HostLog",
         }
     }
 }
@@ -597,25 +601,38 @@ impl RemintSession {
         g.attach_cursor = g.events.last().map(|e| e.id).unwrap_or(0);
     }
 
-    fn host_rpc(g: &Inner, p: &PendingPermission) -> Option<PermissionRpc> {
-        g.host_bindings.get(&p.binding).map(|b| PermissionRpc {
-            binding: *b,
+    fn host_rpc(g: &Inner, p: &PendingPermission) -> Result<PermissionRpc, RemintError> {
+        let binding = g
+            .host_bindings
+            .get(&p.binding)
+            .ok_or_else(|| RemintError::HostLog(format!("no Host Binding for {}", p.binding)))?;
+        Ok(PermissionRpc {
+            binding: *binding,
             rpc_id: p.rpc_id.to_string(),
             tool_call_id: p.tool_call_id.clone(),
         })
     }
 
-    /// Record a decision on the Host EventLog (`option_id: None` = cancelled).
-    fn host_decide(g: &Inner, p: &PendingPermission, option_id: Option<&str>, allowed: bool) {
-        if let Some(rpc) = Self::host_rpc(g, p) {
-            let _ = g.host_session.decide_permission_rpc(
+    /// Record a decision on the Host EventLog (`option_id: None` =
+    /// cancelled). Errors propagate (occupancy / store) — callers run this
+    /// before mutating pending state or emitting any wire command.
+    fn host_decide(
+        g: &Inner,
+        p: &PendingPermission,
+        option_id: Option<&str>,
+        allowed: bool,
+    ) -> Result<(), RemintError> {
+        let rpc = Self::host_rpc(g, p)?;
+        g.host_session
+            .decide_permission_rpc(
                 p.title.clone(),
                 allowed,
                 g.host_user,
                 rpc,
                 option_id.map(str::to_string),
-            );
-        }
+            )
+            .map(|_| ())
+            .map_err(|e| RemintError::HostLog(e.to_string()))
     }
 
     /// Record a decoded ACP `session/request_permission` (must carry its
@@ -664,6 +681,11 @@ impl RemintSession {
             options,
         };
         let new_ref = ask.as_ref();
+        // Host EventLog first: on failure nothing is adopted or tracked.
+        let rpc = Self::host_rpc(&g, &ask)?;
+        g.host_session
+            .ask_permission_rpc(g.host_agent, title.to_string(), rpc)
+            .map_err(|e| RemintError::HostLog(e.to_string()))?;
         if let Some(tc) = tool_call_id {
             let live_shares = g
                 .pending
@@ -687,11 +709,6 @@ impl RemintSession {
                     );
                 }
             }
-        }
-        if let Some(rpc) = Self::host_rpc(&g, &ask) {
-            let _ = g
-                .host_session
-                .ask_permission_rpc(g.host_agent, title.to_string(), rpc);
         }
         g.pending.insert(key, ask);
         Self::push_event(
@@ -731,13 +748,14 @@ impl RemintSession {
             return Err(RemintError::OptionNotOffered);
         };
         let allowed = option_allows(opt);
+        // Host decision first: on failure the ask stays pending, no reply.
+        Self::host_decide(&g, &ask, Some(option_id), allowed)?;
         g.pending.remove(&key);
         Self::push_event(
             &mut g,
             RemintEventKind::PermissionResolved(ask.as_ref()),
             option_id,
         );
-        Self::host_decide(&g, &ask, Some(option_id), allowed);
         if g.pending.is_empty() && g.resurfaced.is_empty() {
             g.turn_in_flight = false;
             g.in_flight_prompt = None;
@@ -755,8 +773,14 @@ impl RemintSession {
     /// own rpc id, then `session/cancel` ([`AgentCommand::Abort`]). Resurfaced
     /// asks from dead Bindings are dropped as cancelled on the Host log only —
     /// never written to the wire. Pending and resurfaced maps end empty.
-    pub fn cancel_turn(&self) -> Vec<AgentCommand> {
+    ///
+    /// Host decisions are recorded first; if one fails ([`RemintError::HostLog`])
+    /// no command is returned and both maps are left as they were.
+    pub fn cancel_turn(&self) -> Result<Vec<AgentCommand>, RemintError> {
         let mut g = self.inner.lock().unwrap();
+        for ask in g.pending.values().chain(g.resurfaced.values()) {
+            Self::host_decide(&g, ask, None, false)?;
+        }
         let mut out = Vec::new();
         let live = std::mem::take(&mut g.pending);
         let dead = std::mem::take(&mut g.resurfaced);
@@ -775,7 +799,6 @@ impl RemintSession {
                 RemintEventKind::PermissionResolved(ask.as_ref()),
                 "cancelled",
             );
-            Self::host_decide(&g, ask, None, false);
         }
         out.push(AgentCommand::Abort {
             session_id: g.agent_session_id.clone(),
@@ -785,7 +808,7 @@ impl RemintSession {
         }
         g.turn_in_flight = false;
         g.in_flight_prompt = None;
-        out
+        Ok(out)
     }
 
     /// Append a Host [`EventBody::ToolCall`] keyed by `tool_call_id`.
@@ -967,11 +990,13 @@ impl RemintSession {
         }
 
         // Remint Binding + AttachResume (09-27). Same agent_session_id.
-        let new_binding = format!("bind-{}", g.next_binding);
-        g.next_binding += 1;
-        let old_binding = std::mem::replace(&mut g.binding_id, new_binding.clone());
-        if let Some(old_host) = g.host_bindings.get(&old_binding).copied() {
-            let _ = g.host_session.unbind(old_host);
+        // Host Binding swap first: on failure the remint Binding is unchanged.
+        if let Some(old_host) = g.host_bindings.get(&g.binding_id).copied() {
+            match g.host_session.unbind(old_host) {
+                // Already released (e.g. agent left): release is idempotent.
+                Ok(_) | Err(hearth::Error::UnknownBinding(_)) => {}
+                Err(e) => return Err(RemintError::HostLog(e.to_string())),
+            }
         }
         let host_agent = g.host_agent;
         let host_binding = g
@@ -980,7 +1005,10 @@ impl RemintSession {
                 Some(host_agent),
                 Host::from_bind("acp", Some(g.agent_session_id.clone()), None),
             )
-            .expect("bind reminted host");
+            .map_err(|e| RemintError::HostLog(e.to_string()))?;
+        let new_binding = format!("bind-{}", g.next_binding);
+        g.next_binding += 1;
+        g.binding_id = new_binding.clone();
         g.host_bindings.insert(new_binding.clone(), host_binding.id);
         g.transport_owner = TransportOwner::Binding(new_binding.clone());
         wire_actions.push(WireAction::AttachResume);
@@ -2006,7 +2034,7 @@ mod tests {
         s.begin_turn("work");
         ask_via_codec(&s, &mut peer, "t1", "x").unwrap();
         ask_via_codec(&s, &mut peer, "t2", "y").unwrap();
-        let cmds = s.cancel_turn();
+        let cmds = s.cancel_turn().unwrap();
         assert_eq!(cmds.len(), 3);
         assert!(matches!(cmds.last(), Some(AgentCommand::Abort { .. })));
         for c in &cmds {
@@ -2137,7 +2165,7 @@ mod tests {
             .iter()
             .any(|e| matches!(e.kind, RemintEventKind::PermissionReasked { .. })));
 
-        let cmds = s.cancel_turn();
+        let cmds = s.cancel_turn().unwrap();
         // One live ask answered cancelled + session/cancel; dead ids untouched.
         assert_eq!(cmds.len(), 2);
         for c in &cmds {
@@ -2166,7 +2194,7 @@ mod tests {
         s.request_permission(RpcId::Str("2".into()), Some("t3"), "y", opts())
             .unwrap();
         assert_eq!(s.pending_permissions().len(), 2, "5 and \"5\" are distinct");
-        s.cancel_turn();
+        s.cancel_turn().unwrap();
         assert_maps_empty(&s, "after cancel");
 
         s.begin_turn("c");
@@ -2180,5 +2208,50 @@ mod tests {
             .unwrap();
         assert_maps_empty(&s, "after remint + re-ask answered");
         assert!(!s.turn_in_flight());
+    }
+
+    /// Pep Should 1 (PR #16): Host decision errors propagate. With the Host
+    /// user out of the Session, resolve / cancel return HostLog, emit no
+    /// command, keep the ask pending and write no PermissionDecided.
+    #[test]
+    fn host_decide_error_propagates_and_keeps_ask_pending() {
+        let (s, _, bid) = RemintSession::open("sess-1", "S-1", caps_resume());
+        let mut peer = FakeAcp::new("S-1");
+        let a = ask_via_codec(&s, &mut peer, "t1", "x").unwrap();
+        let host_user = s.inner.lock().unwrap().host_user;
+        s.inner
+            .lock()
+            .unwrap()
+            .host_session
+            .leave(Member::User(host_user))
+            .unwrap();
+        let decided = |s: &RemintSession| {
+            s.host_events()
+                .iter()
+                .filter(|e| matches!(e.body, EventBody::PermissionDecided { .. }))
+                .count()
+        };
+        assert!(matches!(
+            s.resolve_permission(&bid, &a.rpc_id, "allow-once"),
+            Err(RemintError::HostLog(_))
+        ));
+        assert!(matches!(s.cancel_turn(), Err(RemintError::HostLog(_))));
+        assert_eq!(s.pending_permissions().len(), 1);
+        assert_eq!(decided(&s), 0);
+        assert!(peer.hung());
+
+        s.inner
+            .lock()
+            .unwrap()
+            .host_session
+            .join(Member::User(host_user))
+            .unwrap();
+        send_via_codec(
+            &mut peer,
+            &s.resolve_permission(&bid, &a.rpc_id, "allow-once").unwrap(),
+        );
+        assert!(!peer.hung());
+        assert_eq!(decided(&s), 1);
+        assert_maps_empty(&s, "after recovery");
     }
 }

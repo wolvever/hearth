@@ -316,8 +316,18 @@ impl<A: CodingAgent> HostAttach<A> {
     }
 
     /// Answer one ask on its JSON-RPC id with `{outcome:"selected", optionId}`.
-    /// `option_id` must be one the agent offered on that ask; otherwise
-    /// [`AttachError::OptionNotOffered`] and the ask stays pending.
+    ///
+    /// Order (Pep, PR #16): validate → occupancy check + Host
+    /// `PermissionDecided` append ([`Session::decide_permission_rpc`]) →
+    /// wire send → drop the pending entry. On any error nothing goes out and
+    /// the ask stays pending:
+    /// - unknown key → [`AttachError::UnknownPermission`];
+    /// - `option_id` not offered → [`AttachError::OptionNotOffered`];
+    /// - `by` not occupying the Session → [`AttachError::Hearth`], no
+    ///   decision written, no frame sent.
+    ///
+    /// If the send itself fails, the decision is already on the EventLog
+    /// (it cannot be un-appended) but the ask stays pending for a retry.
     pub fn answer_permission(
         &mut self,
         session: &Session,
@@ -338,6 +348,14 @@ impl<A: CodingAgent> HostAttach<A> {
             });
         };
         let allowed = option_allows(opt);
+        // require_user + append BEFORE anything reaches the wire.
+        let ev = session.decide_permission_rpc(
+            ask.title.clone(),
+            allowed,
+            by,
+            self.permission_rpc(&ask),
+            Some(option_id.into()),
+        )?;
         self.coding.send(AgentCommand::ReplyPermission {
             session_id: self.wire_session(),
             permission_id: rpc_id.to_string(),
@@ -346,22 +364,31 @@ impl<A: CodingAgent> HostAttach<A> {
             rpc_id: Some(rpc_id.clone()),
         })?;
         self.pending.remove(&key);
-        let ev = session.decide_permission_rpc(
-            ask.title.clone(),
-            allowed,
-            by,
-            self.permission_rpc(&ask),
-            Some(option_id.into()),
-        )?;
         Ok(ev)
     }
 
     /// Cancel the turn: answer **every** pending ask on this Binding with
     /// `{outcome:"cancelled"}` (ACP MUST), then send [`AgentCommand::Abort`]
     /// (`session/cancel`). Returns the Host decisions recorded.
+    ///
+    /// Decisions (occupancy check + `PermissionDecided`) are all recorded
+    /// before any frame is sent, so a `by` who does not occupy the Session
+    /// fails on the first ask: typed error, nothing sent, nothing written,
+    /// every ask stays pending. Each pending entry is dropped only after
+    /// its cancelled reply was sent.
     pub fn cancel(&mut self, session: &Session, by: UserId) -> AttachResult<Vec<Event>> {
-        let mut out = Vec::new();
-        for ask in self.pending_permissions() {
+        let asks = self.pending_permissions();
+        let mut out = Vec::with_capacity(asks.len());
+        for ask in &asks {
+            out.push(session.decide_permission_rpc(
+                ask.title.clone(),
+                false,
+                by,
+                self.permission_rpc(ask),
+                None,
+            )?);
+        }
+        for ask in &asks {
             self.coding.send(AgentCommand::ReplyPermission {
                 session_id: self.wire_session(),
                 permission_id: ask.rpc_id.to_string(),
@@ -370,13 +397,6 @@ impl<A: CodingAgent> HostAttach<A> {
                 rpc_id: Some(ask.rpc_id.clone()),
             })?;
             self.pending.remove(&(self.binding.id, ask.rpc_id.clone()));
-            out.push(session.decide_permission_rpc(
-                ask.title.clone(),
-                false,
-                by,
-                self.permission_rpc(&ask),
-                None,
-            )?);
         }
         match self.coding.send(AgentCommand::Abort {
             session_id: self.wire_session(),
@@ -433,6 +453,12 @@ impl<A: CodingAgent> HostAttach<A> {
                 if self.pending.contains_key(&key) {
                     return Err(AttachError::DuplicateRpcId(rpc_id.clone()));
                 }
+                // EventLog append first; track the ask only once it is on
+                // the log, so a failed append leaves no phantom pending entry.
+                let mut appended = Vec::new();
+                for body in event_bodies(self.binding.id, self.agent, &ev) {
+                    appended.push(session.append(body)?);
+                }
                 self.pending.insert(
                     key,
                     PendingAsk {
@@ -442,10 +468,6 @@ impl<A: CodingAgent> HostAttach<A> {
                         options: options.clone(),
                     },
                 );
-                let mut appended = Vec::new();
-                for body in event_bodies(self.binding.id, self.agent, &ev) {
-                    appended.push(session.append(body)?);
-                }
                 Ok(appended)
             }
             _ => {
@@ -880,5 +902,70 @@ mod tests {
         let pending = attach.pending_permissions();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].tool_call_id.as_deref(), Some("a"));
+    }
+
+    fn decided_count(session: &Session) -> usize {
+        session
+            .events()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e.body, EventBody::PermissionDecided { .. }))
+            .count()
+    }
+
+    /// Pep Must (PR #16): a user who does not occupy the Session gets a
+    /// typed Err; nothing is sent, the ask stays pending, no decision is
+    /// written. The occupant can still answer afterwards.
+    #[test]
+    fn acp_answer_by_stranger_sends_nothing_and_keeps_ask() {
+        let (store, user, agent, session) = room();
+        let stranger = store.create_user("stranger");
+        let mut attach = acp_attach(&session, agent.id);
+        push_ask(&mut attach, serde_json::json!(4), "call_1");
+        attach.drain(&session).unwrap();
+
+        let err = attach
+            .answer_permission(&session, stranger.id, &RpcId::Num(4), "allow-once")
+            .unwrap_err();
+        assert!(matches!(err, AttachError::Hearth(hearth::Error::NotMember)));
+        assert!(attach.coding.transport().outbound().is_empty());
+        assert_eq!(attach.pending_permissions().len(), 1);
+        assert_eq!(decided_count(&session), 0);
+
+        attach
+            .answer_permission(&session, user.id, &RpcId::Num(4), "allow-once")
+            .unwrap();
+        assert_eq!(attach.coding.transport().outbound().len(), 1);
+        assert_eq!(attach.coding.transport().outbound()[0]["id"], 4);
+        assert!(attach.pending_permissions().is_empty());
+        assert_eq!(decided_count(&session), 1);
+    }
+
+    /// Pep Must (PR #16), cancel path: stranger cancel is a typed Err with
+    /// no replies, no session/cancel, no decisions; every ask stays pending.
+    #[test]
+    fn acp_cancel_by_stranger_sends_nothing_and_keeps_asks() {
+        let (store, user, agent, session) = room();
+        let stranger = store.create_user("stranger");
+        let mut attach = acp_attach(&session, agent.id);
+        push_ask(&mut attach, serde_json::json!(7), "call_ctrl");
+        push_ask(&mut attach, serde_json::json!(8), "toolu_sub");
+        attach.drain(&session).unwrap();
+
+        let err = attach.cancel(&session, stranger.id).unwrap_err();
+        assert!(matches!(err, AttachError::Hearth(hearth::Error::NotMember)));
+        assert!(attach.coding.transport().outbound().is_empty());
+        assert_eq!(attach.pending_permissions().len(), 2);
+        assert_eq!(decided_count(&session), 0);
+
+        let decided = attach.cancel(&session, user.id).unwrap();
+        assert_eq!(decided.len(), 2);
+        assert_eq!(decided_count(&session), 2);
+        let out = attach.coding.transport().outbound().to_vec();
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0]["id"], 7);
+        assert_eq!(out[1]["id"], 8);
+        assert_eq!(out[2]["method"], "session/cancel");
+        assert!(attach.pending_permissions().is_empty());
     }
 }
