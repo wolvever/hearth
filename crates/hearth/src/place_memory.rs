@@ -61,7 +61,7 @@ pub fn skill_path(name: &str) -> String {
 }
 
 /// In-memory file map for one Place. Not stored on the [`Place`] locator.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MemoryFiles {
     pub agents_md: String,
     pub memory_md: String,
@@ -69,19 +69,6 @@ pub struct MemoryFiles {
     pub handoff_md: Option<String>,
     pub topics: HashMap<String, String>,
     pub skills: HashMap<String, String>,
-}
-
-impl Default for MemoryFiles {
-    fn default() -> Self {
-        Self {
-            agents_md: String::new(),
-            memory_md: String::new(),
-            user_md: String::new(),
-            handoff_md: None,
-            topics: HashMap::new(),
-            skills: HashMap::new(),
-        }
-    }
 }
 
 /// Load / write policy. `PlaceBacked` is the correct path; the `Naive*`
@@ -434,7 +421,7 @@ mod tests {
         p.set_agents_md(bind, "use rustfmt").unwrap();
         p.set_memory_md(
             bind,
-            &format!("{}{}", "index: deploy via make ship\n", "x".repeat(600)),
+            format!("{}{}", "index: deploy via make ship\n", "x".repeat(600)),
         )
         .unwrap();
         p.set_user_md(bind, "prefers short replies").unwrap();

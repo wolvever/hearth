@@ -13,7 +13,9 @@ use hearth::{grok_api_key, EventBody, HostKind, Member, Runtime, Wake};
 fn keep_wake_then_optional_grok_chat_completion() {
     let rt = Runtime::new();
     let user = rt.store().create_user("cheng");
-    let agent = rt.store().create_agent("grok", "reply in one short sentence");
+    let agent = rt
+        .store()
+        .create_agent("grok", "reply in one short sentence");
     let session = rt.create_session();
     session.join(Member::User(user.id)).unwrap();
 

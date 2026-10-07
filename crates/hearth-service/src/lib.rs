@@ -173,14 +173,19 @@ fn apply_join(
     agent: Option<String>,
 ) -> Result<EventOut, StatusCode> {
     let session = st.store().session(id).map_err(|_| StatusCode::NOT_FOUND)?;
-    let mut names = st.names.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut names = st
+        .names
+        .lock()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let (ev, keep_agent) = if let Some(name) = user {
         let uid = *names
             .users
             .entry(name.clone())
             .or_insert_with(|| st.store().create_user(name).id);
         (
-            session.join(Member::User(uid)).map_err(|_| StatusCode::CONFLICT)?,
+            session
+                .join(Member::User(uid))
+                .map_err(|_| StatusCode::CONFLICT)?,
             None,
         )
     } else if let Some(name) = agent {
@@ -189,7 +194,9 @@ fn apply_join(
             .entry(name.clone())
             .or_insert_with(|| st.store().create_agent(name, String::new()).id);
         (
-            session.join(Member::Agent(aid)).map_err(|_| StatusCode::CONFLICT)?,
+            session
+                .join(Member::Agent(aid))
+                .map_err(|_| StatusCode::CONFLICT)?,
             Some(aid),
         )
     } else {
@@ -267,17 +274,14 @@ fn apply_user_message(
     text: String,
 ) -> Result<EventOut, StatusCode> {
     let _session = st.store().session(id).map_err(|_| StatusCode::NOT_FOUND)?;
-    let names = st.names.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let names = st
+        .names
+        .lock()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let uid = *names.users.get(&name).ok_or(StatusCode::NOT_FOUND)?;
     drop(names);
     ensure_kept(st, id)?;
-    match st.runtime.wake(
-        id,
-        Wake::UserQuery {
-            user: uid,
-            text,
-        },
-    ) {
+    match st.runtime.wake(id, Wake::UserQuery { user: uid, text }) {
         Ok(evs) => {
             for e in &evs {
                 st.publish(id, event_out(e));
@@ -433,7 +437,9 @@ mod tests {
     async fn call(app: Router, req: Request<Body>) -> (StatusCode, String) {
         let res = app.oneshot(req).await.unwrap();
         let status = res.status();
-        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+            .await
+            .unwrap();
         (status, String::from_utf8_lossy(&bytes).into_owned())
     }
 
@@ -457,7 +463,9 @@ mod tests {
 
         let (st, txt) = call(
             app.clone(),
-            Request::get(format!("/sessions/{id}")).body(Body::empty()).unwrap(),
+            Request::get(format!("/sessions/{id}"))
+                .body(Body::empty())
+                .unwrap(),
         )
         .await;
         assert_eq!(st, StatusCode::OK);
@@ -556,11 +564,29 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&create.1).unwrap();
         let id = v["id"].as_str().unwrap().to_string();
 
-        let j = http(addr, "POST", &format!("/sessions/{id}/join"), Some(r#"{"user":"cheng"}"#)).await;
+        let j = http(
+            addr,
+            "POST",
+            &format!("/sessions/{id}/join"),
+            Some(r#"{"user":"cheng"}"#),
+        )
+        .await;
         assert_eq!(j.0, 200);
-        let j2 = http(addr, "POST", &format!("/sessions/{id}/join"), Some(r#"{"user":"guest"}"#)).await;
+        let j2 = http(
+            addr,
+            "POST",
+            &format!("/sessions/{id}/join"),
+            Some(r#"{"user":"guest"}"#),
+        )
+        .await;
         assert_eq!(j2.0, 200);
-        let ja = http(addr, "POST", &format!("/sessions/{id}/join"), Some(r#"{"agent":"scribe"}"#)).await;
+        let ja = http(
+            addr,
+            "POST",
+            &format!("/sessions/{id}/join"),
+            Some(r#"{"agent":"scribe"}"#),
+        )
+        .await;
         assert_eq!(ja.0, 200);
 
         let url = format!("ws://{addr}/sessions/{id}/stream");
@@ -634,9 +660,11 @@ mod tests {
         expect_text(&mut a, "steer-from-a").await;
         expect_text(&mut b, "steer-from-a").await;
 
-        b.send(WsMsg::Text(r#"{"user":"guest","message":"steer-from-b"}"#.into()))
-            .await
-            .unwrap();
+        b.send(WsMsg::Text(
+            r#"{"user":"guest","message":"steer-from-b"}"#.into(),
+        ))
+        .await
+        .unwrap();
         expect_text(&mut b, "409").await;
 
         let listed = http(addr, "GET", &format!("/sessions/{id}/events"), None).await;
@@ -657,6 +685,7 @@ mod tests {
         let _ = b.close(None).await;
     }
 
+    #[allow(clippy::result_large_err)] // tungstenite::Error is upstream; test-only helper
     async fn expect_text(
         ws: &mut (impl StreamExt<Item = Result<WsMsg, tokio_tungstenite::tungstenite::Error>> + Unpin),
         needle: &str,
@@ -677,7 +706,12 @@ mod tests {
         }
     }
 
-    async fn http(addr: std::net::SocketAddr, method: &str, path: &str, body: Option<&str>) -> (u16, String) {
+    async fn http(
+        addr: std::net::SocketAddr,
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+    ) -> (u16, String) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let payload = body.unwrap_or("");
         let req = format!(

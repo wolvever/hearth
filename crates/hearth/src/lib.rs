@@ -14,23 +14,23 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use uuid::Uuid;
 
-mod sandbox;
+mod host;
 mod place;
 mod place_memory;
-mod host;
 mod runtime;
+mod sandbox;
+pub use host::{
+    grok_api_key, ClaudeCode as ClaudeCodeHost, Codex as CodexHost, Dsh as DshHost, Fx as FxHost,
+    Goose as GooseHost, Grok as GrokHost, GrokBuild as GrokBuildHost, Host, HostKind, HostTicket,
+    OpenCode as OpenCodeHost, Pi as PiHost,
+};
 pub use place::{Place, PlaceAttach, PlaceOs, PlaceProvider};
 pub use place_memory::{
     cross_agent_write, skill_path, topic_path, InjectedContext, MemoryFiles, MemoryPolicy,
     PlaceMemory, WorkingState, AGENTS_MD, HANDOFF_MD, MEMORY_MD, SUMMARY_BYTE_CAP, USER_MD,
 };
-pub use sandbox::FakeSandbox;
-pub use host::{
-    grok_api_key, Host, HostKind, HostTicket, ClaudeCode as ClaudeCodeHost, Codex as CodexHost,
-    Dsh as DshHost, Fx as FxHost, Pi as PiHost, OpenCode as OpenCodeHost, Goose as GooseHost,
-    Grok as GrokHost, GrokBuild as GrokBuildHost,
-};
 pub use runtime::{HolderId, KeepSpec, Liveness, Runtime, SessionTurnLease, StepOutcome, Wake};
+pub use sandbox::FakeSandbox;
 
 // --- identities ---
 
@@ -127,12 +127,28 @@ pub enum ToolInterruptStatus {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum EventBody {
-    MemberJoin { member: Member },
-    MemberLeave { member: Member },
-    ConfigSet { key: String, value: String },
-    UserMessage { user: UserId, text: String },
-    AgentMessage { agent: AgentId, text: String },
-    AgentThink { agent: AgentId, text: String },
+    MemberJoin {
+        member: Member,
+    },
+    MemberLeave {
+        member: Member,
+    },
+    ConfigSet {
+        key: String,
+        value: String,
+    },
+    UserMessage {
+        user: UserId,
+        text: String,
+    },
+    AgentMessage {
+        agent: AgentId,
+        text: String,
+    },
+    AgentThink {
+        agent: AgentId,
+        text: String,
+    },
     ToolCall {
         agent: AgentId,
         /// Stable id for this call (ACP `toolCallId` / wire `item_id`).
@@ -156,24 +172,48 @@ pub enum EventBody {
         name: String,
         status: ToolInterruptStatus,
     },
-    AskUser { agent: AgentId, prompt: String },
-    PermissionAsked { agent: AgentId, request: String },
-    PermissionDecided { request: String, allowed: bool, by: UserId },
-    TurnStart { agent: AgentId },
-    TurnEnd { agent: AgentId },
+    AskUser {
+        agent: AgentId,
+        prompt: String,
+    },
+    PermissionAsked {
+        agent: AgentId,
+        request: String,
+    },
+    PermissionDecided {
+        request: String,
+        allowed: bool,
+        by: UserId,
+    },
+    TurnStart {
+        agent: AgentId,
+    },
+    TurnEnd {
+        agent: AgentId,
+    },
     /// Intra-turn durable step checkpoint. Not model-visible.
     StepCompleted {
         turn_id: u64,
         step_id: String,
         result: String,
     },
-    BindingAttached { binding: BindingId },
-    BindingReleased { binding: BindingId },
+    BindingAttached {
+        binding: BindingId,
+    },
+    BindingReleased {
+        binding: BindingId,
+    },
     /// Replaces `[start, end]` (inclusive EventId range in log order) in [`Session::surface`]. Full log keeps both.
     /// Product compact path: [`Session::compact_with_handoff`] (PreCompactHandoff).
-    Compact { start: EventId, end: EventId, summary: String },
+    Compact {
+        start: EventId,
+        end: EventId,
+        summary: String,
+    },
     /// Runtime wake marker (Timer / Trigger). Not model-visible.
-    Wake { source: WakeSource },
+    Wake {
+        source: WakeSource,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -332,12 +372,8 @@ pub fn unmatched_tool_calls(events: &[Event]) -> Vec<(AgentId, String, String)> 
     let mut terminal: HashSet<String> = HashSet::new();
     for e in events.iter().rev() {
         match &e.body {
-            EventBody::ToolResult {
-                tool_call_id, ..
-            }
-            | EventBody::ToolCallInterrupted {
-                tool_call_id, ..
-            } => {
+            EventBody::ToolResult { tool_call_id, .. }
+            | EventBody::ToolCallInterrupted { tool_call_id, .. } => {
                 terminal.insert(tool_call_id.clone());
             }
             _ => {}
@@ -505,14 +541,24 @@ impl InMemory {
             .ok_or(Error::UnknownAgent(id))
     }
 
-    pub fn set_user_config(&self, id: UserId, key: impl Into<String>, value: impl Into<String>) -> Result<()> {
+    pub fn set_user_config(
+        &self,
+        id: UserId,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Result<()> {
         let mut g = self.lock()?;
         let user = g.users.get_mut(&id).ok_or(Error::UnknownUser(id))?;
         user.config.insert(key.into(), value.into());
         Ok(())
     }
 
-    pub fn set_agent_config(&self, id: AgentId, key: impl Into<String>, value: impl Into<String>) -> Result<()> {
+    pub fn set_agent_config(
+        &self,
+        id: AgentId,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Result<()> {
         let mut g = self.lock()?;
         let agent = g.agents.get_mut(&id).ok_or(Error::UnknownAgent(id))?;
         agent.config.insert(key.into(), value.into());
@@ -607,7 +653,9 @@ impl Session {
         let mut g = self.store.lock()?;
         match &member {
             Member::User(id) if !g.users.contains_key(id) => return Err(Error::UnknownUser(*id)),
-            Member::Agent(id) if !g.agents.contains_key(id) => return Err(Error::UnknownAgent(*id)),
+            Member::Agent(id) if !g.agents.contains_key(id) => {
+                return Err(Error::UnknownAgent(*id))
+            }
             _ => {}
         }
         let data = g
@@ -786,7 +834,12 @@ impl Session {
     /// This is the EventLog primitive. The product path is
     /// [`Self::compact_with_handoff`]: flush Place `handoff.md` first, then
     /// store a summary that *references* Place paths (see `NaiveCompactWithoutHandoff`).
-    pub fn compact(&self, start: EventId, end: EventId, summary: impl Into<String>) -> Result<Event> {
+    pub fn compact(
+        &self,
+        start: EventId,
+        end: EventId,
+        summary: impl Into<String>,
+    ) -> Result<Event> {
         self.append(EventBody::Compact {
             start,
             end,
@@ -908,9 +961,11 @@ impl Session {
                 data.places.insert(place.id, place.clone());
                 return Ok(place);
             }
-            if let Some((&eid, _)) = data.places.iter().find(|(_, p)| {
-                p.provider == place.provider && p.instance == place.instance
-            }) {
+            if let Some((&eid, _)) = data
+                .places
+                .iter()
+                .find(|(_, p)| p.provider == place.provider && p.instance == place.instance)
+            {
                 place.id = eid;
                 data.places.insert(eid, place.clone());
                 return Ok(place);
@@ -1270,7 +1325,10 @@ mod tests {
         let session = store.create_session();
         session.join(Member::Agent(agent.id)).unwrap();
         let binding = session.bind(HostKind::Pi, None, None).unwrap();
-        assert_eq!(session.config().unwrap().get("model").map(String::as_str), Some("sonnet"));
+        assert_eq!(
+            session.config().unwrap().get("model").map(String::as_str),
+            Some("sonnet")
+        );
         session.set_config("model", "opus").unwrap();
         session.set_config("temp", "0").unwrap();
         session.set_config("temp", "1").unwrap();
@@ -1304,7 +1362,9 @@ mod tests {
             Error::NotMember
         ));
         assert!(matches!(
-            session.decide_permission("rm", true, outsider.id).unwrap_err(),
+            session
+                .decide_permission("rm", true, outsider.id)
+                .unwrap_err(),
             Error::NotMember
         ));
         let log = session.events().unwrap();
@@ -1509,7 +1569,6 @@ mod tests {
     }
 }
 
-
 /// Shared-place tests (option A / B, join/leave).
 ///
 /// JUDGE — Environment as a sixth type? **No.** These tests express a place
@@ -1517,6 +1576,7 @@ mod tests {
 /// - share = two Bindings, same `sandbox_id` (option A co-tenant);
 /// - outlive = [`FakeSandbox`] files keyed by that id after leave/unbind;
 /// - a later Binding with the same id sees the files (option B proxy).
+///
 /// Adding `Environment` would only be required if we had to fake a live Binding
 /// or store files on Session. We do neither. Host maps (Paseo folder, MA/Tag
 /// sandbox, Cursor VM/pool) stay behind the id string.
@@ -1534,16 +1594,29 @@ mod environment {
         session.join(Member::Agent(codex.id)).unwrap();
         let place = Some("sb-shared".to_string());
         let b_cc = session
-            .bind_agent(claude.id, HostKind::ClaudeCode, Some("cc-resume".into()), place.clone())
+            .bind_agent(
+                claude.id,
+                HostKind::ClaudeCode,
+                Some("cc-resume".into()),
+                place.clone(),
+            )
             .unwrap();
         let b_cx = session
-            .bind_agent(codex.id, HostKind::Codex, Some("cx-resume".into()), place.clone())
+            .bind_agent(
+                codex.id,
+                HostKind::Codex,
+                Some("cx-resume".into()),
+                place.clone(),
+            )
             .unwrap();
         assert_eq!(b_cc.sandbox_id, b_cx.sandbox_id);
         assert_eq!(b_cc.kind, "claude_code");
         assert_eq!(b_cx.kind, "codex");
         assert_eq!(session.bindings().unwrap().len(), 2);
-        assert_eq!(session.live_sandbox_ids().unwrap(), vec!["sb-shared".to_string()]);
+        assert_eq!(
+            session.live_sandbox_ids().unwrap(),
+            vec!["sb-shared".to_string()]
+        );
 
         session.leave(Member::Agent(claude.id)).unwrap();
         let left = session.bindings().unwrap();
@@ -1551,8 +1624,14 @@ mod environment {
         assert_eq!(left[0].id, b_cx.id);
         assert_eq!(left[0].sandbox_id.as_deref(), Some("sb-shared"));
         assert!(store.session(session.id()).is_ok());
-        assert!(session.members().unwrap().contains(&Member::Agent(codex.id)));
-        assert!(!session.members().unwrap().contains(&Member::Agent(claude.id)));
+        assert!(session
+            .members()
+            .unwrap()
+            .contains(&Member::Agent(codex.id)));
+        assert!(!session
+            .members()
+            .unwrap()
+            .contains(&Member::Agent(claude.id)));
     }
 
     #[test]
@@ -1565,10 +1644,20 @@ mod environment {
         session.join(Member::Agent(codex.id)).unwrap();
         let sid = "sb-proxy";
         let b_cc = session
-            .bind_agent(claude.id, HostKind::ClaudeCode, Some("native-cc".into()), Some(sid.into()))
+            .bind_agent(
+                claude.id,
+                HostKind::ClaudeCode,
+                Some("native-cc".into()),
+                Some(sid.into()),
+            )
             .unwrap();
         let b_cx = session
-            .bind_agent(codex.id, HostKind::Codex, Some("native-cx".into()), Some(sid.into()))
+            .bind_agent(
+                codex.id,
+                HostKind::Codex,
+                Some("native-cx".into()),
+                Some(sid.into()),
+            )
             .unwrap();
         assert_ne!(b_cc.native_resume_id, b_cx.native_resume_id);
         assert_eq!(b_cc.sandbox_id, b_cx.sandbox_id);
@@ -1633,7 +1722,12 @@ mod environment {
         assert!(store.session(session.id()).is_ok());
 
         let again = session
-            .bind_agent(codex.id, HostKind::Codex, Some("native-cx-2".into()), Some(sid.into()))
+            .bind_agent(
+                codex.id,
+                HostKind::Codex,
+                Some("native-cx-2".into()),
+                Some(sid.into()),
+            )
             .unwrap();
         assert_eq!(again.sandbox_id.as_deref(), Some(sid));
         assert_eq!(place.read(sid, "/note.txt"), Some("from-claude"));
