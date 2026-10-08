@@ -350,6 +350,10 @@ struct Inner {
     events: Vec<RemintEvent>,
     next_event: Seq,
     turn_in_flight: bool,
+    /// Local per-`RemintSession` prompt counter, bumped by
+    /// [`RemintSession::begin_turn`]. Not the kernel `TurnId`. A late
+    /// terminal for an older turn never clears a newer one.
+    turn: u64,
     /// In-flight user prompt text (never auto-resubmitted after remint).
     in_flight_prompt: Option<String>,
     /// Live asks on the current Binding — answerable on the wire.
@@ -414,6 +418,7 @@ impl RemintSession {
                 events: Vec::new(),
                 next_event: 1,
                 turn_in_flight: false,
+                turn: 0,
                 in_flight_prompt: None,
                 pending: BTreeMap::new(),
                 resurfaced: BTreeMap::new(),
@@ -586,19 +591,49 @@ impl RemintSession {
         g.attach_cursor = g.events.last().map(|e| e.id).unwrap_or(0);
     }
 
-    pub fn begin_turn(&self, user: &str) {
+    /// Start a prompt turn; returns its turn number for [`Self::turn_ended`]
+    /// / [`Self::complete_turn`]. The number is a local per-session counter,
+    /// not the kernel `TurnId`.
+    pub fn begin_turn(&self, user: &str) -> u64 {
         let mut g = self.inner.lock().unwrap();
         Self::push_event(&mut g, RemintEventKind::User, user);
+        g.turn += 1;
         g.turn_in_flight = true;
         g.in_flight_prompt = Some(user.to_string());
+        g.turn
     }
 
-    pub fn complete_turn(&self, agent: &str) {
+    /// The agent ended `turn` (its `session/prompt` response arrived, e.g.
+    /// `stopReason: "cancelled"` after [`Self::cancel_turn`]). Clears the
+    /// in-flight turn only if `turn` is still the current one; a late
+    /// terminal for an older turn is ignored. Returns whether it applied.
+    /// `turn` is the local counter from [`Self::begin_turn`], not the kernel
+    /// `TurnId`.
+    pub fn turn_ended(&self, turn: u64) -> bool {
         let mut g = self.inner.lock().unwrap();
+        Self::end_turn_if_current(&mut g, turn)
+    }
+
+    /// The agent's final message for `turn`. Same turn check as
+    /// [`Self::turn_ended`]: a late final message for an older turn is
+    /// dropped and never clears a newer one. Returns whether it applied.
+    pub fn complete_turn(&self, turn: u64, agent: &str) -> bool {
+        let mut g = self.inner.lock().unwrap();
+        if !Self::end_turn_if_current(&mut g, turn) {
+            return false;
+        }
         Self::push_event(&mut g, RemintEventKind::Agent, agent);
+        g.attach_cursor = g.events.last().map(|e| e.id).unwrap_or(0);
+        true
+    }
+
+    fn end_turn_if_current(g: &mut Inner, turn: u64) -> bool {
+        if turn != g.turn || !g.turn_in_flight {
+            return false;
+        }
         g.turn_in_flight = false;
         g.in_flight_prompt = None;
-        g.attach_cursor = g.events.last().map(|e| e.id).unwrap_or(0);
+        true
     }
 
     fn host_rpc(g: &Inner, p: &PendingPermission) -> Result<PermissionRpc, RemintError> {
@@ -776,6 +811,10 @@ impl RemintSession {
     ///
     /// Host decisions are recorded first; if one fails ([`RemintError::HostLog`])
     /// no command is returned and both maps are left as they were.
+    ///
+    /// The turn stays in flight: a returned `session/cancel` is not known
+    /// delivered (the wire may be dead). It clears on [`Self::turn_ended`];
+    /// a remint before that still runs Cancel-before-reattach.
     pub fn cancel_turn(&self) -> Result<Vec<AgentCommand>, RemintError> {
         let mut g = self.inner.lock().unwrap();
         for ask in g.pending.values().chain(g.resurfaced.values()) {
@@ -806,8 +845,6 @@ impl RemintSession {
         if g.turn_in_flight {
             Self::push_event(&mut g, RemintEventKind::TurnCancelled, "cancel");
         }
-        g.turn_in_flight = false;
-        g.in_flight_prompt = None;
         Ok(out)
     }
 
@@ -2031,7 +2068,7 @@ mod tests {
         let (s, _, _) = RemintSession::open("sess-1", "S-1", caps_resume());
         let mut peer = FakeAcp::new("S-1");
         peer.shared_tool_call_id = Some("shell-permission");
-        s.begin_turn("work");
+        let turn = s.begin_turn("work");
         ask_via_codec(&s, &mut peer, "t1", "x").unwrap();
         ask_via_codec(&s, &mut peer, "t2", "y").unwrap();
         let cmds = s.cancel_turn().unwrap();
@@ -2047,8 +2084,70 @@ mod tests {
             .iter()
             .all(|(_, o)| o == &serde_json::json!({"outcome": "cancelled"})));
         assert!(peer.methods.iter().any(|m| m == "session/cancel"));
+        assert!(s.turn_in_flight(), "in flight until the prompt response");
+        assert!(s.turn_ended(turn));
         assert!(!s.turn_in_flight());
         assert_maps_empty(&s, "after cancel");
+    }
+
+    /// Cancel is sent but the wire is dead (never delivered). A later
+    /// remint must still Cancel-before-reattach and finalize the tool.
+    #[test]
+    fn cancel_then_remint_with_lost_cancel_still_cancels() {
+        let (s, _, _) = RemintSession::open("sess-1", "S-1", caps_resume());
+        s.begin_turn("work");
+        s.start_tool("t1", "build");
+        let cmds = s.cancel_turn().unwrap();
+        assert!(matches!(cmds.last(), Some(AgentCommand::Abort { .. })));
+        // Abort dropped on the floor: no prompt response ever arrives.
+        let o = s.remint_and_attach().unwrap();
+        assert!(o.turn_interrupted);
+        assert!(o
+            .wire_actions
+            .iter()
+            .any(|a| matches!(a, WireAction::SessionClose | WireAction::SessionCancel)));
+        assert_eq!(o.tools_finalized, 1);
+        assert!(!s.turn_in_flight());
+    }
+
+    /// A late prompt response for cancelled turn N must not clear turn N+1.
+    #[test]
+    fn late_terminal_for_old_turn_leaves_new_turn_in_flight() {
+        let (s, _, _) = RemintSession::open("sess-1", "S-1", caps_resume());
+        let n = s.begin_turn("first");
+        s.cancel_turn().unwrap();
+        let n1 = s.begin_turn("second");
+        assert_ne!(n, n1);
+        assert!(!s.turn_ended(n), "stale terminal ignored");
+        assert!(s.turn_in_flight());
+        assert!(s.turn_ended(n1));
+        assert!(!s.turn_in_flight());
+        assert!(!s.turn_ended(n1), "idempotent");
+    }
+
+    /// Same as above through `complete_turn`: a late final message for
+    /// cancelled turn N is dropped and leaves N+1 (and its prompt) intact.
+    #[test]
+    fn late_complete_turn_for_old_turn_leaves_new_turn_in_flight() {
+        let (s, _, _) = RemintSession::open("sess-1", "S-1", caps_resume());
+        let n = s.begin_turn("first");
+        s.cancel_turn().unwrap();
+        let n1 = s.begin_turn("second");
+        let events_before = s.inner.lock().unwrap().events.len();
+        assert!(
+            !s.complete_turn(n, "late reply for first"),
+            "stale final dropped"
+        );
+        assert!(s.turn_in_flight());
+        {
+            let g = s.inner.lock().unwrap();
+            assert_eq!(g.in_flight_prompt.as_deref(), Some("second"));
+            assert_eq!(g.events.len(), events_before, "stale text not logged");
+        }
+        assert!(s.complete_turn(n1, "reply for second"));
+        assert!(!s.turn_in_flight());
+        assert!(s.inner.lock().unwrap().in_flight_prompt.is_none());
+        assert!(!s.complete_turn(n1, "dup"), "idempotent");
     }
 
     /// Remint with asks in flight, twice. Old Binding's rpc ids are dead:
