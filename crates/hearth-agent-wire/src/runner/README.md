@@ -32,7 +32,10 @@ Never `session/new` under that Session. Never `session/load` as fallback
 `resolve_permission(binding, rpc_id, option_id)` returns the
 `ReplyPermission` to write on that same id; an `optionId` the agent did not
 offer → `OptionNotOffered`. `cancel_turn` answers every live ask
-`cancelled`, then `session/cancel`.
+`cancelled`, then `session/cancel`; the turn stays in flight until
+`turn_ended(turn)` (the prompt response), so a remint after a lost cancel
+still runs Cancel-before-reattach, and a late response for an older turn
+never clears a newer one.
 
 On remint the old Binding's asks move to *resurfaced* (still healthy HITL —
 no cancel / finalize, also on a second remint). A dead Binding's rpc id is
