@@ -511,8 +511,11 @@ mod tests {
     }
 
     fn acp_stdio_command() -> Option<std::process::Command> {
-        let toy = std::path::Path::new("/workspace/experiments/2026-10-05-hearth/agent.mjs");
-        if toy.is_file() {
+        let toy_dir = std::path::Path::new("/workspace/experiments/2026-10-05-hearth");
+        let toy = toy_dir.join("agent.mjs");
+        // The toy imports its deps: agent.mjs alone (node_modules pruned)
+        // cannot run, so treat it as absent and skip like no agent at all.
+        if toy.is_file() && toy_dir.join("node_modules").is_dir() {
             let node_ok = std::process::Command::new("node")
                 .arg("--version")
                 .stdout(std::process::Stdio::null())
@@ -522,7 +525,7 @@ mod tests {
                 .unwrap_or(false);
             if node_ok {
                 let mut cmd = std::process::Command::new("node");
-                cmd.arg(toy);
+                cmd.arg(&toy);
                 return Some(cmd);
             }
         }
