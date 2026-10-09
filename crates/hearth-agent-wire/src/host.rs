@@ -36,6 +36,17 @@ pub enum AttachError {
     /// Agent reused a JSON-RPC id that is still awaiting a response.
     #[error("permission ask rpc id {0} is already pending")]
     DuplicateRpcId(RpcId),
+    /// A Host `PermissionDecided` is already on the EventLog for this ask
+    /// (its wire reply is still owed) and the retry names a different
+    /// outcome. `decided` is the stashed optionId (`None` = cancelled).
+    #[error(
+        "permission ask {rpc_id} already decided as {decided:?}; retry asked for {requested:?}"
+    )]
+    AlreadyDecided {
+        rpc_id: RpcId,
+        decided: Option<String>,
+        requested: Option<String>,
+    },
 }
 
 /// One in-flight JSON-RPC permission ask the agent is blocked on.
@@ -47,8 +58,11 @@ pub struct PendingAsk {
     pub title: String,
     pub options: Vec<PermissionOption>,
     /// Host `PermissionDecided` already on the EventLog while the wire reply
-    /// is still owed (send failed). Retries must not decide again.
-    decided: Option<Event>,
+    /// is still owed (send failed), with the `allowed` / `optionId` it
+    /// recorded (`None` = cancelled). Retries must not decide again, and
+    /// every wire reply for this ask is built from this stash so the log
+    /// and the wire never disagree.
+    decided: Option<(Event, bool, Option<String>)>,
 }
 
 impl PendingAsk {
@@ -318,6 +332,23 @@ impl<A: CodingAgent> HostAttach<A> {
         }
     }
 
+    /// Wire reply for one ask: `optionId: Some` → `selected`, `None` →
+    /// `cancelled`. Callers pass the stashed Host decision when there is one.
+    fn permission_reply(
+        &self,
+        rpc_id: &RpcId,
+        allowed: bool,
+        option_id: Option<String>,
+    ) -> AgentCommand {
+        AgentCommand::ReplyPermission {
+            session_id: self.wire_session(),
+            permission_id: rpc_id.to_string(),
+            allow: allowed,
+            option_id,
+            rpc_id: Some(rpc_id.clone()),
+        }
+    }
+
     /// Answer one ask on its JSON-RPC id with `{outcome:"selected", optionId}`.
     ///
     /// Order (Pep, PR #16): validate → occupancy check + Host
@@ -332,7 +363,8 @@ impl<A: CodingAgent> HostAttach<A> {
     /// If the send itself fails, the decision is already on the EventLog
     /// (it cannot be un-appended) but the ask stays pending for a retry.
     /// A retry reuses that Host decision — it does not append a second
-    /// `PermissionDecided`.
+    /// `PermissionDecided`. A retry with the same `option_id` re-sends the
+    /// stashed reply; a different one is [`AttachError::AlreadyDecided`].
     pub fn answer_permission(
         &mut self,
         session: &Session,
@@ -346,8 +378,18 @@ impl<A: CodingAgent> HostAttach<A> {
             .get(&key)
             .cloned()
             .ok_or_else(|| AttachError::UnknownPermission(rpc_id.clone()))?;
-        let ev = match ask.decided.clone() {
-            Some(ev) => ev,
+        let (ev, allowed, wire_option) = match ask.decided.clone() {
+            Some((ev, allowed, stashed)) => {
+                // Retry: only the same outcome may re-send.
+                if stashed.as_deref() != Some(option_id) {
+                    return Err(AttachError::AlreadyDecided {
+                        rpc_id: rpc_id.clone(),
+                        decided: stashed,
+                        requested: Some(option_id.into()),
+                    });
+                }
+                (ev, allowed, stashed)
+            }
             None => {
                 let Some(opt) = ask.offers(option_id) else {
                     return Err(AttachError::OptionNotOffered {
@@ -356,33 +398,23 @@ impl<A: CodingAgent> HostAttach<A> {
                     });
                 };
                 let allowed = option_allows(opt);
+                let wire_option = Some(option_id.to_string());
                 // require_user + append BEFORE anything reaches the wire.
                 let ev = session.decide_permission_rpc(
                     ask.title.clone(),
                     allowed,
                     by,
                     self.permission_rpc(&ask),
-                    Some(option_id.into()),
+                    wire_option.clone(),
                 )?;
                 if let Some(p) = self.pending.get_mut(&key) {
-                    p.decided = Some(ev.clone());
+                    p.decided = Some((ev.clone(), allowed, wire_option.clone()));
                 }
-                ev
+                (ev, allowed, wire_option)
             }
         };
-        let (allowed, wire_option) = match &ev.body {
-            EventBody::PermissionDecided {
-                allowed, option_id, ..
-            } => (*allowed, option_id.clone()),
-            _ => unreachable!("decided stash is always PermissionDecided"),
-        };
-        self.coding.send(AgentCommand::ReplyPermission {
-            session_id: self.wire_session(),
-            permission_id: rpc_id.to_string(),
-            allow: allowed,
-            option_id: wire_option,
-            rpc_id: Some(rpc_id.clone()),
-        })?;
+        self.coding
+            .send(self.permission_reply(rpc_id, allowed, wire_option))?;
         self.pending.remove(&key);
         Ok(ev)
     }
@@ -390,6 +422,10 @@ impl<A: CodingAgent> HostAttach<A> {
     /// Cancel the turn: answer **every** pending ask on this Binding with
     /// `{outcome:"cancelled"}` (ACP MUST), then send [`AgentCommand::Abort`]
     /// (`session/cancel`). Returns the Host decisions recorded.
+    ///
+    /// An ask that already has a stashed Host decision (an earlier answer
+    /// whose send failed) is replied from that stash — `selected` with the
+    /// stashed optionId — so the EventLog and the wire agree.
     ///
     /// Decisions (occupancy check + `PermissionDecided`) are recorded per
     /// ask and stashed on the pending entry before any frame is sent, so a
@@ -401,10 +437,13 @@ impl<A: CodingAgent> HostAttach<A> {
     pub fn cancel(&mut self, session: &Session, by: UserId) -> AttachResult<Vec<Event>> {
         let asks = self.pending_permissions();
         let mut out = Vec::with_capacity(asks.len());
+        let mut replies = Vec::with_capacity(asks.len());
         for ask in &asks {
             let key = (self.binding.id, ask.rpc_id.clone());
-            let ev = match self.pending.get(&key).and_then(|a| a.decided.clone()) {
-                Some(ev) => ev,
+            let (ev, allowed, wire_option) = match ask.decided.clone() {
+                // Already decided (e.g. a failed answer_permission): the
+                // wire reply follows the stash, not `cancelled`.
+                Some(stashed) => stashed,
                 None => {
                     let ev = session.decide_permission_rpc(
                         ask.title.clone(),
@@ -414,22 +453,18 @@ impl<A: CodingAgent> HostAttach<A> {
                         None,
                     )?;
                     if let Some(p) = self.pending.get_mut(&key) {
-                        p.decided = Some(ev.clone());
+                        p.decided = Some((ev.clone(), false, None));
                     }
-                    ev
+                    (ev, false, None)
                 }
             };
             out.push(ev);
+            replies.push((ask.rpc_id.clone(), allowed, wire_option));
         }
-        for ask in &asks {
-            self.coding.send(AgentCommand::ReplyPermission {
-                session_id: self.wire_session(),
-                permission_id: ask.rpc_id.to_string(),
-                allow: false,
-                option_id: None,
-                rpc_id: Some(ask.rpc_id.clone()),
-            })?;
-            self.pending.remove(&(self.binding.id, ask.rpc_id.clone()));
+        for (rpc_id, allowed, wire_option) in replies {
+            self.coding
+                .send(self.permission_reply(&rpc_id, allowed, wire_option))?;
+            self.pending.remove(&(self.binding.id, rpc_id));
         }
         match self.coding.send(AgentCommand::Abort {
             session_id: self.wire_session(),
@@ -1144,5 +1179,126 @@ mod tests {
         assert_eq!(out[1]["id"], 8);
         assert_eq!(out[2]["method"], "session/cancel");
         assert!(attach.pending_permissions().is_empty());
+    }
+
+    /// Every Host `PermissionDecided` for rpc id `rpc` as `(allowed, optionId)`.
+    fn decisions_for(session: &Session, rpc: &str) -> Vec<(bool, Option<String>)> {
+        session
+            .events()
+            .unwrap()
+            .into_iter()
+            .filter_map(|e| match e.body {
+                EventBody::PermissionDecided {
+                    allowed,
+                    option_id,
+                    rpc: Some(r),
+                    ..
+                } if r.rpc_id == rpc => Some((allowed, option_id)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Pep Must (PR #18): answer(allow-once) fails to send, then cancel.
+    /// The stashed ask is replied `selected allow-once` (not `cancelled`),
+    /// the log holds exactly one PermissionDecided for it, and they agree.
+    /// An undecided sibling ask is still cancelled; session/cancel goes last.
+    #[test]
+    fn cancel_after_failed_answer_replies_stashed_decision() {
+        let (_store, user, agent, session) = room();
+        let mut attach = acp_attach_failing(&session, agent.id, 1);
+        push_ask_failing(&mut attach, serde_json::json!(4), "call_1");
+        push_ask_failing(&mut attach, serde_json::json!(5), "call_2");
+        attach.drain(&session).unwrap();
+
+        let err = attach
+            .answer_permission(&session, user.id, &RpcId::Num(4), "allow-once")
+            .unwrap_err();
+        assert!(matches!(err, AttachError::Bus(BusError::Transport(_))));
+        assert!(attach.coding.inner.transport().outbound().is_empty());
+
+        let decided = attach.cancel(&session, user.id).unwrap();
+        assert_eq!(decided.len(), 2);
+        assert!(attach.pending_permissions().is_empty());
+
+        let log4 = decisions_for(&session, "4");
+        assert_eq!(log4, vec![(true, Some("allow-once".to_string()))]);
+        assert_eq!(decisions_for(&session, "5"), vec![(false, None)]);
+        assert_eq!(decided_count(&session), 2);
+
+        let out = attach.coding.inner.transport().outbound().to_vec();
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0]["id"], 4);
+        assert_eq!(
+            out[0]["result"]["outcome"],
+            serde_json::json!({"outcome": "selected", "optionId": "allow-once"}),
+            "wire must match the stashed log decision"
+        );
+        assert_eq!(out[0]["result"]["outcome"]["optionId"], "allow-once");
+        assert_eq!(
+            log4[0].1.as_deref(),
+            out[0]["result"]["outcome"]["optionId"].as_str()
+        );
+        assert_eq!(out[1]["id"], 5);
+        assert_eq!(
+            out[1]["result"]["outcome"],
+            serde_json::json!({"outcome": "cancelled"})
+        );
+        assert_eq!(out[2]["method"], "session/cancel");
+    }
+
+    /// Pep Should (PR #18): a retry naming a different outcome than the
+    /// stash is `AlreadyDecided` (nothing sent, ask kept); the same option
+    /// re-sends. A cancelled stash refuses a later selected answer too.
+    #[test]
+    fn answer_retry_with_different_option_is_already_decided() {
+        let (_store, user, agent, session) = room();
+        let mut attach = acp_attach_failing(&session, agent.id, 1);
+        push_ask_failing(&mut attach, serde_json::json!(4), "call_1");
+        attach.drain(&session).unwrap();
+
+        attach
+            .answer_permission(&session, user.id, &RpcId::Num(4), "allow-once")
+            .unwrap_err();
+        let err = attach
+            .answer_permission(&session, user.id, &RpcId::Num(4), "reject-once")
+            .unwrap_err();
+        assert!(matches!(
+            &err,
+            AttachError::AlreadyDecided { rpc_id: RpcId::Num(4), decided: Some(d), requested: Some(r) }
+                if d == "allow-once" && r == "reject-once"
+        ));
+        assert!(attach.coding.inner.transport().outbound().is_empty());
+        assert_eq!(attach.pending_permissions().len(), 1);
+        assert_eq!(decided_count(&session), 1);
+
+        attach
+            .answer_permission(&session, user.id, &RpcId::Num(4), "allow-once")
+            .unwrap();
+        let out = attach.coding.inner.transport().outbound().to_vec();
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0]["result"]["outcome"],
+            serde_json::json!({"outcome": "selected", "optionId": "allow-once"})
+        );
+        assert_eq!(
+            decisions_for(&session, "4"),
+            vec![(true, Some("allow-once".to_string()))]
+        );
+
+        // Cancelled stash (cancel send failed) → a selected answer is refused.
+        let mut attach = acp_attach_failing(&session, agent.id, 1);
+        push_ask_failing(&mut attach, serde_json::json!(9), "call_9");
+        attach.drain(&session).unwrap();
+        attach.cancel(&session, user.id).unwrap_err();
+        let err = attach
+            .answer_permission(&session, user.id, &RpcId::Num(9), "allow-once")
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AttachError::AlreadyDecided { decided: None, .. }
+        ));
+        assert!(attach.coding.inner.transport().outbound().is_empty());
+        assert_eq!(decisions_for(&session, "9"), vec![(false, None)]);
     }
 }
