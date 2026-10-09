@@ -39,13 +39,16 @@ pub enum AttachError {
 }
 
 /// One in-flight JSON-RPC permission ask the agent is blocked on.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PendingAsk {
     pub rpc_id: RpcId,
     /// Display / correlation only — not unique (copilot-cli #989).
     pub tool_call_id: Option<String>,
     pub title: String,
     pub options: Vec<PermissionOption>,
+    /// Host `PermissionDecided` already on the EventLog while the wire reply
+    /// is still owed (send failed). Retries must not decide again.
+    decided: Option<Event>,
 }
 
 impl PendingAsk {
@@ -328,6 +331,8 @@ impl<A: CodingAgent> HostAttach<A> {
     ///
     /// If the send itself fails, the decision is already on the EventLog
     /// (it cannot be un-appended) but the ask stays pending for a retry.
+    /// A retry reuses that Host decision — it does not append a second
+    /// `PermissionDecided`.
     pub fn answer_permission(
         &mut self,
         session: &Session,
@@ -341,26 +346,41 @@ impl<A: CodingAgent> HostAttach<A> {
             .get(&key)
             .cloned()
             .ok_or_else(|| AttachError::UnknownPermission(rpc_id.clone()))?;
-        let Some(opt) = ask.offers(option_id) else {
-            return Err(AttachError::OptionNotOffered {
-                rpc_id: rpc_id.clone(),
-                option_id: option_id.into(),
-            });
+        let ev = match ask.decided.clone() {
+            Some(ev) => ev,
+            None => {
+                let Some(opt) = ask.offers(option_id) else {
+                    return Err(AttachError::OptionNotOffered {
+                        rpc_id: rpc_id.clone(),
+                        option_id: option_id.into(),
+                    });
+                };
+                let allowed = option_allows(opt);
+                // require_user + append BEFORE anything reaches the wire.
+                let ev = session.decide_permission_rpc(
+                    ask.title.clone(),
+                    allowed,
+                    by,
+                    self.permission_rpc(&ask),
+                    Some(option_id.into()),
+                )?;
+                if let Some(p) = self.pending.get_mut(&key) {
+                    p.decided = Some(ev.clone());
+                }
+                ev
+            }
         };
-        let allowed = option_allows(opt);
-        // require_user + append BEFORE anything reaches the wire.
-        let ev = session.decide_permission_rpc(
-            ask.title.clone(),
-            allowed,
-            by,
-            self.permission_rpc(&ask),
-            Some(option_id.into()),
-        )?;
+        let (allowed, wire_option) = match &ev.body {
+            EventBody::PermissionDecided {
+                allowed, option_id, ..
+            } => (*allowed, option_id.clone()),
+            _ => unreachable!("decided stash is always PermissionDecided"),
+        };
         self.coding.send(AgentCommand::ReplyPermission {
             session_id: self.wire_session(),
             permission_id: rpc_id.to_string(),
             allow: allowed,
-            option_id: Some(option_id.into()),
+            option_id: wire_option,
             rpc_id: Some(rpc_id.clone()),
         })?;
         self.pending.remove(&key);
@@ -371,22 +391,35 @@ impl<A: CodingAgent> HostAttach<A> {
     /// `{outcome:"cancelled"}` (ACP MUST), then send [`AgentCommand::Abort`]
     /// (`session/cancel`). Returns the Host decisions recorded.
     ///
-    /// Decisions (occupancy check + `PermissionDecided`) are all recorded
-    /// before any frame is sent, so a `by` who does not occupy the Session
-    /// fails on the first ask: typed error, nothing sent, nothing written,
-    /// every ask stays pending. Each pending entry is dropped only after
-    /// its cancelled reply was sent.
+    /// Decisions (occupancy check + `PermissionDecided`) are recorded per
+    /// ask and stashed on the pending entry before any frame is sent, so a
+    /// `by` who does not occupy the Session fails on the first undecided
+    /// ask: typed error, nothing sent for that ask, every ask stays pending.
+    /// Each pending entry is dropped only after its cancelled reply was
+    /// sent. A send failure leaves decided asks pending; a retry reuses
+    /// those Host decisions and does not append a second `PermissionDecided`.
     pub fn cancel(&mut self, session: &Session, by: UserId) -> AttachResult<Vec<Event>> {
         let asks = self.pending_permissions();
         let mut out = Vec::with_capacity(asks.len());
         for ask in &asks {
-            out.push(session.decide_permission_rpc(
-                ask.title.clone(),
-                false,
-                by,
-                self.permission_rpc(ask),
-                None,
-            )?);
+            let key = (self.binding.id, ask.rpc_id.clone());
+            let ev = match self.pending.get(&key).and_then(|a| a.decided.clone()) {
+                Some(ev) => ev,
+                None => {
+                    let ev = session.decide_permission_rpc(
+                        ask.title.clone(),
+                        false,
+                        by,
+                        self.permission_rpc(ask),
+                        None,
+                    )?;
+                    if let Some(p) = self.pending.get_mut(&key) {
+                        p.decided = Some(ev.clone());
+                    }
+                    ev
+                }
+            };
+            out.push(ev);
         }
         for ask in &asks {
             self.coding.send(AgentCommand::ReplyPermission {
@@ -466,6 +499,7 @@ impl<A: CodingAgent> HostAttach<A> {
                         tool_call_id: tool_item_id.clone(),
                         title: title.clone(),
                         options: options.clone(),
+                        decided: None,
                     },
                 );
                 Ok(appended)
@@ -962,6 +996,149 @@ mod tests {
         assert_eq!(decided.len(), 2);
         assert_eq!(decided_count(&session), 2);
         let out = attach.coding.transport().outbound().to_vec();
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0]["id"], 7);
+        assert_eq!(out[1]["id"], 8);
+        assert_eq!(out[2]["method"], "session/cancel");
+        assert!(attach.pending_permissions().is_empty());
+    }
+
+    /// CodingAgent that fails the next N `send`s, then proxies.
+    struct FailSend<A> {
+        inner: A,
+        remaining_failures: usize,
+    }
+
+    impl<A: CodingAgent> CodingAgent for FailSend<A> {
+        fn kind(&self) -> AgentKind {
+            self.inner.kind()
+        }
+        fn send(&mut self, cmd: AgentCommand) -> Result<(), BusError> {
+            if self.remaining_failures > 0 {
+                self.remaining_failures -= 1;
+                return Err(BusError::Transport("injected send failure".into()));
+            }
+            self.inner.send(cmd)
+        }
+        fn try_recv(&mut self) -> Result<Option<AgentEvent>, BusError> {
+            self.inner.try_recv()
+        }
+    }
+
+    type AcpFramed = crate::FramedAgent<crate::JsonlRpcTransport, crate::adapters::acp::AcpCodec>;
+
+    fn acp_attach_failing(
+        session: &Session,
+        agent: AgentId,
+        fail_sends: usize,
+    ) -> HostAttach<FailSend<AcpFramed>> {
+        let binding = session
+            .bind_host(
+                Some(agent),
+                host_for(AgentKind::Acp, Some("S-1".into()), None),
+            )
+            .unwrap();
+        HostAttach::attach(
+            binding,
+            agent,
+            FailSend {
+                inner: crate::FramedAgent::new(
+                    crate::JsonlRpcTransport::without_rpc_chunks(),
+                    crate::adapters::acp::AcpCodec,
+                ),
+                remaining_failures: fail_sends,
+            },
+        )
+    }
+
+    fn push_ask_failing(
+        attach: &mut HostAttach<FailSend<AcpFramed>>,
+        rpc_id: serde_json::Value,
+        tool_call_id: &str,
+    ) {
+        let raw = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": rpc_id,
+            "method": "session/request_permission",
+            "params": {
+                "sessionId": "S-1",
+                "toolCall": {"toolCallId": tool_call_id, "title": "bash"},
+                "options": [
+                    {"optionId": "allow-once", "name": "Allow", "kind": "allow_once"},
+                    {"optionId": "reject-once", "name": "Reject", "kind": "reject_once"}
+                ]
+            }
+        });
+        attach
+            .coding
+            .inner
+            .transport_mut()
+            .push_bytes(&crate::JsonlRpcTransport::encode_jsonl(&raw).unwrap());
+    }
+
+    /// Send failure after Host decide must not double `PermissionDecided` on retry.
+    #[test]
+    fn answer_permission_send_retry_does_not_double_decide() {
+        let (_store, user, agent, session) = room();
+        let mut attach = acp_attach_failing(&session, agent.id, 1);
+        push_ask_failing(&mut attach, serde_json::json!(4), "call_1");
+        attach.drain(&session).unwrap();
+
+        let err = attach
+            .answer_permission(&session, user.id, &RpcId::Num(4), "allow-once")
+            .unwrap_err();
+        assert!(matches!(err, AttachError::Bus(BusError::Transport(_))));
+        assert_eq!(attach.pending_permissions().len(), 1, "ask stays for retry");
+        assert_eq!(decided_count(&session), 1, "Host decide landed once");
+        assert!(attach.coding.inner.transport().outbound().is_empty());
+
+        attach
+            .answer_permission(&session, user.id, &RpcId::Num(4), "allow-once")
+            .unwrap();
+        assert!(attach.pending_permissions().is_empty());
+        assert_eq!(
+            decided_count(&session),
+            1,
+            "retry must not append a second PermissionDecided"
+        );
+        let out = attach.coding.inner.transport().outbound();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["id"], 4);
+        assert_eq!(
+            out[0]["result"]["outcome"],
+            serde_json::json!({"outcome": "selected", "optionId": "allow-once"})
+        );
+    }
+
+    /// Cancel send failure after Host decide must not double `PermissionDecided`.
+    #[test]
+    fn cancel_send_retry_does_not_double_decide() {
+        let (_store, user, agent, session) = room();
+        // Fail the first cancelled reply send; decisions for both asks are
+        // recorded first, then sends begin.
+        let mut attach = acp_attach_failing(&session, agent.id, 1);
+        push_ask_failing(&mut attach, serde_json::json!(7), "call_ctrl");
+        push_ask_failing(&mut attach, serde_json::json!(8), "toolu_sub");
+        attach.drain(&session).unwrap();
+
+        let err = attach.cancel(&session, user.id).unwrap_err();
+        assert!(matches!(err, AttachError::Bus(BusError::Transport(_))));
+        assert_eq!(
+            attach.pending_permissions().len(),
+            2,
+            "nothing dropped on fail"
+        );
+        assert_eq!(decided_count(&session), 2, "both Host decides landed");
+        assert!(attach.coding.inner.transport().outbound().is_empty());
+
+        let decided = attach.cancel(&session, user.id).unwrap();
+        assert_eq!(decided.len(), 2);
+        assert_eq!(
+            decided_count(&session),
+            2,
+            "retry must not append more PermissionDecided"
+        );
+        let out = attach.coding.inner.transport().outbound().to_vec();
         assert_eq!(out.len(), 3);
         assert_eq!(out[0]["id"], 7);
         assert_eq!(out[1]["id"], 8);
