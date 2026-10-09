@@ -77,6 +77,9 @@ transport decode problem, not an event.
 cancel-before-reattach, permission resurface, tool finalize, truncated
 resync, stale-teardown skip, fail-closed guard) is `runner::remint`.
 Binding ids stay Host-owned via `HostAttach`.
+`HostAttach::bind` / `loopback` claim through `Session::rebind` and refuse a
+second live Binding (`BindingOwnerChanged`); to reconnect an existing Session
+use `HostAttach::attach` / `resume`, or `runner::remint` to swap Bindings.
 
 ## Review bar
 

@@ -236,7 +236,9 @@ impl<A: CodingAgent> HostAttach<A> {
     /// Mint Binding once via [`Session::bind_host`], then attach. Further
     /// reconnects must use [`Self::attach`] / [`Self::resume`].
     pub fn bind(session: &Session, agent: AgentId, host: Host, coding: A) -> AttachResult<Self> {
-        let binding = session.bind_host(Some(agent), host)?;
+        // Same claim point as every rebind path: refuses (no duplicate) if
+        // the agent already has a live Binding — reconnect via attach.
+        let binding = session.rebind(None, agent, host)?;
         Ok(Self::attach(binding, agent, coding))
     }
 
@@ -281,6 +283,9 @@ impl<A: CodingAgent> HostAttach<A> {
     }
 
     /// Occupancy-checked UserMessage on the Session, then outbound command.
+    /// Prompt submit rechecks, under the store lock, that this attach's
+    /// Binding still owns the Session (not reminted away); a stale attach
+    /// gets [`hearth::Error::UnknownBinding`] and nothing is sent.
     pub fn user_message(
         &mut self,
         session: &Session,
@@ -288,7 +293,7 @@ impl<A: CodingAgent> HostAttach<A> {
         text: impl Into<String>,
     ) -> AttachResult<Event> {
         let text = text.into();
-        let ev = session.user_message(user, text.clone())?;
+        let ev = session.user_message_on(self.binding.id, user, text.clone())?;
         self.coding.send(AgentCommand::UserMessage {
             session_id: self.wire_session(),
             text,
@@ -304,7 +309,7 @@ impl<A: CodingAgent> HostAttach<A> {
         text: impl Into<String>,
     ) -> AttachResult<Event> {
         let text = text.into();
-        let ev = session.user_message(user, text.clone())?;
+        let ev = session.user_message_on(self.binding.id, user, text.clone())?;
         self.coding.send(AgentCommand::Steer {
             session_id: self.wire_session(),
             text,
@@ -1300,5 +1305,24 @@ mod tests {
         ));
         assert!(attach.coding.inner.transport().outbound().is_empty());
         assert_eq!(decisions_for(&session, "9"), vec![(false, None)]);
+    }
+
+    /// Prompt submit on an attach whose Binding was reminted away is
+    /// refused under the store lock; nothing is logged or sent.
+    #[test]
+    fn stale_attach_prompt_submit_refused_after_rebind() {
+        let (_store, user, agent, session) = room();
+        let mut attach = HostAttach::loopback(&session, agent.id, AgentKind::Codex).unwrap();
+        let old = attach.binding().id;
+        // Second bind for the same agent is refused, not duplicated.
+        assert!(HostAttach::loopback(&session, agent.id, AgentKind::Codex).is_err());
+        session
+            .rebind(Some(old), agent.id, host_for(AgentKind::Codex, None, None))
+            .unwrap();
+        let n = session.events().unwrap().len();
+        assert!(attach.user_message(&session, user.id, "late").is_err());
+        assert!(attach.steer(&session, user.id, "late").is_err());
+        assert_eq!(session.events().unwrap().len(), n);
+        assert_eq!(session.bindings().unwrap().len(), 1);
     }
 }

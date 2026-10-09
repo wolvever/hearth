@@ -373,7 +373,14 @@ struct Inner {
     host_session: HostSession,
     host_agent: AgentId,
     host_user: UserId,
+    /// Test seam: runs inside `remint_and_attach` between the Binding
+    /// snapshot and the claim, to inject a competing rebind.
+    #[cfg(test)]
+    before_claim: Option<BeforeClaim>,
 }
+
+#[cfg(test)]
+type BeforeClaim = Box<dyn FnOnce(&HostSession, Option<hearth::BindingId>) + Send>;
 
 /// Host-owned remint state for AttachRunner. Session-first: remint never
 /// mints `session/new` under an existing Session.
@@ -401,8 +408,9 @@ impl RemintSession {
             .expect("join remint agent");
         let agent_session_id: AgentSessionId = agent_session_id.into();
         let host_binding = host_session
-            .bind_host(
-                Some(host_agent.id),
+            .rebind(
+                None,
+                host_agent.id,
                 Host::from_bind("acp", Some(agent_session_id.clone()), None),
             )
             .expect("bind remint host");
@@ -432,6 +440,8 @@ impl RemintSession {
                 host_session,
                 host_agent: host_agent.id,
                 host_user: host_user.id,
+                #[cfg(test)]
+                before_claim: None,
             }),
         };
         (store, session_id, binding_id)
@@ -791,10 +801,10 @@ impl RemintSession {
             RemintEventKind::PermissionResolved(ask.as_ref()),
             option_id,
         );
-        if g.pending.is_empty() && g.resurfaced.is_empty() {
-            g.turn_in_flight = false;
-            g.in_flight_prompt = None;
-        }
+        // Answering the last ask does NOT end the turn: the agent resumes
+        // the tool and is still mid-turn. Only its terminal
+        // (`turn_ended` / `complete_turn`, keyed by turn) clears it, so a
+        // later remint still runs Cancel-before-reattach (10-10).
         Ok(AgentCommand::ReplyPermission {
             session_id: g.agent_session_id.clone(),
             permission_id: rpc_id.to_string(),
@@ -979,17 +989,47 @@ impl RemintSession {
 
         // Cancel-before-reattach (09-28): mid-turn orphan only.
         // Rehydrate-pending-permission (09-29): do NOT cancel healthy HITL.
-        if mid_turn {
-            let action = if g.live_caps.close {
-                WireAction::SessionClose
-            } else if g.live_caps.cancel {
-                WireAction::SessionCancel
-            } else {
-                let reason = RemintError::CancelNotSupported;
-                Self::push_event(&mut g, RemintEventKind::FailClosed, reason.as_event_text());
-                Self::mark_interrupted_if_in_flight(&mut g, reason.as_event_text());
-                return Err(reason);
-            };
+        let cancel_action = if !mid_turn {
+            None
+        } else if g.live_caps.close {
+            Some(WireAction::SessionClose)
+        } else if g.live_caps.cancel {
+            Some(WireAction::SessionCancel)
+        } else {
+            let reason = RemintError::CancelNotSupported;
+            Self::push_event(&mut g, RemintEventKind::FailClosed, reason.as_event_text());
+            Self::mark_interrupted_if_in_flight(&mut g, reason.as_event_text());
+            return Err(reason);
+        };
+
+        // Remint Binding swap (10-10). Lock order for every rebind path:
+        // RemintSession.inner -> hearth store (inside `Session::rebind`).
+        // The claim rechecks that the snapshotted old Binding still owns the
+        // agent, binds the new Binding, and only then releases the old one —
+        // one store lock, so no window with no Binding and no duplicate. On
+        // failure nothing below has run: remint state is unchanged. Slow
+        // teardown of the old wire (the returned `wire_actions`) happens in
+        // the caller after this lock is dropped.
+        let old_host = g.host_bindings.get(&g.binding_id).copied();
+        #[cfg(test)]
+        if let Some(hook) = g.before_claim.take() {
+            hook(&g.host_session, old_host);
+        }
+        let host_agent = g.host_agent;
+        let host_binding = g
+            .host_session
+            .rebind(
+                old_host,
+                host_agent,
+                Host::from_bind("acp", Some(g.agent_session_id.clone()), None),
+            )
+            .map_err(|e| {
+                let err = RemintError::HostLog(e.to_string());
+                Self::push_event(&mut g, RemintEventKind::FailClosed, err.as_event_text());
+                err
+            })?;
+
+        if let Some(action) = cancel_action {
             wire_actions.push(action);
             Self::push_event(&mut g, RemintEventKind::TurnCancelled, "mid-turn");
             turn_interrupted = true;
@@ -1027,22 +1067,6 @@ impl RemintSession {
         }
 
         // Remint Binding + AttachResume (09-27). Same agent_session_id.
-        // Host Binding swap first: on failure the remint Binding is unchanged.
-        if let Some(old_host) = g.host_bindings.get(&g.binding_id).copied() {
-            match g.host_session.unbind(old_host) {
-                // Already released (e.g. agent left): release is idempotent.
-                Ok(_) | Err(hearth::Error::UnknownBinding(_)) => {}
-                Err(e) => return Err(RemintError::HostLog(e.to_string())),
-            }
-        }
-        let host_agent = g.host_agent;
-        let host_binding = g
-            .host_session
-            .bind_host(
-                Some(host_agent),
-                Host::from_bind("acp", Some(g.agent_session_id.clone()), None),
-            )
-            .map_err(|e| RemintError::HostLog(e.to_string()))?;
         let new_binding = format!("bind-{}", g.next_binding);
         g.next_binding += 1;
         g.binding_id = new_binding.clone();
@@ -2296,7 +2320,7 @@ mod tests {
         s.cancel_turn().unwrap();
         assert_maps_empty(&s, "after cancel");
 
-        s.begin_turn("c");
+        let turn_c = s.begin_turn("c");
         s.request_permission(RpcId::Num(3), Some("t4"), "x", opts())
             .unwrap();
         let o = s.remint_and_attach().unwrap();
@@ -2306,6 +2330,10 @@ mod tests {
         s.resolve_permission(&o.binding_id, &RpcId::Num(1), "reject-once")
             .unwrap();
         assert_maps_empty(&s, "after remint + re-ask answered");
+        // 10-10: answering the last ask does not end the turn; the agent's
+        // terminal does.
+        assert!(s.turn_in_flight());
+        assert!(s.turn_ended(turn_c));
         assert!(!s.turn_in_flight());
     }
 
@@ -2352,5 +2380,222 @@ mod tests {
         assert!(!peer.hung());
         assert_eq!(decided(&s), 1);
         assert_maps_empty(&s, "after recovery");
+    }
+
+    // ---- 10-10: remint Binding swap (bind-before-release, one claim) ----
+
+    fn live_host_bindings(s: &RemintSession) -> Vec<hearth::BindingId> {
+        let g = s.inner.lock().unwrap();
+        let agent = g.host_agent;
+        g.host_session
+            .bindings()
+            .unwrap()
+            .into_iter()
+            .filter(|b| b.agent == Some(agent))
+            .map(|b| b.id)
+            .collect()
+    }
+
+    fn host_binding_of(s: &RemintSession, bid: &str) -> hearth::BindingId {
+        s.inner.lock().unwrap().host_bindings[bid]
+    }
+
+    /// Replay the Host EventLog: after the first attach the agent must never
+    /// be left with zero live Bindings at any committed prefix.
+    fn assert_no_binding_window(s: &RemintSession) {
+        let mut live = std::collections::HashSet::new();
+        let mut attached_once = false;
+        for e in s.host_events() {
+            match e.body {
+                EventBody::BindingAttached { binding } => {
+                    live.insert(binding);
+                    attached_once = true;
+                }
+                EventBody::BindingReleased { binding } => {
+                    live.remove(&binding);
+                    assert!(
+                        !attached_once || !live.is_empty(),
+                        "EventLog window with no Binding after releasing {binding:?}"
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Starts on the OLD Binding and injects a competing claimant between
+    /// the remint's Binding snapshot and its claim. The competitor behaves
+    /// like Runtime::remint / a fresh attach on main: if it sees no live
+    /// Binding for the agent it binds one. On main 73c5b59 the remint has
+    /// already unbound the old Binding at that point, so the competitor sees
+    /// the window and binds -> two live Bindings after remint (FAILS). With
+    /// the fix the old Binding is still live at the snapshot, the
+    /// competitor stands down, and the swap is atomic (PASSES).
+    #[test]
+    fn remint_swap_from_old_binding_no_window_no_duplicate() {
+        let (s, _, bid) = RemintSession::open("sess-1", "S-1", caps_resume());
+        assert_eq!(bid, "bind-1");
+        let old = host_binding_of(&s, &bid);
+        assert_eq!(live_host_bindings(&s), vec![old], "starts on OLD Binding");
+
+        let agent = s.host_agent_id();
+        let seen = std::sync::Arc::new(Mutex::new(None));
+        let seen_in_hook = seen.clone();
+        s.inner.lock().unwrap().before_claim = Some(Box::new(move |host, _snap| {
+            let live: Vec<_> = host
+                .bindings()
+                .unwrap()
+                .into_iter()
+                .filter(|b| b.agent == Some(agent))
+                .map(|b| b.id)
+                .collect();
+            if live.is_empty() {
+                host.bind_host(Some(agent), Host::from_bind("acp", None, None))
+                    .unwrap();
+            }
+            *seen_in_hook.lock().unwrap() = Some(live);
+        }));
+
+        let o = s.remint_and_attach().unwrap();
+
+        let seen = seen.lock().unwrap().clone().expect("hook ran");
+        assert_eq!(
+            seen,
+            vec![old],
+            "window: no Binding between snapshot and claim"
+        );
+        let new = host_binding_of(&s, &o.binding_id);
+        assert_ne!(new, old);
+        assert_eq!(
+            live_host_bindings(&s),
+            vec![new],
+            "exactly one live Binding (the remint's) after swap"
+        );
+        assert_eq!(s.binding_id(), o.binding_id);
+        assert_eq!(s.transport_owner(), TransportOwner::Binding(o.binding_id));
+        assert_no_binding_window(&s);
+    }
+
+    /// A competing rebind that WINS between snapshot and claim: the
+    /// remint's ownership recheck fails closed, leaves remint state on the
+    /// old Binding and never adds a second live Binding.
+    #[test]
+    fn remint_claim_rechecks_owner_after_competing_rebind() {
+        let (s, _, bid) = RemintSession::open("sess-1", "S-1", caps_resume());
+        let old = host_binding_of(&s, &bid);
+        let agent = s.host_agent_id();
+        let winner = std::sync::Arc::new(Mutex::new(None));
+        let w = winner.clone();
+        s.inner.lock().unwrap().before_claim = Some(Box::new(move |host, snap| {
+            assert_eq!(snap, Some(old));
+            let b = host
+                .rebind(snap, agent, Host::from_bind("acp", None, None))
+                .unwrap();
+            *w.lock().unwrap() = Some(b.id);
+        }));
+        let begin = s.begin_turn("mid");
+        s.start_tool("t1", "bash");
+
+        let err = s.remint_and_attach().unwrap_err();
+        assert!(matches!(err, RemintError::HostLog(_)), "{err:?}");
+        let winner = winner.lock().unwrap().expect("competitor ran");
+        assert_eq!(live_host_bindings(&s), vec![winner], "no duplicate");
+        assert_eq!(s.binding_id(), bid, "remint state unchanged");
+        assert_eq!(s.transport_owner(), TransportOwner::Binding(bid));
+        // Failed claim ran before Cancel-before-reattach side effects.
+        assert!(s.turn_in_flight());
+        assert_eq!(s.interrupted_marker_count("t1"), 0);
+        assert!(s.turn_ended(begin));
+        assert_no_binding_window(&s);
+    }
+
+    /// Two remints back to back: each is a single atomic swap.
+    #[test]
+    fn double_remint_swaps_keep_one_binding() {
+        let (s, _, _) = RemintSession::open("sess-1", "S-1", caps_resume());
+        let a = s.remint_and_attach().unwrap();
+        let b = s.remint_and_attach().unwrap();
+        assert_eq!(
+            live_host_bindings(&s),
+            vec![host_binding_of(&s, &b.binding_id)]
+        );
+        assert_ne!(a.binding_id, b.binding_id);
+        assert_no_binding_window(&s);
+    }
+
+    /// 10-10 resolve_permission finding: answering the LAST ask used to
+    /// clear turn_in_flight, so a remint while the agent was still running
+    /// the approved tool skipped Cancel-before-reattach and left the tool
+    /// orphaned. Fails on main 73c5b59; the turn now stays in flight until
+    /// the agent's terminal (turn_ended / complete_turn).
+    #[test]
+    fn answering_last_ask_keeps_turn_in_flight_for_remint_cancel() {
+        let (s, _, bid) = RemintSession::open("sess-1", "S-1", caps_resume());
+        let turn = s.begin_turn("run it");
+        s.start_tool("t1", "bash");
+        s.request_permission(RpcId::Num(7), Some("t1"), "bash", opts())
+            .unwrap();
+        s.resolve_permission(&bid, &RpcId::Num(7), "allow-once")
+            .unwrap();
+        assert!(s.pending_permissions().is_empty());
+        assert!(
+            s.turn_in_flight(),
+            "agent is still mid-turn after the answer"
+        );
+
+        let o = s.remint_and_attach().unwrap();
+        assert!(o.turn_interrupted, "remint must Cancel-before-reattach");
+        assert_eq!(
+            o.wire_actions,
+            vec![WireAction::SessionClose, WireAction::AttachResume]
+        );
+        assert_eq!(o.tools_finalized, 1);
+        assert_eq!(s.interrupted_marker_count("t1"), 1);
+        assert!(!s.turn_in_flight());
+        // Late terminal for the cancelled turn is a no-op.
+        assert!(!s.turn_ended(turn));
+    }
+
+    /// Terminal keyed by turn clears the flag after an answered ask.
+    #[test]
+    fn answered_ask_turn_clears_on_terminal() {
+        let (s, _, bid) = RemintSession::open("sess-1", "S-1", caps_resume());
+        let turn = s.begin_turn("q");
+        s.request_permission(RpcId::Num(1), Some("t1"), "x", opts())
+            .unwrap();
+        s.resolve_permission(&bid, &RpcId::Num(1), "allow-once")
+            .unwrap();
+        assert!(s.turn_in_flight());
+        assert!(!s.turn_ended(turn + 1), "other turn's terminal ignored");
+        assert!(s.complete_turn(turn, "done"));
+        assert!(!s.turn_in_flight());
+        let o = s.remint_and_attach().unwrap();
+        assert!(!o.turn_interrupted);
+        assert_eq!(o.wire_actions, vec![WireAction::AttachResume]);
+    }
+
+    /// Hermes #53525 lesson: no rebind path may skip the shared claim.
+    /// Non-test code in the rebind paths must not call the raw
+    /// unbind/bind_host pair; `Session::rebind` is the only claim point.
+    #[test]
+    fn rebind_paths_all_go_through_session_rebind() {
+        let srcs = [
+            ("remint.rs", include_str!("remint.rs")),
+            ("host.rs", include_str!("../host.rs")),
+            ("runtime.rs", include_str!("../../../hearth/src/runtime.rs")),
+        ];
+        for (name, src) in srcs {
+            let prod = src.split("#[cfg(test)]\nmod tests").next().unwrap();
+            for raw in [".unbind(", ".bind_host(", ".bind_agent(", ".bind("] {
+                assert!(
+                    !prod.contains(raw),
+                    "{name}: rebind path calls {raw} instead of Session::rebind"
+                );
+            }
+            assert!(
+                prod.contains(".rebind("),
+                "{name}: claim via Session::rebind"
+            );
+        }
     }
 }

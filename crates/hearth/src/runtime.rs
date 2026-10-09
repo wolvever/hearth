@@ -240,6 +240,8 @@ impl Runtime {
 
     /// Idle remint. Refused if a Binding is live or liveness is unknown.
     pub fn remint(&self, session: SessionId) -> Result<crate::BindingId> {
+        // Lock order (all rebind paths): durable gate -> kept -> store.
+        let _gate = self.lock_durable()?;
         let (agent, host) = self.kept_recipe(session)?;
         let sess = self.store.session(session)?;
         ensure_agent_member(&sess, agent)?;
@@ -249,7 +251,7 @@ impl Runtime {
             }
             Liveness::Unknown => Err(Error::Waiting(WaitReason::LivenessUnknown)),
             Liveness::NeverBound | Liveness::PositivelyDead => {
-                Ok(sess.bind_host(Some(agent), host)?.id)
+                Ok(claim_binding(&sess, agent, host)?.id)
             }
         }
     }
@@ -262,6 +264,7 @@ impl Runtime {
     /// Does **not** call [`Session::turn_end`] — the host runner would end the turn later.
     /// Does **not** spawn a real CLI or invent `AgentMessage`.
     pub fn wake(&self, session: SessionId, wake: Wake) -> Result<Vec<Event>> {
+        let _gate = self.lock_durable()?;
         let (agent, host) = self.kept_recipe(session)?;
         let sess = self.store.session(session)?;
         let start_len = sess.events()?.len();
@@ -272,7 +275,7 @@ impl Runtime {
             Liveness::Unknown => return Err(Error::Waiting(WaitReason::LivenessUnknown)),
             Liveness::LiveIdle => {}
             Liveness::NeverBound | Liveness::PositivelyDead => {
-                sess.bind_host(Some(agent), host)?;
+                claim_binding(&sess, agent, host)?;
             }
         }
         record_wake(&sess, &wake)?;
@@ -365,7 +368,7 @@ impl Runtime {
             Liveness::Unknown => return Err(Error::Waiting(WaitReason::LivenessUnknown)),
             Liveness::LiveIdle => {}
             Liveness::NeverBound | Liveness::PositivelyDead => {
-                sess.bind_host(Some(agent), host)?;
+                claim_binding(&sess, agent, host)?;
             }
         }
 
@@ -591,6 +594,17 @@ fn ensure_agent_member(session: &Session, agent: AgentId) -> Result<()> {
         Ok(_) | Err(Error::AlreadyMember) => Ok(()),
         Err(e) => Err(e),
     }
+}
+
+/// Claim a Binding for a NeverBound / PositivelyDead agent. The snapshot
+/// (`classify_session`) is rechecked inside [`Session::rebind`]: a Binding
+/// that appeared since is reported as [`WaitReason::AlreadyLive`], never
+/// duplicated.
+fn claim_binding(session: &Session, agent: AgentId, host: Host) -> Result<crate::Binding> {
+    session.rebind(None, agent, host).map_err(|e| match e {
+        Error::BindingOwnerChanged => Error::Waiting(WaitReason::AlreadyLive),
+        e => e,
+    })
 }
 
 fn binding_for_agent(session: &Session, agent: AgentId) -> Result<BindingId> {
@@ -1348,5 +1362,28 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    /// Rebind paths on Runtime (remint / wake / begin_turn) claim through
+    /// `Session::rebind(None, ..)`: a Binding that appears after the
+    /// classify snapshot is never duplicated.
+    #[test]
+    fn runtime_remint_wake_begin_turn_never_duplicate_binding() {
+        let rt = Runtime::new();
+        let session = rt.create_session();
+        let agent = rt.store().create_agent("scribe", "");
+        rt.keep(session.id(), agent.id, goose()).unwrap();
+        let first = rt.remint(session.id()).unwrap();
+        assert!(matches!(
+            rt.remint(session.id()),
+            Err(Error::Waiting(WaitReason::AlreadyLive))
+        ));
+        assert!(matches!(
+            claim_binding(&session, agent.id, goose()),
+            Err(Error::Waiting(WaitReason::AlreadyLive))
+        ));
+        rt.wake(session.id(), Wake::Timer).unwrap();
+        let live: Vec<_> = session.bindings().unwrap().iter().map(|b| b.id).collect();
+        assert_eq!(live, vec![first]);
     }
 }
