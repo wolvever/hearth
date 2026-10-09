@@ -281,6 +281,10 @@ pub enum Error {
     Waiting(WaitReason),
     #[error("turn lease lost")]
     TurnLeaseLost,
+    /// [`Session::rebind`] ownership recheck failed: the agent's live
+    /// Binding is no longer the one the caller snapshotted.
+    #[error("binding owner changed")]
+    BindingOwnerChanged,
     #[error("session not owned by this holder")]
     SessionNotOwned,
     #[error("live turn is still open")]
@@ -875,6 +879,77 @@ impl Session {
             }
         }
         Ok(out)
+    }
+
+    /// The single claim point for every path that (re)binds an Agent's
+    /// Binding on this Session (wire remint, Runtime remint / wake /
+    /// begin_turn). Under the one store lock it:
+    ///
+    /// 1. rechecks ownership: every live Binding of `agent` must be
+    ///    `expected` (`None` = the caller saw no live Binding). An `expected`
+    ///    that is already released is tolerated (e.g. the agent left).
+    ///    Otherwise [`Error::BindingOwnerChanged`] and nothing changes;
+    /// 2. binds the new Binding (`BindingAttached`);
+    /// 3. only then releases `expected` (`BindingReleased`).
+    ///
+    /// Readers of [`Self::bindings`] never see a window with no Binding nor
+    /// two live Bindings for the agent. Slow teardown of the old wire is the
+    /// caller's job, after its locks are dropped.
+    pub fn rebind(
+        &self,
+        expected: Option<BindingId>,
+        agent: AgentId,
+        host: Host,
+    ) -> Result<Binding> {
+        let binding = host.into_binding(Some(agent));
+        self.write(|data| {
+            let owner_changed = data
+                .bindings
+                .values()
+                .any(|b| b.agent == Some(agent) && Some(b.id) != expected);
+            if owner_changed {
+                return Err(Error::BindingOwnerChanged);
+            }
+            data.bindings.insert(binding.id, binding.clone());
+            data.push(EventBody::BindingAttached {
+                binding: binding.id,
+            });
+            if let Some(old) = expected {
+                if data.bindings.remove(&old).is_some() {
+                    data.push(EventBody::BindingReleased { binding: old });
+                }
+            }
+            Ok(binding)
+        })
+    }
+
+    /// Occupancy-checked UserMessage that also rechecks, under the same
+    /// store lock, that `binding` is still live (prompt submit on a
+    /// reminted-away Binding is refused with [`Error::UnknownBinding`]).
+    pub fn user_message_on(
+        &self,
+        binding: BindingId,
+        user: UserId,
+        text: impl Into<String>,
+    ) -> Result<Event> {
+        let mut g = self.store.lock()?;
+        if !g.users.contains_key(&user) {
+            return Err(Error::UnknownUser(user));
+        }
+        let data = g
+            .sessions
+            .get_mut(&self.id)
+            .ok_or(Error::UnknownSession(self.id))?;
+        if !data.members.contains(&Member::User(user)) {
+            return Err(Error::NotMember);
+        }
+        if !data.bindings.contains_key(&binding) {
+            return Err(Error::UnknownBinding(binding));
+        }
+        Ok(data.push(EventBody::UserMessage {
+            user,
+            text: text.into(),
+        }))
     }
 
     /// Release a binding. The session and its log remain.
@@ -1989,5 +2064,93 @@ mod environment {
         assert_eq!(grok.kind, "grok");
         assert_eq!(grok_build.kind, "grok_build");
         assert_eq!(dsh.agent, Some(agent.id));
+    }
+
+    #[test]
+    fn rebind_binds_new_before_releasing_old_atomically() {
+        let store = InMemory::new();
+        let agent = store.create_agent("a", "");
+        let session = store.create_session();
+        let old = session
+            .rebind(None, agent.id, HostKind::Goose.host(None, None))
+            .unwrap();
+        let new = session
+            .rebind(Some(old.id), agent.id, HostKind::Goose.host(None, None))
+            .unwrap();
+        let live: Vec<_> = session.bindings().unwrap().iter().map(|b| b.id).collect();
+        assert_eq!(live, vec![new.id]);
+        let tail: Vec<_> = session
+            .events()
+            .unwrap()
+            .into_iter()
+            .rev()
+            .take(2)
+            .map(|e| e.body)
+            .collect();
+        assert_eq!(
+            tail,
+            vec![
+                EventBody::BindingReleased { binding: old.id },
+                EventBody::BindingAttached { binding: new.id },
+            ],
+            "attached new, then released old"
+        );
+    }
+
+    #[test]
+    fn rebind_rechecks_owner_and_never_duplicates() {
+        let store = InMemory::new();
+        let agent = store.create_agent("a", "");
+        let session = store.create_session();
+        let first = session
+            .rebind(None, agent.id, HostKind::Goose.host(None, None))
+            .unwrap();
+        // Stale "no Binding" snapshot (Runtime remint / wake / begin_turn).
+        assert!(matches!(
+            session.rebind(None, agent.id, HostKind::Goose.host(None, None)),
+            Err(Error::BindingOwnerChanged)
+        ));
+        // Someone rebound first; our snapshot of `first` is stale.
+        let winner = session
+            .rebind(Some(first.id), agent.id, HostKind::Goose.host(None, None))
+            .unwrap();
+        let n = session.events().unwrap().len();
+        assert!(matches!(
+            session.rebind(Some(first.id), agent.id, HostKind::Goose.host(None, None)),
+            Err(Error::BindingOwnerChanged)
+        ));
+        assert_eq!(
+            session.events().unwrap().len(),
+            n,
+            "failed claim writes nothing"
+        );
+        let live: Vec<_> = session.bindings().unwrap().iter().map(|b| b.id).collect();
+        assert_eq!(live, vec![winner.id]);
+        // Already-released expected with no live owner (agent left) is fine.
+        session.unbind(winner.id).unwrap();
+        session
+            .rebind(Some(winner.id), agent.id, HostKind::Goose.host(None, None))
+            .unwrap();
+        assert_eq!(session.bindings().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn user_message_on_refuses_reminted_away_binding() {
+        let store = InMemory::new();
+        let user = store.create_user("u");
+        let agent = store.create_agent("a", "");
+        let session = store.create_session();
+        session.join(Member::User(user.id)).unwrap();
+        let old = session
+            .rebind(None, agent.id, HostKind::Goose.host(None, None))
+            .unwrap();
+        let new = session
+            .rebind(Some(old.id), agent.id, HostKind::Goose.host(None, None))
+            .unwrap();
+        assert!(matches!(
+            session.user_message_on(old.id, user.id, "stale"),
+            Err(Error::UnknownBinding(_))
+        ));
+        session.user_message_on(new.id, user.id, "ok").unwrap();
     }
 }
