@@ -48,8 +48,9 @@ use hearth::{
 };
 use serde_json::Value;
 
+use crate::adapters::acp::{self, ClientCapabilities, ClientRequestRoute};
 use crate::host::option_allows;
-use crate::{AgentCommand, AgentEvent, PermissionOption, RpcId};
+use crate::{AgentCommand, AgentEvent, BusError, PermissionOption, RpcId};
 
 /// Live agent capabilities from an ACP `initialize` result (not static
 /// catalog flags alone).
@@ -321,6 +322,12 @@ pub struct RemintOutcome {
     pub tools_finalized: usize,
     pub resynced_from_host: bool,
     pub turn_interrupted: bool,
+    /// One `-32800` error per agent→client request that was in flight on
+    /// the OLD Binding. Write them on the old wire BEFORE its teardown
+    /// (`wire_actions`), via [`flush_old_wire_replies`]; they are already
+    /// dropped from Host state, so a dead old wire just loses them — they
+    /// are never retried on the new Binding.
+    pub old_wire_replies: Vec<AgentCommand>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -337,6 +344,24 @@ pub struct TeardownOutcome {
     pub closed: bool,
     pub transport_owner: TransportOwner,
     pub binding_id: BindingId,
+    /// `-32800` per in-flight agent→client request on the closed Binding;
+    /// write before closing the wire (see [`flush_old_wire_replies`]).
+    pub old_wire_replies: Vec<AgentCommand>,
+}
+
+/// Best-effort write of [`RemintOutcome::old_wire_replies`] /
+/// [`TeardownOutcome::old_wire_replies`] on the OLD wire before teardown.
+/// A failed send (old wire already dead) drops that reply: no retry, no
+/// re-route to the new Binding, and teardown is neither blocked nor
+/// failed. Returns how many replies were dropped.
+pub fn flush_old_wire_replies(
+    replies: Vec<AgentCommand>,
+    mut send_old: impl FnMut(AgentCommand) -> Result<(), BusError>,
+) -> usize {
+    replies
+        .into_iter()
+        .filter(|cmd| send_old(cmd.clone()).is_err())
+        .count()
 }
 
 struct Inner {
@@ -360,6 +385,11 @@ struct Inner {
     pending: BTreeMap<PermissionKey, PendingPermission>,
     /// Asks from dead Bindings — shown to the user, never answered on wire.
     resurfaced: BTreeMap<PermissionKey, PendingPermission>,
+    /// What `initialize` advertises; sole gate for agent→client requests.
+    client_caps: ClientCapabilities,
+    /// In-flight agent→client requests (advertised methods only), keyed by
+    /// `(Binding, rpc id)` like permission asks; value is the method.
+    client_requests: BTreeMap<PermissionKey, String>,
     /// Remint Binding id → Host [`hearth::BindingId`] for typed Host Events.
     host_bindings: HashMap<BindingId, hearth::BindingId>,
     attach_cursor: Seq,
@@ -430,6 +460,8 @@ impl RemintSession {
                 in_flight_prompt: None,
                 pending: BTreeMap::new(),
                 resurfaced: BTreeMap::new(),
+                client_caps: ClientCapabilities::HOST,
+                client_requests: BTreeMap::new(),
                 host_bindings,
                 attach_cursor: 0,
                 transport_owner: TransportOwner::Binding(binding_id.clone()),
@@ -465,6 +497,80 @@ impl RemintSession {
 
     pub fn set_live_caps(&self, caps: LiveCaps) {
         self.inner.lock().unwrap().live_caps = caps;
+    }
+
+    pub fn client_capabilities(&self) -> ClientCapabilities {
+        self.inner.lock().unwrap().client_caps
+    }
+
+    /// Override the advertised client capabilities. Only for a Host that
+    /// really implements them; production keeps [`ClientCapabilities::HOST`].
+    pub fn set_client_capabilities(&self, caps: ClientCapabilities) {
+        self.inner.lock().unwrap().client_caps = caps;
+    }
+
+    /// ACP `initialize` request advertising exactly the client capabilities.
+    pub fn initialize_request(&self, rpc_id: &RpcId) -> Value {
+        acp::encode_initialize(rpc_id, self.client_capabilities())
+    }
+
+    /// In-flight agent→client requests, keyed by `(Binding, rpc id)`.
+    pub fn pending_client_requests(&self) -> Vec<(PermissionKey, String)> {
+        self.inner
+            .lock()
+            .unwrap()
+            .client_requests
+            .iter()
+            .map(|(k, m)| (k.clone(), m.clone()))
+            .collect()
+    }
+
+    /// Route an agent→client request with no dedicated route (`fs/*`,
+    /// `terminal/*`, unknown). Returns the reply to write now:
+    /// - not advertised / unknown → `Some(-32601)` on the same id;
+    /// - advertised → tracked on the current Binding, `None` (answered
+    ///   later, or `-32800` on cancel / remint / teardown);
+    /// - notification, response, or a handled method such as
+    ///   `session/request_permission` → `None`, nothing tracked (permission
+    ///   asks go through [`Self::on_permission_ask`]).
+    pub fn on_client_request(&self, ev: &AgentEvent) -> Result<Option<AgentCommand>, RemintError> {
+        let Some((rpc_id, method)) = acp::unrouted_agent_request(ev) else {
+            return Ok(None);
+        };
+        let mut g = self.inner.lock().unwrap();
+        match acp::route_client_request(g.client_caps, &rpc_id, &method) {
+            ClientRequestRoute::Reject(reply) => Ok(Some(reply)),
+            ClientRequestRoute::Track => {
+                if g.closed {
+                    return Err(RemintError::SessionGone);
+                }
+                let key = (g.binding_id.clone(), rpc_id);
+                if g.client_requests.contains_key(&key) {
+                    return Err(RemintError::DuplicateRpcId);
+                }
+                g.client_requests.insert(key, method);
+                Ok(None)
+            }
+        }
+    }
+
+    /// Take every in-flight agent→client request on `binding` as one
+    /// `-32800` reply each. The entries leave the map here, so no id is
+    /// ever answered twice or after its Binding is gone.
+    fn take_client_replies(g: &mut Inner, binding: &str, why: &str) -> Vec<AgentCommand> {
+        let keys: Vec<PermissionKey> = g
+            .client_requests
+            .keys()
+            .filter(|(b, _)| b == binding)
+            .cloned()
+            .collect();
+        keys.into_iter()
+            .filter_map(|k| {
+                g.client_requests
+                    .remove(&k)
+                    .map(|m| acp::cancelled_reply(&k.1, &m, why))
+            })
+            .collect()
     }
 
     pub fn event_count(&self) -> usize {
@@ -849,6 +955,15 @@ impl RemintSession {
                 "cancelled",
             );
         }
+        // In-flight agent→client requests: one -32800 each, before
+        // session/cancel. Only the live Binding has any (remint drained
+        // the old one's), so a dead id is never answered here.
+        let live_bid = g.binding_id.clone();
+        out.extend(Self::take_client_replies(
+            &mut g,
+            &live_bid,
+            "session cancelled",
+        ));
         out.push(AgentCommand::Abort {
             session_id: g.agent_session_id.clone(),
         });
@@ -1029,6 +1144,12 @@ impl RemintSession {
                 err
             })?;
 
+        // In-flight agent→client requests on the old Binding: one -32800
+        // each, for the OLD wire before teardown. Dropped from state now —
+        // never moved to, retried on, or answered by the new Binding.
+        let old_bid = g.binding_id.clone();
+        let old_wire_replies = Self::take_client_replies(&mut g, &old_bid, "binding reminted");
+
         if let Some(action) = cancel_action {
             wire_actions.push(action);
             Self::push_event(&mut g, RemintEventKind::TurnCancelled, "mid-turn");
@@ -1106,6 +1227,7 @@ impl RemintSession {
             tools_finalized,
             resynced_from_host,
             turn_interrupted,
+            old_wire_replies,
         })
     }
 
@@ -1196,8 +1318,11 @@ impl RemintSession {
                 closed: g.closed,
                 transport_owner: g.transport_owner.clone(),
                 binding_id: g.binding_id.clone(),
+                old_wire_replies: Vec::new(),
             };
         }
+        let old_bid = snapshot.old_binding_id.clone();
+        let old_wire_replies = Self::take_client_replies(&mut g, &old_bid, "binding torn down");
         // Idle path: teardown still owns → close + detach.
         g.closed = true;
         g.transport_owner = TransportOwner::Detached;
@@ -1207,6 +1332,7 @@ impl RemintSession {
             closed: true,
             transport_owner: TransportOwner::Detached,
             binding_id: g.binding_id.clone(),
+            old_wire_replies,
         }
     }
 
@@ -1272,6 +1398,10 @@ mod tests {
         ignored: Vec<Value>,
         /// copilot-cli #989: advertise this toolCallId on every ask.
         shared_tool_call_id: Option<&'static str>,
+        /// In-flight agent→client requests (fs/*, terminal/*, …): id → method.
+        requests: BTreeMap<RpcId, String>,
+        /// (method, JSON-RPC error code) per error reply, in delivery order.
+        errors: Vec<(String, i64)>,
     }
 
     impl FakeAcp {
@@ -1284,7 +1414,23 @@ mod tests {
                 got: Vec::new(),
                 ignored: Vec::new(),
                 shared_tool_call_id: None,
+                requests: BTreeMap::new(),
+                errors: Vec::new(),
             }
+        }
+
+        /// Agent → client request (e.g. `fs/read_text_file`); the agent
+        /// blocks on that id until a response or error arrives.
+        fn request(&mut self, method: &str) -> WireFrame {
+            self.next_rpc += 1;
+            let rpc = RpcId::Num(self.next_rpc);
+            self.requests.insert(rpc.clone(), method.into());
+            WireFrame::Json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": rpc.to_json(),
+                "method": method,
+                "params": {"sessionId": self.agent_session_id, "path": "/tmp/x"}
+            }))
         }
 
         fn dispatch(&mut self, method: &str, session: &RemintSession) -> Result<(), RemintError> {
@@ -1339,6 +1485,13 @@ mod tests {
                 self.ignored.push(v);
                 return;
             };
+            if let Some(code) = v.pointer("/error/code").and_then(|c| c.as_i64()) {
+                match self.requests.remove(&rpc) {
+                    Some(method) => self.errors.push((method, code)),
+                    None => self.ignored.push(v),
+                }
+                return;
+            }
             let outcome = v.pointer("/result/outcome").cloned();
             let ok_shape = outcome
                 .as_ref()
@@ -1355,7 +1508,7 @@ mod tests {
         }
 
         fn hung(&self) -> bool {
-            !self.waiting.is_empty()
+            !self.waiting.is_empty() || !self.requests.is_empty()
         }
 
         fn outcome(&self, tool_call_id: &str) -> Option<&Value> {
@@ -2597,5 +2750,175 @@ mod tests {
                 "{name}: claim via Session::rebind"
             );
         }
+    }
+
+    // ---- Agent→client requests (fs/*, terminal/*) — Oct 11 ----
+
+    fn caps_read() -> ClientCapabilities {
+        ClientCapabilities {
+            read_text_file: true,
+            ..ClientCapabilities::HOST
+        }
+    }
+
+    /// Wire path for a generic agent→client request: decode → route →
+    /// write any immediate reply back to the agent.
+    fn request_via_codec(s: &RemintSession, peer: &mut FakeAcp, method: &str) {
+        let frame = peer.request(method);
+        let ev = AcpCodec.decode_event(&frame).unwrap().unwrap();
+        if let Some(reply) = s.on_client_request(&ev).unwrap() {
+            send_via_codec(peer, &reply);
+        }
+    }
+
+    #[test]
+    fn remint_unadvertised_fs_request_gets_method_not_found() {
+        let (s, _, _) = RemintSession::open("sess-A", "agent-1", caps_resume());
+        let mut peer = FakeAcp::new("agent-1");
+        request_via_codec(&s, &mut peer, "fs/read_text_file");
+        request_via_codec(&s, &mut peer, "terminal/create");
+        request_via_codec(&s, &mut peer, "x/unknown");
+        assert_eq!(
+            peer.errors,
+            vec![
+                ("fs/read_text_file".into(), -32601),
+                ("terminal/create".into(), -32601),
+                ("x/unknown".into(), -32601),
+            ]
+        );
+        assert!(!peer.hung(), "nothing hangs");
+        assert!(s.pending_client_requests().is_empty());
+    }
+
+    /// Pep Accept (1): the -32601 fallback skips handled methods —
+    /// request_permission still lands in the pending map.
+    #[test]
+    fn remint_request_permission_not_swallowed_by_fallback() {
+        let (s, _, bid) = RemintSession::open("sess-A", "agent-1", caps_resume());
+        let mut peer = FakeAcp::new("agent-1");
+        let frame = peer.ask("call_1", "bash");
+        let ev = AcpCodec.decode_event(&frame).unwrap().unwrap();
+        assert_eq!(s.on_client_request(&ev).unwrap(), None);
+        s.on_permission_ask(&ev).unwrap();
+        assert_eq!(s.pending_permissions().len(), 1);
+        assert_eq!(s.pending_permissions()[0].binding, bid);
+        assert!(peer.errors.is_empty() && peer.ignored.is_empty());
+    }
+
+    #[test]
+    fn remint_in_flight_request_answered_once_on_old_wire() {
+        let (s, _, old_bid) = RemintSession::open("sess-A", "agent-1", caps_resume());
+        s.set_client_capabilities(caps_read());
+        let mut old_peer = FakeAcp::new("agent-1");
+        request_via_codec(&s, &mut old_peer, "fs/read_text_file");
+        assert_eq!(s.pending_client_requests().len(), 1);
+        assert_eq!(s.pending_client_requests()[0].0 .0, old_bid);
+        assert!(old_peer.hung(), "advertised request is in flight");
+
+        let out = s.remint_and_attach().unwrap();
+        assert_eq!(out.old_wire_replies.len(), 1);
+        assert!(s.pending_client_requests().is_empty());
+        let dropped = flush_old_wire_replies(out.old_wire_replies, |cmd| {
+            send_via_codec(&mut old_peer, &cmd);
+            Ok(())
+        });
+        assert_eq!(dropped, 0);
+        assert_eq!(old_peer.errors, vec![("fs/read_text_file".into(), -32800)]);
+        assert!(!old_peer.hung(), "nothing hangs");
+
+        // Never again: a later cancel on the new Binding answers nothing.
+        let mut new_peer = FakeAcp::new("agent-1");
+        for cmd in s.cancel_turn().unwrap() {
+            send_via_codec(&mut new_peer, &cmd);
+        }
+        assert!(new_peer.errors.is_empty() && new_peer.ignored.is_empty());
+        let again = s.remint_and_attach().unwrap();
+        assert!(again.old_wire_replies.is_empty(), "never answered twice");
+    }
+
+    /// Pep Accept (2): old wire already dead — the reply is dropped, not
+    /// retried on the new Binding, and remint succeeds.
+    #[test]
+    fn remint_dead_old_wire_drops_in_flight_request() {
+        let (s, _, old_bid) = RemintSession::open("sess-A", "agent-1", caps_resume());
+        s.set_client_capabilities(caps_read());
+        let mut old_peer = FakeAcp::new("agent-1");
+        request_via_codec(&s, &mut old_peer, "fs/read_text_file");
+
+        let out = s.remint_and_attach().expect("remint succeeds");
+        assert_ne!(out.binding_id, old_bid);
+        let mut attempts = 0;
+        let dropped = flush_old_wire_replies(out.old_wire_replies, |_| {
+            attempts += 1;
+            Err(BusError::Transport("old wire dead".into()))
+        });
+        assert_eq!((attempts, dropped), (1, 1), "one try, then dropped");
+        assert!(s.pending_client_requests().is_empty(), "request dropped");
+
+        let mut new_peer = FakeAcp::new("agent-1");
+        for cmd in s.cancel_turn().unwrap() {
+            send_via_codec(&mut new_peer, &cmd);
+        }
+        assert!(new_peer.errors.is_empty(), "nothing on the new Binding");
+        assert!(new_peer.ignored.is_empty(), "nothing on the new Binding");
+        assert_eq!(new_peer.methods, vec!["session/cancel".to_string()]);
+    }
+
+    #[test]
+    fn cancel_turn_answers_in_flight_request_once_before_session_cancel() {
+        let (s, _, _) = RemintSession::open("sess-A", "agent-1", caps_resume());
+        s.set_client_capabilities(caps_read());
+        let mut peer = FakeAcp::new("agent-1");
+        request_via_codec(&s, &mut peer, "fs/read_text_file");
+        let cmds = s.cancel_turn().unwrap();
+        assert!(matches!(
+            cmds.as_slice(),
+            [
+                AgentCommand::ReplyError { code: -32800, .. },
+                AgentCommand::Abort { .. }
+            ]
+        ));
+        for cmd in &cmds {
+            send_via_codec(&mut peer, cmd);
+        }
+        assert_eq!(peer.errors, vec![("fs/read_text_file".into(), -32800)]);
+        assert!(!peer.hung());
+        let again = s.cancel_turn().unwrap();
+        assert!(
+            again
+                .iter()
+                .all(|c| !matches!(c, AgentCommand::ReplyError { .. })),
+            "never answered twice"
+        );
+    }
+
+    #[test]
+    fn teardown_answers_in_flight_request_once() {
+        let (s, _, bid) = RemintSession::open("sess-A", "agent-1", caps_resume());
+        s.set_client_capabilities(caps_read());
+        let mut peer = FakeAcp::new("agent-1");
+        request_via_codec(&s, &mut peer, "fs/read_text_file");
+        let snap = s.snapshot_teardown_for_binding(&bid);
+        let out = s.apply_teardown(&snap);
+        assert!(out.closed);
+        assert_eq!(out.old_wire_replies.len(), 1);
+        flush_old_wire_replies(out.old_wire_replies, |cmd| {
+            send_via_codec(&mut peer, &cmd);
+            Ok(())
+        });
+        assert_eq!(peer.errors, vec![("fs/read_text_file".into(), -32800)]);
+        assert!(!peer.hung());
+        assert!(s.pending_client_requests().is_empty());
+    }
+
+    #[test]
+    fn remint_initialize_advertises_host_set() {
+        let (s, _, _) = RemintSession::open("sess-A", "agent-1", caps_resume());
+        let init = s.initialize_request(&RpcId::Num(0));
+        assert_eq!(init["method"], "initialize");
+        assert_eq!(
+            init["params"]["clientCapabilities"],
+            serde_json::json!({"fs": {"readTextFile": false, "writeTextFile": false}, "terminal": false})
+        );
     }
 }

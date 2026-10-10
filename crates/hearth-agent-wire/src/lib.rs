@@ -107,6 +107,14 @@ pub enum AgentCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         rpc_id: Option<RpcId>,
     },
+    /// JSON-RPC **error** response on an agent→client request id (ACP:
+    /// `-32601` for a method the client did not advertise, `-32800` for a
+    /// request cancelled by session cancel / Binding remint or teardown).
+    ReplyError {
+        rpc_id: RpcId,
+        code: i64,
+        message: String,
+    },
     ReplyQuestion {
         session_id: SessionId,
         question_id: QuestionId,
@@ -166,6 +174,7 @@ impl AgentCommand {
             Self::Steer { .. } => "Steer",
             Self::Abort { .. } => "Abort",
             Self::ReplyPermission { .. } => "ReplyPermission",
+            Self::ReplyError { .. } => "ReplyError",
             Self::ReplyQuestion { .. } => "ReplyQuestion",
             Self::Compact { .. } => "Compact",
             Self::SpawnTask { .. } => "SpawnTask",

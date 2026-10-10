@@ -42,6 +42,31 @@ until the client answers **that id** (ACP v1 tool-calls):
   #989 reuses `"shell-permission"`) and never by a single "expected" id
   (claude-agent-acp #851).
 
+## Agent→client requests (fs / terminal)
+
+ACP agents must check `clientCapabilities` from `initialize` before calling
+`fs/read_text_file`, `fs/write_text_file` or `terminal/*`; the client owns
+the reply. Earlier these requests decoded as `AgentEvent::Native` and got
+**no reply**, so an agent could hang mid-turn. Now:
+
+- `ClientCapabilities::HOST` is what Host truly implements: **nothing** today,
+  so `initialize` advertises `fs.readTextFile: false`, `fs.writeTextFile:
+  false`, `terminal: false` (`encode_initialize`). No stub handlers. The same
+  struct is the only gate for routing below.
+- An agent→client request (has `id` + `method`) for a method not advertised,
+  or an unknown method, gets an immediate JSON-RPC error on the same id:
+  `-32601` method not found (`AgentCommand::ReplyError`). Notifications (no
+  id) and responses get no reply. Handled requests
+  (`HANDLED_AGENT_REQUESTS`: `session/request_permission`) never fall
+  through to `-32601` — they still go to the pending-ask map.
+- Requests for advertised methods are tracked in flight by `(Binding, rpc
+  id)`. On session cancel each gets exactly one `-32800` before
+  `session/cancel`; on Binding remint / teardown each gets one `-32800`
+  for the OLD wire before teardown (`old_wire_replies`,
+  `flush_old_wire_replies`). If the old wire is already dead the reply is
+  dropped — never retried on the new Binding, never answered twice, and
+  remint / teardown still succeed.
+
 ## Fixtures
 
 | File | Maps to |

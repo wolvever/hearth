@@ -231,6 +231,132 @@ pub fn permission_response(rpc_id: &RpcId, option_id: Option<&str>) -> Value {
     })
 }
 
+/// JSON-RPC "method not found" (ACP: unadvertised / unknown agent→client request).
+pub const METHOD_NOT_FOUND: i64 = -32601;
+/// JSON-RPC "request cancelled": in-flight agent→client request closed by
+/// session cancel or Binding remint / teardown.
+pub const REQUEST_CANCELLED: i64 = -32800;
+
+/// Agent→client JSON-RPC requests Host already routes elsewhere (the
+/// permission pending map). These never fall through to `-32601`.
+pub const HANDLED_AGENT_REQUESTS: &[&str] = &["session/request_permission"];
+
+/// What the client advertises in `initialize.clientCapabilities`, and the
+/// single source of truth for which agent→client requests Host accepts.
+///
+/// [`Self::HOST`] is what Host truly implements today: nothing. Host has no
+/// file-system or terminal handler, so every flag is `false` and every
+/// `fs/*` / `terminal/*` request is answered `-32601` at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ClientCapabilities {
+    pub read_text_file: bool,
+    pub write_text_file: bool,
+    pub terminal: bool,
+}
+
+impl ClientCapabilities {
+    /// Host's real implemented set (none today). No stubs.
+    pub const HOST: Self = Self {
+        read_text_file: false,
+        write_text_file: false,
+        terminal: false,
+    };
+
+    /// `clientCapabilities` JSON for `initialize`.
+    pub fn to_json(self) -> Value {
+        serde_json::json!({
+            "fs": {
+                "readTextFile": self.read_text_file,
+                "writeTextFile": self.write_text_file,
+            },
+            "terminal": self.terminal,
+        })
+    }
+
+    /// Whether an agent→client request `method` is covered by this set.
+    pub fn advertises(self, method: &str) -> bool {
+        match method {
+            "fs/read_text_file" => self.read_text_file,
+            "fs/write_text_file" => self.write_text_file,
+            m if m.starts_with("terminal/") => self.terminal,
+            _ => false,
+        }
+    }
+}
+
+/// Client `initialize` request advertising exactly `caps`.
+pub fn encode_initialize(rpc_id: &RpcId, caps: ClientCapabilities) -> Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": rpc_id.to_json(),
+        "method": "initialize",
+        "params": {
+            "protocolVersion": 1,
+            "clientCapabilities": caps.to_json(),
+        },
+    })
+}
+
+/// JSON-RPC error response on `rpc_id`.
+pub fn error_response(rpc_id: &RpcId, code: i64, message: &str) -> Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": rpc_id.to_json(),
+        "error": {"code": code, "message": message},
+    })
+}
+
+/// An agent→client JSON-RPC request Host has no dedicated route for
+/// (decoded as [`AgentEvent::Native`] with a `method` and an `id`).
+/// Notifications (no id) and responses (no method) return `None`, and so
+/// do [`HANDLED_AGENT_REQUESTS`].
+pub fn unrouted_agent_request(ev: &AgentEvent) -> Option<(RpcId, String)> {
+    let AgentEvent::Native { payload, .. } = ev else {
+        return None;
+    };
+    let method = payload.get("method")?.as_str()?;
+    if HANDLED_AGENT_REQUESTS.contains(&method) {
+        return None;
+    }
+    let rpc_id = RpcId::from_json(payload.get("id")?)?;
+    Some((rpc_id, method.to_string()))
+}
+
+/// Host's decision for one unrouted agent→client request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClientRequestRoute {
+    /// Advertised: track in flight until answered / cancelled.
+    Track,
+    /// Not advertised or unknown: answer this `-32601` now.
+    Reject(AgentCommand),
+}
+
+/// Route an unrouted agent→client request against the advertised set.
+pub fn route_client_request(
+    caps: ClientCapabilities,
+    rpc_id: &RpcId,
+    method: &str,
+) -> ClientRequestRoute {
+    if caps.advertises(method) {
+        ClientRequestRoute::Track
+    } else {
+        ClientRequestRoute::Reject(AgentCommand::ReplyError {
+            rpc_id: rpc_id.clone(),
+            code: METHOD_NOT_FOUND,
+            message: format!("method not found: {method} (not advertised by client)"),
+        })
+    }
+}
+
+/// `-32800` reply closing one in-flight agent→client request.
+pub fn cancelled_reply(rpc_id: &RpcId, method: &str, why: &str) -> AgentCommand {
+    AgentCommand::ReplyError {
+        rpc_id: rpc_id.clone(),
+        code: REQUEST_CANCELLED,
+        message: format!("{method} cancelled: {why}"),
+    }
+}
+
 /// Encode an outbound command as an ACP JSON-RPC frame.
 ///
 /// [`AgentCommand::ReplyPermission`] encodes a JSON-RPC **response** on its
@@ -259,6 +385,11 @@ pub fn encode_frame(cmd: &AgentCommand) -> Result<WireFrame, BusError> {
                 option_id.as_deref(),
             )));
         }
+        AgentCommand::ReplyError {
+            rpc_id,
+            code,
+            message,
+        } => return Ok(WireFrame::Json(error_response(rpc_id, *code, message))),
         AgentCommand::Abort { session_id } => (
             "session/cancel",
             serde_json::json!({ "sessionId": session_id }),
