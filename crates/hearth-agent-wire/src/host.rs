@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 
+use crate::adapters::acp::{self, ClientCapabilities, ClientRequestRoute};
 use crate::{
     AgentCommand, AgentEvent, AgentKind, BusError, CodingAgent, LoopbackAgent, PermissionOption,
     RpcId,
@@ -33,8 +34,9 @@ pub enum AttachError {
     /// The reply names an optionId the agent did not offer on that ask.
     #[error("optionId {option_id:?} was not offered on permission ask {rpc_id}")]
     OptionNotOffered { rpc_id: RpcId, option_id: String },
-    /// Agent reused a JSON-RPC id that is still awaiting a response.
-    #[error("permission ask rpc id {0} is already pending")]
+    /// Agent reused a JSON-RPC id that is still awaiting a response
+    /// (permission ask or other in-flight agent→client request).
+    #[error("agent request rpc id {0} is already pending")]
     DuplicateRpcId(RpcId),
     /// A Host `PermissionDecided` is already on the EventLog for this ask
     /// (its wire reply is still owed) and the retry names a different
@@ -212,6 +214,12 @@ pub struct HostAttach<A: CodingAgent> {
     coding: A,
     native_session: Option<String>,
     pending: HashMap<(BindingId, RpcId), PendingAsk>,
+    /// What `initialize` advertises; the only set of agent→client methods
+    /// Host accepts. Defaults to [`ClientCapabilities::HOST`] (none).
+    client_caps: ClientCapabilities,
+    /// In-flight agent→client requests for advertised methods, keyed like
+    /// permission asks by `(Binding, rpc id)`; value is the method.
+    client_requests: HashMap<(BindingId, RpcId), String>,
 }
 
 impl<A: CodingAgent> HostAttach<A> {
@@ -224,7 +232,53 @@ impl<A: CodingAgent> HostAttach<A> {
             coding,
             native_session,
             pending: HashMap::new(),
+            client_caps: ClientCapabilities::HOST,
+            client_requests: HashMap::new(),
         }
+    }
+
+    /// Override the advertised client capabilities. Only for a Host that
+    /// really implements them; production uses [`ClientCapabilities::HOST`].
+    pub fn with_client_capabilities(mut self, caps: ClientCapabilities) -> Self {
+        self.client_caps = caps;
+        self
+    }
+
+    pub fn client_capabilities(&self) -> ClientCapabilities {
+        self.client_caps
+    }
+
+    /// ACP `initialize` request advertising exactly [`Self::client_capabilities`].
+    pub fn initialize_request(&self, rpc_id: &RpcId) -> serde_json::Value {
+        acp::encode_initialize(rpc_id, self.client_caps)
+    }
+
+    /// In-flight agent→client requests on this Binding, ordered by rpc id.
+    pub fn pending_client_requests(&self) -> Vec<(RpcId, String)> {
+        let mut v: Vec<(RpcId, String)> = self
+            .client_requests
+            .iter()
+            .filter(|((b, _), _)| *b == self.binding.id)
+            .map(|((_, id), m)| (id.clone(), m.clone()))
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// Error-reply (`-32800`) every in-flight agent→client request on this
+    /// Binding, exactly once each: an entry is dropped right after its reply
+    /// is sent, so a retry after a send failure never answers twice.
+    fn close_client_requests(&mut self, why: &str) -> AttachResult<()> {
+        for (rpc_id, method) in self.pending_client_requests() {
+            self.coding
+                .send(acp::cancelled_reply(&rpc_id, &method, why))?;
+            self.client_requests.remove(&(self.binding.id, rpc_id));
+        }
+        Ok(())
+    }
+
+    fn speaks_acp(&self) -> bool {
+        matches!(self.coding.kind(), AgentKind::Acp | AgentKind::GrokBuild)
     }
 
     /// Resume is attach: same Binding id, same native resume token if present.
@@ -471,6 +525,9 @@ impl<A: CodingAgent> HostAttach<A> {
                 .send(self.permission_reply(&rpc_id, allowed, wire_option))?;
             self.pending.remove(&(self.binding.id, rpc_id));
         }
+        // In-flight agent→client requests get one -32800 each, before
+        // session/cancel (same order as permission asks).
+        self.close_client_requests("session cancelled")?;
         match self.coding.send(AgentCommand::Abort {
             session_id: self.wire_session(),
         }) {
@@ -543,6 +600,24 @@ impl<A: CodingAgent> HostAttach<A> {
                     },
                 );
                 Ok(appended)
+            }
+            AgentEvent::Native { .. } if self.speaks_acp() => {
+                // Agent→client request with no dedicated route (fs/*,
+                // terminal/*, unknown). session/request_permission is
+                // decoded as PermissionAsk above and never reaches here.
+                if let Some((rpc_id, method)) = acp::unrouted_agent_request(&ev) {
+                    match acp::route_client_request(self.client_caps, &rpc_id, &method) {
+                        ClientRequestRoute::Reject(reply) => self.coding.send(reply)?,
+                        ClientRequestRoute::Track => {
+                            let key = (self.binding.id, rpc_id.clone());
+                            if self.client_requests.contains_key(&key) {
+                                return Err(AttachError::DuplicateRpcId(rpc_id));
+                            }
+                            self.client_requests.insert(key, method);
+                        }
+                    }
+                }
+                Ok(vec![])
             }
             _ => {
                 let mut appended = Vec::new();
@@ -1324,5 +1399,162 @@ mod tests {
         assert!(attach.steer(&session, user.id, "late").is_err());
         assert_eq!(session.events().unwrap().len(), n);
         assert_eq!(session.bindings().unwrap().len(), 1);
+    }
+
+    // ---- Agent→client requests (fs/*, terminal/*) — Oct 11 ----
+
+    fn push_raw(attach: &mut HostAttach<AcpFramed>, raw: serde_json::Value) {
+        attach
+            .coding
+            .transport_mut()
+            .push_bytes(&crate::JsonlRpcTransport::encode_jsonl(&raw).unwrap());
+    }
+
+    fn agent_request(id: serde_json::Value, method: &str) -> serde_json::Value {
+        serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method,
+            "params": {"sessionId": "S-1", "path": "/etc/hosts"}})
+    }
+
+    #[test]
+    fn acp_initialize_advertises_exactly_implemented_set() {
+        let (_store, _user, agent, session) = room();
+        let attach = acp_attach(&session, agent.id);
+        assert_eq!(attach.client_capabilities(), ClientCapabilities::HOST);
+        let init = attach.initialize_request(&RpcId::Num(0));
+        assert_eq!(init["method"], "initialize");
+        assert_eq!(init["id"], 0);
+        assert_eq!(
+            init["params"]["clientCapabilities"],
+            serde_json::json!({"fs": {"readTextFile": false, "writeTextFile": false},
+                "terminal": false})
+        );
+        // Same struct gates routing: what is advertised is what is accepted.
+        for m in ["fs/read_text_file", "fs/write_text_file", "terminal/create"] {
+            assert!(!ClientCapabilities::HOST.advertises(m), "{m}");
+        }
+    }
+
+    /// Key test (fails on main: the request got no reply at all).
+    #[test]
+    fn acp_unadvertised_fs_read_gets_method_not_found() {
+        let (_store, _user, agent, session) = room();
+        let mut attach = acp_attach(&session, agent.id);
+        push_raw(
+            &mut attach,
+            agent_request(serde_json::json!(41), "fs/read_text_file"),
+        );
+        attach.drain(&session).unwrap();
+        let out = attach.coding.transport().outbound().to_vec();
+        assert_eq!(out.len(), 1, "exactly one reply, never silence: {out:?}");
+        assert_eq!(out[0]["id"], 41);
+        assert_eq!(out[0]["error"]["code"], -32601);
+        assert!(out[0].get("result").is_none());
+        assert!(attach.pending_client_requests().is_empty());
+    }
+
+    #[test]
+    fn acp_unknown_method_and_terminal_get_error() {
+        let (_store, _user, agent, session) = room();
+        let mut attach = acp_attach(&session, agent.id);
+        push_raw(
+            &mut attach,
+            agent_request(serde_json::json!("t-1"), "terminal/create"),
+        );
+        push_raw(
+            &mut attach,
+            agent_request(serde_json::json!(2), "fs/write_text_file"),
+        );
+        push_raw(
+            &mut attach,
+            agent_request(serde_json::json!(3), "vendor/whatever"),
+        );
+        attach.drain(&session).unwrap();
+        let out = attach.coding.transport().outbound().to_vec();
+        let got: Vec<(serde_json::Value, serde_json::Value)> = out
+            .iter()
+            .map(|f| (f["id"].clone(), f["error"]["code"].clone()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (serde_json::json!("t-1"), serde_json::json!(-32601)),
+                (serde_json::json!(2), serde_json::json!(-32601)),
+                (serde_json::json!(3), serde_json::json!(-32601)),
+            ]
+        );
+    }
+
+    #[test]
+    fn acp_notification_gets_no_reply() {
+        let (_store, _user, agent, session) = room();
+        let mut attach = acp_attach(&session, agent.id);
+        push_raw(
+            &mut attach,
+            serde_json::json!({"jsonrpc": "2.0", "method": "fs/read_text_file",
+                "params": {"sessionId": "S-1", "path": "/x"}}),
+        );
+        push_raw(
+            &mut attach,
+            serde_json::json!({"jsonrpc": "2.0", "method": "vendor/ping", "params": {}}),
+        );
+        // A response from the agent (id, no method) is not a request either.
+        push_raw(
+            &mut attach,
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {}}),
+        );
+        attach.drain(&session).unwrap();
+        assert!(attach.coding.transport().outbound().is_empty());
+    }
+
+    /// Pep Accept (1): request_permission still lands in pending with the
+    /// -32601 fallback in place; no error reply goes out.
+    #[test]
+    fn acp_request_permission_still_pending_with_fallback() {
+        let (_store, _user, agent, session) = room();
+        let mut attach = acp_attach(&session, agent.id);
+        push_ask(&mut attach, serde_json::json!(5), "call_1");
+        push_raw(
+            &mut attach,
+            agent_request(serde_json::json!(6), "fs/read_text_file"),
+        );
+        attach.drain(&session).unwrap();
+        let pending = attach.pending_permissions();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].rpc_id, RpcId::Num(5));
+        let out = attach.coding.transport().outbound().to_vec();
+        assert_eq!(out.len(), 1, "only the fs request is rejected");
+        assert_eq!(out[0]["id"], 6);
+        assert!(out.iter().all(|f| f["id"] != 5));
+    }
+
+    #[test]
+    fn acp_cancel_answers_in_flight_request_once() {
+        let (_store, user, agent, session) = room();
+        let caps = ClientCapabilities {
+            read_text_file: true,
+            ..ClientCapabilities::HOST
+        };
+        let mut attach = acp_attach(&session, agent.id).with_client_capabilities(caps);
+        push_ask(&mut attach, serde_json::json!(7), "call_ctrl");
+        push_raw(
+            &mut attach,
+            agent_request(serde_json::json!(8), "fs/read_text_file"),
+        );
+        attach.drain(&session).unwrap();
+        assert!(attach.coding.transport().outbound().is_empty(), "tracked");
+        assert_eq!(attach.pending_client_requests().len(), 1);
+
+        attach.cancel(&session, user.id).unwrap();
+        let out = attach.coding.transport().outbound().to_vec();
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0]["id"], 7);
+        assert_eq!(out[1]["id"], 8);
+        assert_eq!(out[1]["error"]["code"], -32800);
+        assert_eq!(out[2]["method"], "session/cancel");
+        assert!(attach.pending_client_requests().is_empty());
+
+        attach.cancel(&session, user.id).unwrap();
+        let out = attach.coding.transport().outbound().to_vec();
+        assert_eq!(out.iter().filter(|f| f["id"] == 8).count(), 1, "once");
     }
 }
