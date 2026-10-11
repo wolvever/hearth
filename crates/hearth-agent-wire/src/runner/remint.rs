@@ -364,6 +364,57 @@ pub fn flush_old_wire_replies(
         .count()
 }
 
+/// Result of [`flush_and_teardown_old_wire`]: how many in-flight replies
+/// were dropped on a dead old wire, and whether the caller still owes
+/// [`WireAction::AttachResume`] on the NEW Binding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OldWireFlush {
+    pub dropped: usize,
+    pub needs_attach_resume: bool,
+}
+
+/// Production OLD-wire path after [`RemintSession::remint_and_attach`].
+///
+/// Order is load-bearing:
+/// 1. [`flush_old_wire_replies`] — one try each; dead wire drops the reply
+/// 2. `SessionClose` / `SessionCancel` from `wire_actions`
+///
+/// [`WireAction::AttachResume`] is **not** written here — it belongs on the
+/// NEW Binding after teardown. Dead-wire failures never block remint and
+/// never retry on the new Binding.
+pub fn flush_and_teardown_old_wire(
+    outcome: RemintOutcome,
+    mut send_old: impl FnMut(AgentCommand) -> Result<(), BusError>,
+    mut write_old_rpc: impl FnMut(Value) -> Result<(), BusError>,
+    next_rpc_id: &mut u64,
+) -> OldWireFlush {
+    let agent_session_id = outcome.agent_session_id.clone();
+    let dropped = flush_old_wire_replies(outcome.old_wire_replies, &mut send_old);
+    let mut needs_attach_resume = false;
+    for action in outcome.wire_actions {
+        match action {
+            WireAction::AttachResume => needs_attach_resume = true,
+            WireAction::SessionCancel => {
+                let id = *next_rpc_id;
+                *next_rpc_id = next_rpc_id.saturating_add(1);
+                let rpc = encode_remint_rpc(RemintWireMethod::SessionCancel, &agent_session_id, id);
+                let _ = write_old_rpc(rpc);
+            }
+            WireAction::SessionClose => {
+                let id = *next_rpc_id;
+                *next_rpc_id = next_rpc_id.saturating_add(1);
+                let rpc = encode_remint_rpc(RemintWireMethod::SessionClose, &agent_session_id, id);
+                let _ = write_old_rpc(rpc);
+            }
+            WireAction::None => {}
+        }
+    }
+    OldWireFlush {
+        dropped,
+        needs_attach_resume,
+    }
+}
+
 struct Inner {
     session_id: SessionId,
     binding_id: BindingId,

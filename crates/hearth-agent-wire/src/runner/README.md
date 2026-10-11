@@ -8,6 +8,8 @@ Host-adjacent spawn / pump / remint. **Not a kernel noun.**
 | `transport_for_wire` | ACP `jsonl-rpc` → `JsonlRpcTransport::without_rpc_chunks()` |
 | `remint::RemintSession` | Binding remint policy (09-27…10-02 + 10-06 fail-closed) |
 | `remint::LiveCaps` | Gate resume on live `initialize` caps |
+| `AttachRunner::initialize_host` | Live attach: send ACP `initialize` with `ClientCapabilities::HOST` (all false), wait for result |
+| `AttachRunner::flush_and_teardown_after_remint` | Flush `old_wire_replies` then SessionClose/Cancel on the OLD wire |
 
 ## Remint (fail-closed)
 
@@ -44,6 +46,15 @@ from the resumed agent adopts a resurfaced ask only when its `toolCallId`
 is unique; shared ids (copilot-cli #989) are never routed by `toolCallId`.
 Host `PermissionAsked` / `PermissionDecided` carry a typed
 `PermissionRpc { binding, rpc_id, tool_call_id }`.
+
+## Live attach initialize + remint flush (2026-10-12)
+
+Live AttachRunner must send ACP `initialize` with `ClientCapabilities::HOST`
+(all false — no stub fs/terminal) and wait for the result before any
+agent-bound RPC (`session/new`, prompt, …). Remint writes
+`old_wire_replies` via `flush_old_wire_replies` **before** SessionClose /
+SessionCancel on the old wire; a dead old wire drops replies and never
+blocks remint or retries on the new Binding.
 
 ## Out of scope
 
