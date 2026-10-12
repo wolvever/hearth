@@ -33,6 +33,14 @@ pub use remint::{
 /// not hang the Host pump forever (same class as Copilot Content-Length hang).
 const READ_STDOUT_TIMEOUT: Duration = Duration::from_millis(200);
 
+/// Upper bound on [`AttachRunner::wait_rpc_result`]: 256 pumps of
+/// [`READ_STDOUT_TIMEOUT`] (~51s) for a real child.
+const WAIT_RPC_RESULT_TIMEOUT: Duration = Duration::from_millis(256 * 200);
+
+/// JSON-RPC "method not found" — answer for agent->client requests that
+/// arrive while the handshake owns the wire.
+const METHOD_NOT_FOUND: i64 = -32601;
+
 /// Build the transport matching a [`LaunchSpec`] wire.
 ///
 /// ACP / catalog `jsonl-rpc` → [`JsonlRpcTransport::without_rpc_chunks`]
@@ -90,6 +98,9 @@ enum ChildIo {
 pub struct AttachRunner {
     io: ChildIo,
     wire: WireKind,
+    /// Set only when [`Self::initialize_host`] returns Ok. Agent-bound
+    /// writes fail with [`BusError::NotInitialized`] until then.
+    initialized: bool,
 }
 
 impl AttachRunner {
@@ -121,6 +132,7 @@ impl AttachRunner {
                 stdout,
             },
             wire: spec.wire,
+            initialized: false,
         })
     }
 
@@ -135,7 +147,12 @@ impl AttachRunner {
                 exit_code: None,
             },
             wire,
+            initialized: false,
         }
+    }
+
+    pub fn is_initialized(&self) -> bool {
+        self.initialized
     }
 
     pub fn wire(&self) -> WireKind {
@@ -174,7 +191,17 @@ impl AttachRunner {
         }
     }
 
+    /// Agent-bound raw write. Fails with [`BusError::NotInitialized`]
+    /// until [`Self::initialize_host`] has returned Ok.
     pub fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), BusError> {
+        if !self.initialized {
+            return Err(BusError::NotInitialized);
+        }
+        self.write_bytes_ungated(bytes)
+    }
+
+    /// Handshake-only write (initialize + replies during the wait).
+    fn write_bytes_ungated(&mut self, bytes: &[u8]) -> Result<(), BusError> {
         match &mut self.io {
             ChildIo::Real { stdin, .. } => {
                 let Some(stdin) = stdin.as_mut() else {
@@ -295,14 +322,24 @@ impl AttachRunner {
 
     /// Write one JSON value on the runner's wire (JSONL or Content-Length).
     pub fn write_value(&mut self, msg: &serde_json::Value) -> Result<(), BusError> {
-        match self.wire {
-            WireKind::JsonlRpc => self.write_jsonl(msg),
-            WireKind::JsonRpc => self.write_jsonrpc(msg),
-            WireKind::Sse | WireKind::WebSocket => Err(BusError::Transport(format!(
-                "AttachRunner does not write {} yet",
-                self.wire.as_str()
-            ))),
+        if !self.initialized {
+            return Err(BusError::NotInitialized);
         }
+        self.write_value_ungated(msg)
+    }
+
+    fn write_value_ungated(&mut self, msg: &serde_json::Value) -> Result<(), BusError> {
+        let bytes = match self.wire {
+            WireKind::JsonlRpc => JsonlRpcTransport::encode_jsonl(msg)?,
+            WireKind::JsonRpc => JsonRpcTransport::encode_content_length(msg)?,
+            WireKind::Sse | WireKind::WebSocket => {
+                return Err(BusError::Transport(format!(
+                    "AttachRunner does not write {} yet",
+                    self.wire.as_str()
+                )))
+            }
+        };
+        self.write_bytes_ungated(&bytes)
     }
 
     /// Encode an ACP [`AgentCommand`] and write it on this wire.
@@ -332,8 +369,9 @@ impl AttachRunner {
         // Honest caps: ClientCapabilities::HOST is all false (no stub
         // fs/terminal handlers). Pep's rule — nothing goes true in this cut.
         let init = acp::encode_initialize(rpc_id, ClientCapabilities::HOST);
-        self.write_value(&init)?;
+        self.write_value_ungated(&init)?;
         let result = self.wait_rpc_result(transport, rpc_id)?;
+        self.initialized = true;
         Ok(LiveCaps::from_initialize_result(&result))
     }
 
@@ -351,29 +389,28 @@ impl AttachRunner {
             self.write_command(&cmd)
         });
         let mut needs_attach_resume = false;
+        let mut teardown_failed = Vec::new();
         for action in outcome.wire_actions {
-            match action {
-                WireAction::AttachResume => needs_attach_resume = true,
-                WireAction::SessionCancel => {
-                    let id = *next_rpc_id;
-                    *next_rpc_id = next_rpc_id.saturating_add(1);
-                    let rpc =
-                        encode_remint_rpc(RemintWireMethod::SessionCancel, &agent_session_id, id);
-                    let _ = self.write_value(&rpc);
+            let method = match action {
+                WireAction::AttachResume => {
+                    needs_attach_resume = true;
+                    continue;
                 }
-                WireAction::SessionClose => {
-                    let id = *next_rpc_id;
-                    *next_rpc_id = next_rpc_id.saturating_add(1);
-                    let rpc =
-                        encode_remint_rpc(RemintWireMethod::SessionClose, &agent_session_id, id);
-                    let _ = self.write_value(&rpc);
-                }
-                WireAction::None => {}
+                WireAction::SessionCancel => RemintWireMethod::SessionCancel,
+                WireAction::SessionClose => RemintWireMethod::SessionClose,
+                WireAction::None => continue,
+            };
+            let id = *next_rpc_id;
+            *next_rpc_id = next_rpc_id.saturating_add(1);
+            let rpc = encode_remint_rpc(method, &agent_session_id, id);
+            if self.write_value(&rpc).is_err() {
+                teardown_failed.push(method);
             }
         }
         OldWireFlush {
             dropped,
             needs_attach_resume,
+            teardown_failed,
         }
     }
 
@@ -384,9 +421,10 @@ impl AttachRunner {
         rpc_id: &RpcId,
     ) -> Result<serde_json::Value, BusError> {
         // Fake children exhaust a finite stdout; real children are bounded
-        // by READ_STDOUT_TIMEOUT per pump (~50s worst case).
-        const MAX_PUMPS: usize = 256;
-        for _ in 0..MAX_PUMPS {
+        // by READ_STDOUT_TIMEOUT per pump.
+        let max_pumps =
+            (WAIT_RPC_RESULT_TIMEOUT.as_millis() / READ_STDOUT_TIMEOUT.as_millis()) as usize;
+        for _ in 0..max_pumps {
             self.pump(transport)?;
             loop {
                 let frame = match transport {
@@ -405,8 +443,20 @@ impl AttachRunner {
                 let Some(v) = frame.as_json() else {
                     continue;
                 };
-                // Notifications (method, no id) are not the initialize reply.
-                if v.get("method").is_some() && v.get("id").is_none() {
+                if v.get("method").is_some() {
+                    // Agent->client request mid-wait: answer -32601 so the
+                    // agent is never left hanging. Notifications are skipped.
+                    if let Some(id) = v.get("id") {
+                        let reply = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "error": {
+                                "code": METHOD_NOT_FOUND,
+                                "message": "client not ready: initialize in progress"
+                            }
+                        });
+                        self.write_value_ungated(&reply)?;
+                    }
                     continue;
                 }
                 let Some(id_v) = v.get("id") else {
@@ -499,6 +549,37 @@ mod tests {
     use remint::{
         flush_and_teardown_old_wire, LiveCaps, RemintSession, RemintWireMethod, WireAction,
     };
+
+    /// Fake JSONL child that answers `initialize` (id 0) first, then emits
+    /// `rest`. Returned runner has completed the real handshake; keep
+    /// pumping into the returned transport (it may hold buffered bytes).
+    fn initialized_fake_with_transport(rest: Vec<u8>) -> (AttachRunner, RunnerTransport) {
+        let mut stdout = JsonlRpcTransport::encode_jsonl(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 0, "result": { "protocolVersion": 1 }
+        }))
+        .unwrap();
+        stdout.extend(rest);
+        let mut runner = AttachRunner::spawn_fake(WireKind::JsonlRpc, stdout);
+        let mut t = transport_for_wire(WireKind::JsonlRpc);
+        runner.initialize_host(&mut t, &RpcId::Num(0)).unwrap();
+        (runner, t)
+    }
+
+    fn initialized_fake(rest: Vec<u8>) -> AttachRunner {
+        initialized_fake_with_transport(rest).0
+    }
+
+    /// Outbound frames after the leading `initialize`.
+    fn frames_after_initialize(runner: &AttachRunner) -> Vec<serde_json::Value> {
+        let log = std::str::from_utf8(runner.stdin_log().unwrap()).unwrap();
+        let mut frames: Vec<serde_json::Value> = log
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(frames.remove(0)["method"], "initialize");
+        frames
+    }
 
     #[test]
     fn acp_launch_spec_uses_jsonl_without_rpc_chunks() {
@@ -597,7 +678,7 @@ mod tests {
 
     #[test]
     fn resume_wire_write_is_session_resume_not_new() {
-        let mut runner = AttachRunner::spawn_fake(WireKind::JsonlRpc, Vec::new());
+        let mut runner = initialized_fake(Vec::new());
         let rpc = encode_remint_rpc(RemintWireMethod::SessionResume, "S-keep", 1);
         runner.write_jsonl(&rpc).unwrap();
         let log = std::str::from_utf8(runner.stdin_log().unwrap()).unwrap();
@@ -624,8 +705,7 @@ mod tests {
         assert!(out.wire_actions.contains(&WireAction::AttachResume));
 
         let resumed = encode_remint_rpc(RemintWireMethod::SessionResume, &out.agent_session_id, 2);
-        let mut runner = AttachRunner::spawn_fake(
-            WireKind::JsonlRpc,
+        let (mut runner, mut transport) = initialized_fake_with_transport(
             JsonlRpcTransport::encode_jsonl(&serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": 2,
@@ -634,14 +714,17 @@ mod tests {
             .unwrap(),
         );
         runner.write_jsonl(&resumed).unwrap();
-        let mut t = JsonlRpcTransport::without_rpc_chunks();
+        let t = transport.as_jsonl_mut().unwrap();
+        let mut saw = false;
         for _ in 0..8 {
-            runner.pump_jsonl(&mut t).unwrap();
+            runner.pump_jsonl(t).unwrap();
             if let Some(WireFrame::Json(v)) = t.try_recv_frame().unwrap() {
                 assert_eq!(v["result"]["sessionId"], "S-stable");
+                saw = true;
                 break;
             }
         }
+        assert!(saw, "resume result must arrive");
         assert_eq!(session.agent_session_id(), "S-stable");
     }
 
@@ -662,7 +745,7 @@ mod tests {
         let fork = session.refuse_session_new();
         assert_eq!(fork, RemintError::SilentForkBlocked);
         assert_eq!(session.agent_session_id(), "S-orig");
-        let mut runner = AttachRunner::spawn_fake(WireKind::JsonlRpc, Vec::new());
+        let mut runner = initialized_fake(Vec::new());
         // Even a mistaken write of session/new is detectable in tests;
         // production remint APIs never produce this method.
         let banned = serde_json::json!({
@@ -871,18 +954,23 @@ mod tests {
         );
         assert!(out.wire_actions.contains(&WireAction::AttachResume));
 
-        let mut runner = AttachRunner::spawn_fake(WireKind::JsonlRpc, Vec::new());
+        let mut runner = initialized_fake(Vec::new());
         let mut next_id = 10u64;
         let flush = runner.flush_and_teardown_after_remint(out, &mut next_id);
         assert_eq!(flush.dropped, 0);
         assert!(flush.needs_attach_resume);
+        assert!(flush.teardown_failed.is_empty());
 
-        let log = std::str::from_utf8(runner.stdin_log().unwrap()).unwrap();
-        let frames: Vec<serde_json::Value> = log
-            .lines()
-            .filter(|l| !l.is_empty())
-            .map(|l| serde_json::from_str(l).unwrap())
-            .collect();
+        // Byte order: the -32800 reply bytes precede every teardown method.
+        let raw = std::str::from_utf8(runner.stdin_log().unwrap()).unwrap();
+        let reply_at = raw.find("-32800").expect("flush reply written");
+        for m in ["session/close", "session/cancel"] {
+            if let Some(at) = raw.find(m) {
+                assert!(reply_at < at, "flush bytes must precede {m}: {raw}");
+            }
+        }
+
+        let frames = frames_after_initialize(&runner);
         // Order: -32800 error reply first, then session/close or session/cancel.
         // AttachResume must NOT appear on the old wire.
         assert!(frames.len() >= 2, "expected reply + teardown: {frames:?}");
@@ -958,6 +1046,7 @@ mod tests {
         );
         assert_eq!(attempts, 1, "one try then drop");
         assert_eq!(flush.dropped, 1);
+        assert_eq!(flush.teardown_failed, vec![RemintWireMethod::SessionCancel]);
         assert!(flush.needs_attach_resume);
 
         // New Binding runner must not see the dropped reply.
@@ -1023,5 +1112,122 @@ mod tests {
             init["params"]["clientCapabilities"],
             ClientCapabilities::HOST.to_json()
         );
+    }
+    /// Init gate: before initialize_host returns Ok, every agent-bound
+    /// write fails typed; the fake's stdin sees only `initialize`.
+    #[test]
+    fn agent_bound_writes_rejected_until_initialized() {
+        let prompt = serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "session/prompt",
+            "params": {"sessionId": "S1", "prompt": []}
+        });
+        let init_ok = JsonlRpcTransport::encode_jsonl(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "result": { "protocolVersion": 1 }
+        }))
+        .unwrap();
+        let mut runner = AttachRunner::spawn_fake(WireKind::JsonlRpc, init_ok);
+        assert!(matches!(
+            runner.write_value(&prompt),
+            Err(BusError::NotInitialized)
+        ));
+        assert!(matches!(
+            runner.write_jsonl(&prompt),
+            Err(BusError::NotInitialized)
+        ));
+        assert!(matches!(
+            runner.write_bytes(b"{}\n"),
+            Err(BusError::NotInitialized)
+        ));
+        assert!(matches!(
+            runner.write_command(&AgentCommand::UserMessage {
+                session_id: "S1".into(),
+                text: "hi".into(),
+            }),
+            Err(BusError::NotInitialized)
+        ));
+        assert!(runner.stdin_log().unwrap().is_empty());
+
+        let mut t = transport_for_wire(WireKind::JsonlRpc);
+        runner.initialize_host(&mut t, &RpcId::Num(1)).unwrap();
+        let log = std::str::from_utf8(runner.stdin_log().unwrap()).unwrap();
+        let methods: Vec<serde_json::Value> = log
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()["method"].clone())
+            .collect();
+        assert_eq!(methods, vec![serde_json::json!("initialize")]);
+        assert!(runner.is_initialized());
+        runner.write_value(&prompt).unwrap();
+    }
+
+    /// Failed initialize keeps the gate closed.
+    #[test]
+    fn initialize_error_keeps_gate_closed() {
+        let err = JsonlRpcTransport::encode_jsonl(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "error": {"code": -32603, "message": "boom"}
+        }))
+        .unwrap();
+        let mut runner = AttachRunner::spawn_fake(WireKind::JsonlRpc, err);
+        let mut t = transport_for_wire(WireKind::JsonlRpc);
+        assert!(runner.initialize_host(&mut t, &RpcId::Num(1)).is_err());
+        assert!(matches!(
+            runner.write_value(&serde_json::json!({"method": "session/prompt"})),
+            Err(BusError::NotInitialized)
+        ));
+    }
+
+    /// Agent->client request mid-initialize is answered -32601, not dropped.
+    #[test]
+    fn wait_rpc_result_answers_mid_wait_agent_request() {
+        let mut stdout = JsonlRpcTransport::encode_jsonl(&serde_json::json!({
+            "jsonrpc": "2.0", "id": "ask-1", "method": "fs/read_text_file",
+            "params": {"path": "/tmp/x"}
+        }))
+        .unwrap();
+        stdout.extend(
+            JsonlRpcTransport::encode_jsonl(&serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "result": { "protocolVersion": 1 }
+            }))
+            .unwrap(),
+        );
+        let mut runner = AttachRunner::spawn_fake(WireKind::JsonlRpc, stdout);
+        let mut t = transport_for_wire(WireKind::JsonlRpc);
+        runner.initialize_host(&mut t, &RpcId::Num(1)).unwrap();
+        let frames = frames_after_initialize(&runner);
+        assert_eq!(frames.len(), 1, "{frames:?}");
+        assert_eq!(frames[0]["id"], "ask-1");
+        assert_eq!(frames[0]["error"]["code"], METHOD_NOT_FOUND);
+    }
+
+    /// Old-wire teardown write failures are reported, not swallowed.
+    #[test]
+    fn runner_flush_reports_teardown_write_failure() {
+        let (session, _, _) = RemintSession::open(
+            "sess-1",
+            "S-stable",
+            LiveCaps {
+                resume: true,
+                cancel: true,
+                close: true,
+                load_session: false,
+            },
+        );
+        session.begin_turn("mid");
+        let out = session.remint_and_attach().unwrap();
+        let expected: Vec<RemintWireMethod> = out
+            .wire_actions
+            .iter()
+            .filter_map(|a| match a {
+                WireAction::SessionCancel => Some(RemintWireMethod::SessionCancel),
+                WireAction::SessionClose => Some(RemintWireMethod::SessionClose),
+                _ => None,
+            })
+            .collect();
+        assert!(!expected.is_empty());
+        let mut runner = initialized_fake(Vec::new());
+        runner.kill().unwrap();
+        let mut next_id = 1u64;
+        let flush = runner.flush_and_teardown_after_remint(out, &mut next_id);
+        assert_eq!(flush.teardown_failed, expected);
+        assert!(flush.needs_attach_resume);
     }
 }

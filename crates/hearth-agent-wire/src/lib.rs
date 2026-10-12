@@ -406,6 +406,9 @@ pub enum BusError {
     Decode(String),
     #[error("encode: {0}")]
     Encode(String),
+    /// Agent-bound write attempted before ACP `initialize` returned Ok.
+    #[error("agent wire not initialized: initialize must succeed before agent-bound writes")]
+    NotInitialized,
 }
 
 /// What Hearth Host talks to. Live adapters own a child process / socket;

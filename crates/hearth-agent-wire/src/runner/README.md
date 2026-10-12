@@ -56,6 +56,18 @@ agent-bound RPC (`session/new`, prompt, …). Remint writes
 SessionCancel on the old wire; a dead old wire drops replies and never
 blocks remint or retries on the new Binding.
 
+Init gate: until `initialize_host` returns Ok, every agent-bound write
+(`write_command`, `write_value`, `write_jsonl`, `write_jsonrpc`,
+`write_bytes`) fails with `BusError::NotInitialized`. Agent->client
+requests that arrive while waiting for the initialize reply are answered
+`-32601`. Old-wire SessionCancel / SessionClose write failures are reported
+in `OldWireFlush::teardown_failed` (never retried). The wait is bounded by
+`WAIT_RPC_RESULT_TIMEOUT` (~51s).
+
+Test fake: exhausting the fake child's stdout no longer kills it on read
+(EOF is not death) — only `try_wait` / `kill` mark it exited, so live
+attach can still write after `initialize` returns.
+
 ## Out of scope
 
 SoftExpiring, Flush-before-dispatch, Stage, Evidence, EffectId, Queue,

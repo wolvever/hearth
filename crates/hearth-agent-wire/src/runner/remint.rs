@@ -371,6 +371,9 @@ pub fn flush_old_wire_replies(
 pub struct OldWireFlush {
     pub dropped: usize,
     pub needs_attach_resume: bool,
+    /// SessionCancel / SessionClose writes that failed on the old wire.
+    /// Reported, never retried, never block remint.
+    pub teardown_failed: Vec<RemintWireMethod>,
 }
 
 /// Production OLD-wire path after [`RemintSession::remint_and_attach`].
@@ -391,27 +394,27 @@ pub fn flush_and_teardown_old_wire(
     let agent_session_id = outcome.agent_session_id.clone();
     let dropped = flush_old_wire_replies(outcome.old_wire_replies, &mut send_old);
     let mut needs_attach_resume = false;
+    let mut teardown_failed = Vec::new();
     for action in outcome.wire_actions {
-        match action {
-            WireAction::AttachResume => needs_attach_resume = true,
-            WireAction::SessionCancel => {
-                let id = *next_rpc_id;
-                *next_rpc_id = next_rpc_id.saturating_add(1);
-                let rpc = encode_remint_rpc(RemintWireMethod::SessionCancel, &agent_session_id, id);
-                let _ = write_old_rpc(rpc);
+        let method = match action {
+            WireAction::AttachResume => {
+                needs_attach_resume = true;
+                continue;
             }
-            WireAction::SessionClose => {
-                let id = *next_rpc_id;
-                *next_rpc_id = next_rpc_id.saturating_add(1);
-                let rpc = encode_remint_rpc(RemintWireMethod::SessionClose, &agent_session_id, id);
-                let _ = write_old_rpc(rpc);
-            }
-            WireAction::None => {}
+            WireAction::SessionCancel => RemintWireMethod::SessionCancel,
+            WireAction::SessionClose => RemintWireMethod::SessionClose,
+            WireAction::None => continue,
+        };
+        let id = *next_rpc_id;
+        *next_rpc_id = next_rpc_id.saturating_add(1);
+        if write_old_rpc(encode_remint_rpc(method, &agent_session_id, id)).is_err() {
+            teardown_failed.push(method);
         }
     }
     OldWireFlush {
         dropped,
         needs_attach_resume,
+        teardown_failed,
     }
 }
 
