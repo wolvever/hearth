@@ -8,6 +8,8 @@ Host-adjacent spawn / pump / remint. **Not a kernel noun.**
 | `transport_for_wire` | ACP `jsonl-rpc` → `JsonlRpcTransport::without_rpc_chunks()` |
 | `remint::RemintSession` | Binding remint policy (09-27…10-02 + 10-06 fail-closed) |
 | `remint::LiveCaps` | Gate resume on live `initialize` caps |
+| `AttachRunner::initialize_host` | Live attach: send ACP `initialize` with `ClientCapabilities::HOST` (all false), wait for result |
+| `AttachRunner::flush_and_teardown_after_remint` | Flush `old_wire_replies` then SessionClose/Cancel on the OLD wire |
 
 ## Remint (fail-closed)
 
@@ -44,6 +46,27 @@ from the resumed agent adopts a resurfaced ask only when its `toolCallId`
 is unique; shared ids (copilot-cli #989) are never routed by `toolCallId`.
 Host `PermissionAsked` / `PermissionDecided` carry a typed
 `PermissionRpc { binding, rpc_id, tool_call_id }`.
+
+## Live attach initialize + remint flush (2026-10-12)
+
+Live AttachRunner must send ACP `initialize` with `ClientCapabilities::HOST`
+(all false — no stub fs/terminal) and wait for the result before any
+agent-bound RPC (`session/new`, prompt, …). Remint writes
+`old_wire_replies` via `flush_old_wire_replies` **before** SessionClose /
+SessionCancel on the old wire; a dead old wire drops replies and never
+blocks remint or retries on the new Binding.
+
+Init gate: until `initialize_host` returns Ok, every agent-bound write
+(`write_command`, `write_value`, `write_jsonl`, `write_jsonrpc`,
+`write_bytes`) fails with `BusError::NotInitialized`. Agent->client
+requests that arrive while waiting for the initialize reply are answered
+`-32601`. Old-wire SessionCancel / SessionClose write failures are reported
+in `OldWireFlush::teardown_failed` (never retried). The wait is bounded by
+`WAIT_RPC_RESULT_TIMEOUT` (~51s).
+
+Test fake: exhausting the fake child's stdout no longer kills it on read
+(EOF is not death) — only `try_wait` / `kill` mark it exited, so live
+attach can still write after `initialize` returns.
 
 ## Out of scope
 

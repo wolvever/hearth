@@ -364,6 +364,60 @@ pub fn flush_old_wire_replies(
         .count()
 }
 
+/// Result of [`flush_and_teardown_old_wire`]: how many in-flight replies
+/// were dropped on a dead old wire, and whether the caller still owes
+/// [`WireAction::AttachResume`] on the NEW Binding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OldWireFlush {
+    pub dropped: usize,
+    pub needs_attach_resume: bool,
+    /// SessionCancel / SessionClose writes that failed on the old wire.
+    /// Reported, never retried, never block remint.
+    pub teardown_failed: Vec<RemintWireMethod>,
+}
+
+/// Production OLD-wire path after [`RemintSession::remint_and_attach`].
+///
+/// Order is load-bearing:
+/// 1. [`flush_old_wire_replies`] — one try each; dead wire drops the reply
+/// 2. `SessionClose` / `SessionCancel` from `wire_actions`
+///
+/// [`WireAction::AttachResume`] is **not** written here — it belongs on the
+/// NEW Binding after teardown. Dead-wire failures never block remint and
+/// never retry on the new Binding.
+pub fn flush_and_teardown_old_wire(
+    outcome: RemintOutcome,
+    mut send_old: impl FnMut(AgentCommand) -> Result<(), BusError>,
+    mut write_old_rpc: impl FnMut(Value) -> Result<(), BusError>,
+    next_rpc_id: &mut u64,
+) -> OldWireFlush {
+    let agent_session_id = outcome.agent_session_id.clone();
+    let dropped = flush_old_wire_replies(outcome.old_wire_replies, &mut send_old);
+    let mut needs_attach_resume = false;
+    let mut teardown_failed = Vec::new();
+    for action in outcome.wire_actions {
+        let method = match action {
+            WireAction::AttachResume => {
+                needs_attach_resume = true;
+                continue;
+            }
+            WireAction::SessionCancel => RemintWireMethod::SessionCancel,
+            WireAction::SessionClose => RemintWireMethod::SessionClose,
+            WireAction::None => continue,
+        };
+        let id = *next_rpc_id;
+        *next_rpc_id = next_rpc_id.saturating_add(1);
+        if write_old_rpc(encode_remint_rpc(method, &agent_session_id, id)).is_err() {
+            teardown_failed.push(method);
+        }
+    }
+    OldWireFlush {
+        dropped,
+        needs_attach_resume,
+        teardown_failed,
+    }
+}
+
 struct Inner {
     session_id: SessionId,
     binding_id: BindingId,

@@ -40,8 +40,9 @@ pub use host::{
     binding_kind, event_bodies, host_for, AttachError, AttachResult, HostAttach, PendingAsk,
 };
 pub use runner::{
-    encode_remint_rpc, transport_for_wire, AttachRunner, LiveCaps, RemintError, RemintEvent,
-    RemintEventKind, RemintOutcome, RemintSession, RemintWireMethod, RunnerTransport,
+    encode_remint_rpc, flush_and_teardown_old_wire, flush_old_wire_replies, transport_for_wire,
+    AttachRunner, LiveCaps, OldWireFlush, RemintError, RemintEvent, RemintEventKind, RemintOutcome,
+    RemintSession, RemintWireMethod, RunnerTransport,
 };
 pub use transport::{
     JsonRpcTransport, JsonlProblem, JsonlRpcTransport, SseFrame, SseTransport, Transport,
@@ -405,6 +406,9 @@ pub enum BusError {
     Decode(String),
     #[error("encode: {0}")]
     Encode(String),
+    /// Agent-bound write attempted before ACP `initialize` returned Ok.
+    #[error("agent wire not initialized: initialize must succeed before agent-bound writes")]
+    NotInitialized,
 }
 
 /// What Hearth Host talks to. Live adapters own a child process / socket;
