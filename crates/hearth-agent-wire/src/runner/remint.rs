@@ -29,6 +29,9 @@
 //!    fail-closed Event. NEVER `session/new` under that Session. NEVER
 //!    `session/load` as fallback. NEVER resubmit an in-flight prompt
 //!    (mark turn interrupted). Gate resume on live `initialize` caps.
+//!    After OLD-wire flush+teardown, AttachResume is written on the NEW
+//!    Binding/wire only (`write_new_wire_attach_resume`), gated by that
+//!    wire's live `initialize_host` → `set_live_caps`.
 //!
 //! ACP `session/request_permission` is a JSON-RPC request: answers go out
 //! as [`AgentCommand::ReplyPermission`] on the same rpc id with a nested
@@ -234,6 +237,8 @@ pub enum RemintError {
     /// Host EventLog write (PermissionAsked / PermissionDecided) failed;
     /// the ask's state is unchanged and nothing is written to the wire.
     HostLog(String),
+    /// NEW-wire `initialize_host` or `session/resume` write failed after remint.
+    NewWire(String),
 }
 
 impl RemintError {
@@ -251,6 +256,7 @@ impl RemintError {
             Self::DuplicateRpcId => "DuplicateRpcId",
             Self::NotAPermissionRequest => "NotAPermissionRequest",
             Self::HostLog(_) => "HostLog",
+            Self::NewWire(_) => "NewWire",
         }
     }
 }
@@ -438,6 +444,33 @@ pub fn flush_and_teardown_old_wire(
     }
 }
 
+/// Write ACP `session/resume` on the NEW Binding/wire after OLD-wire teardown.
+///
+/// Call only when [`OldWireFlush::needs_attach_resume`] is true. Order is
+/// load-bearing for the caller:
+/// 1. live `initialize_host` on the NEW wire → [`LiveCaps`]
+/// 2. [`RemintSession::set_live_caps`] (done here)
+/// 3. gate: if LiveCaps advertise resume, write `session/resume` with the
+///    same agent session id; else fail-closed (typed [`RemintError`], no
+///    silent skip, never `session/load` / `session/new`).
+///
+/// `ClientCapabilities::HOST` stays all false on the initialize that produced
+/// `live_caps` — this helper does not re-advertise client caps.
+pub fn write_new_wire_attach_resume(
+    session: &RemintSession,
+    agent_session_id: &str,
+    live_caps: LiveCaps,
+    mut write_new_rpc: impl FnMut(Value) -> Result<(), BusError>,
+    next_rpc_id: &mut u64,
+) -> Result<(), RemintError> {
+    session.set_live_caps(live_caps);
+    session.gate_attach_resume()?;
+    let id = *next_rpc_id;
+    *next_rpc_id = next_rpc_id.saturating_add(1);
+    let rpc = encode_remint_rpc(RemintWireMethod::SessionResume, agent_session_id, id);
+    write_new_rpc(rpc).map_err(|e| RemintError::NewWire(e.to_string()))
+}
+
 struct Inner {
     session_id: SessionId,
     binding_id: BindingId,
@@ -571,6 +604,27 @@ impl RemintSession {
 
     pub fn set_live_caps(&self, caps: LiveCaps) {
         self.inner.lock().unwrap().live_caps = caps;
+    }
+
+    /// After NEW-wire `initialize_host` + [`Self::set_live_caps`]: allow
+    /// AttachResume only when live caps advertise resume. Fail-closed
+    /// otherwise (never `session/load`). Does not write the wire.
+    pub fn gate_attach_resume(&self) -> Result<(), RemintError> {
+        let mut g = self.inner.lock().unwrap();
+        if g.closed {
+            return Err(RemintError::SessionGone);
+        }
+        if !g.live_caps.allows_resume() {
+            let reason = if g.live_caps.load_session {
+                RemintError::LoadFallbackBlocked
+            } else {
+                RemintError::ResumeNotSupported
+            };
+            Self::push_event(&mut g, RemintEventKind::FailClosed, reason.as_event_text());
+            Self::mark_interrupted_if_in_flight(&mut g, reason.as_event_text());
+            return Err(reason);
+        }
+        Ok(())
     }
 
     pub fn client_capabilities(&self) -> ClientCapabilities {
