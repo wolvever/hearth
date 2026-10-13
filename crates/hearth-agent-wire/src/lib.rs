@@ -41,8 +41,9 @@ pub use host::{
 };
 pub use runner::{
     encode_remint_rpc, flush_and_teardown_old_wire, flush_old_wire_replies, transport_for_wire,
-    write_old_wire_teardown, AttachRunner, LiveCaps, OldWireFlush, RemintError, RemintEvent,
-    RemintEventKind, RemintOutcome, RemintSession, RemintWireMethod, RunnerTransport,
+    write_new_wire_attach_resume, write_old_wire_teardown, AttachRunner, LiveCaps, OldWireFlush,
+    RemintError, RemintEvent, RemintEventKind, RemintOutcome, RemintSession, RemintWireMethod,
+    RunnerTransport,
 };
 pub use transport::{
     JsonRpcTransport, JsonlProblem, JsonlRpcTransport, SseFrame, SseTransport, Transport,

@@ -10,6 +10,7 @@ Host-adjacent spawn / pump / remint. **Not a kernel noun.**
 | `remint::LiveCaps` | Gate resume on live `initialize` caps |
 | `AttachRunner::initialize_host` | Live attach: send ACP `initialize` with `ClientCapabilities::HOST` (all false), wait for result |
 | `AttachRunner::flush_and_teardown_after_remint` | Runner adapter: `flush_old_wire_replies` then `write_old_wire_teardown` on the OLD wire |
+| `AttachRunner::attach_resume_on_new_wire` | After remint: `initialize_host` on NEW wire → `set_live_caps` → `session/resume` (fail-closed if not advertised) |
 
 ## Remint (fail-closed)
 
@@ -57,6 +58,21 @@ agent-bound RPC (`session/new`, prompt, …). Remint writes
 a dead old wire drops replies and never blocks remint or retries on the
 new Binding. `flush_and_teardown_old_wire` and
 `AttachRunner::flush_and_teardown_after_remint` share those two helpers.
+
+## New-wire AttachResume after remint (2026-10-14)
+
+When `flush_and_teardown_after_remint` returns `needs_attach_resume`, the
+production path lands AttachResume on the **NEW** Binding/wire via
+`AttachRunner::attach_resume_on_new_wire` / `write_new_wire_attach_resume`:
+
+1. `initialize_host` on the NEW wire (`ClientCapabilities::HOST` all false)
+2. `RemintSession::set_live_caps` from that live result
+3. If LiveCaps advertise resume → write ACP `session/resume` with the **same**
+   agent session id; else fail-closed (`ResumeNotSupported` /
+   `LoadFallbackBlocked`) — never silent skip, never `session/load` /
+   `session/new`.
+
+AttachResume is never written on the old wire (already torn down).
 
 Init gate: until `initialize_host` returns Ok, every agent-bound write
 (`write_command`, `write_value`, `write_jsonl`, `write_jsonrpc`,
