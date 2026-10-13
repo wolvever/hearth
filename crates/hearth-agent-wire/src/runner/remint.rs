@@ -376,26 +376,20 @@ pub struct OldWireFlush {
     pub teardown_failed: Vec<RemintWireMethod>,
 }
 
-/// Production OLD-wire path after [`RemintSession::remint_and_attach`].
+/// Write SessionClose / SessionCancel from `wire_actions` on the OLD wire.
 ///
-/// Order is load-bearing:
-/// 1. [`flush_old_wire_replies`] — one try each; dead wire drops the reply
-/// 2. `SessionClose` / `SessionCancel` from `wire_actions`
-///
-/// [`WireAction::AttachResume`] is **not** written here — it belongs on the
-/// NEW Binding after teardown. Dead-wire failures never block remint and
-/// never retry on the new Binding.
-pub fn flush_and_teardown_old_wire(
-    outcome: RemintOutcome,
-    mut send_old: impl FnMut(AgentCommand) -> Result<(), BusError>,
+/// [`WireAction::AttachResume`] is noted but **not** written — it belongs on
+/// the NEW Binding after teardown. Dead-wire write failures are collected in
+/// the returned `teardown_failed` list (never retried, never block remint).
+pub fn write_old_wire_teardown(
+    agent_session_id: &str,
+    wire_actions: Vec<WireAction>,
     mut write_old_rpc: impl FnMut(Value) -> Result<(), BusError>,
     next_rpc_id: &mut u64,
-) -> OldWireFlush {
-    let agent_session_id = outcome.agent_session_id.clone();
-    let dropped = flush_old_wire_replies(outcome.old_wire_replies, &mut send_old);
+) -> (bool, Vec<RemintWireMethod>) {
     let mut needs_attach_resume = false;
     let mut teardown_failed = Vec::new();
-    for action in outcome.wire_actions {
+    for action in wire_actions {
         let method = match action {
             WireAction::AttachResume => {
                 needs_attach_resume = true;
@@ -407,10 +401,36 @@ pub fn flush_and_teardown_old_wire(
         };
         let id = *next_rpc_id;
         *next_rpc_id = next_rpc_id.saturating_add(1);
-        if write_old_rpc(encode_remint_rpc(method, &agent_session_id, id)).is_err() {
+        if write_old_rpc(encode_remint_rpc(method, agent_session_id, id)).is_err() {
             teardown_failed.push(method);
         }
     }
+    (needs_attach_resume, teardown_failed)
+}
+
+/// Production OLD-wire path after [`RemintSession::remint_and_attach`].
+///
+/// Order is load-bearing:
+/// 1. [`flush_old_wire_replies`] — one try each; dead wire drops the reply
+/// 2. [`write_old_wire_teardown`] — SessionClose / SessionCancel
+///
+/// [`WireAction::AttachResume`] is **not** written here — it belongs on the
+/// NEW Binding after teardown. Dead-wire failures never block remint and
+/// never retry on the new Binding.
+pub fn flush_and_teardown_old_wire(
+    outcome: RemintOutcome,
+    mut send_old: impl FnMut(AgentCommand) -> Result<(), BusError>,
+    write_old_rpc: impl FnMut(Value) -> Result<(), BusError>,
+    next_rpc_id: &mut u64,
+) -> OldWireFlush {
+    let agent_session_id = outcome.agent_session_id.clone();
+    let dropped = flush_old_wire_replies(outcome.old_wire_replies, &mut send_old);
+    let (needs_attach_resume, teardown_failed) = write_old_wire_teardown(
+        &agent_session_id,
+        outcome.wire_actions,
+        write_old_rpc,
+        next_rpc_id,
+    );
     OldWireFlush {
         dropped,
         needs_attach_resume,

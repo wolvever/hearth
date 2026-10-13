@@ -23,10 +23,10 @@ use crate::transport::{JsonRpcTransport, JsonlRpcTransport, Transport, WireFrame
 use crate::{AgentCommand, BusError, RpcId};
 
 pub use remint::{
-    encode_remint_rpc, flush_and_teardown_old_wire, flush_old_wire_replies, LiveCaps, OldWireFlush,
-    PendingPermission, PermissionKey, PermissionRef, RemintError, RemintEvent, RemintEventKind,
-    RemintOutcome, RemintSession, RemintWireMethod, ReplaySlice, TeardownOutcome, TeardownSnapshot,
-    TransportOwner, WireAction,
+    encode_remint_rpc, flush_and_teardown_old_wire, flush_old_wire_replies,
+    write_old_wire_teardown, LiveCaps, OldWireFlush, PendingPermission, PermissionKey,
+    PermissionRef, RemintError, RemintEvent, RemintEventKind, RemintOutcome, RemintSession,
+    RemintWireMethod, ReplaySlice, TeardownOutcome, TeardownSnapshot, TransportOwner, WireAction,
 };
 
 /// Cap how long a Real-child stdout read may block. A silent agent must
@@ -379,6 +379,11 @@ impl AttachRunner {
     /// on THIS (old) wire, then write SessionClose / SessionCancel.
     /// AttachResume is left for the NEW wire. Dead-wire writes drop and
     /// never block remint.
+    ///
+    /// Thin runner adapter over [`flush_old_wire_replies`] +
+    /// [`write_old_wire_teardown`] (same order as [`flush_and_teardown_old_wire`]).
+    /// Two `&mut self` write closures cannot share one free-fn call, so the
+    /// phases run sequentially here.
     pub fn flush_and_teardown_after_remint(
         &mut self,
         outcome: RemintOutcome,
@@ -388,25 +393,12 @@ impl AttachRunner {
         let dropped = remint::flush_old_wire_replies(outcome.old_wire_replies, |cmd| {
             self.write_command(&cmd)
         });
-        let mut needs_attach_resume = false;
-        let mut teardown_failed = Vec::new();
-        for action in outcome.wire_actions {
-            let method = match action {
-                WireAction::AttachResume => {
-                    needs_attach_resume = true;
-                    continue;
-                }
-                WireAction::SessionCancel => RemintWireMethod::SessionCancel,
-                WireAction::SessionClose => RemintWireMethod::SessionClose,
-                WireAction::None => continue,
-            };
-            let id = *next_rpc_id;
-            *next_rpc_id = next_rpc_id.saturating_add(1);
-            let rpc = encode_remint_rpc(method, &agent_session_id, id);
-            if self.write_value(&rpc).is_err() {
-                teardown_failed.push(method);
-            }
-        }
+        let (needs_attach_resume, teardown_failed) = remint::write_old_wire_teardown(
+            &agent_session_id,
+            outcome.wire_actions,
+            |rpc| self.write_value(&rpc),
+            next_rpc_id,
+        );
         OldWireFlush {
             dropped,
             needs_attach_resume,
