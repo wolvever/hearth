@@ -24,7 +24,7 @@ use crate::{AgentCommand, BusError, RpcId};
 
 pub use remint::{
     encode_remint_rpc, flush_and_teardown_old_wire, flush_old_wire_replies,
-    write_new_wire_attach_resume, write_old_wire_teardown, LiveCaps, OldWireFlush,
+    write_new_wire_attach_resume, write_old_wire_teardown, LiveCaps, OldWireFlush, OldWireWrite,
     PendingPermission, PermissionKey, PermissionRef, RemintError, RemintEvent, RemintEventKind,
     RemintOutcome, RemintSession, RemintWireMethod, ReplaySlice, TeardownOutcome, TeardownSnapshot,
     TransportOwner, WireAction,
@@ -381,30 +381,22 @@ impl AttachRunner {
     /// AttachResume is left for the NEW wire. Dead-wire writes drop and
     /// never block remint.
     ///
-    /// Thin runner adapter over [`flush_old_wire_replies`] +
-    /// [`write_old_wire_teardown`] (same order as [`flush_and_teardown_old_wire`]).
-    /// Two `&mut self` write closures cannot share one free-fn call, so the
-    /// phases run sequentially here.
+    /// Thin runner adapter over [`flush_and_teardown_old_wire`] — one
+    /// [`OldWireWrite`] sink so both flush and teardown share a single
+    /// `&mut self` borrow (fixes the dual-closure residual left by #23).
     pub fn flush_and_teardown_after_remint(
         &mut self,
         outcome: RemintOutcome,
         next_rpc_id: &mut u64,
     ) -> OldWireFlush {
-        let agent_session_id = outcome.agent_session_id.clone();
-        let dropped = remint::flush_old_wire_replies(outcome.old_wire_replies, |cmd| {
-            self.write_command(&cmd)
-        });
-        let (needs_attach_resume, teardown_failed) = remint::write_old_wire_teardown(
-            &agent_session_id,
-            outcome.wire_actions,
-            |rpc| self.write_value(&rpc),
+        remint::flush_and_teardown_old_wire(
+            outcome,
+            |w| match w {
+                remint::OldWireWrite::Reply(cmd) => self.write_command(&cmd),
+                remint::OldWireWrite::Rpc(rpc) => self.write_value(&rpc),
+            },
             next_rpc_id,
-        );
-        OldWireFlush {
-            dropped,
-            needs_attach_resume,
-            teardown_failed,
-        }
+        )
     }
 
     /// After OLD-wire [`Self::flush_and_teardown_after_remint`] returned
@@ -572,8 +564,8 @@ mod tests {
     use crate::RpcId;
     use crate::{AgentEvent, CodingAgent, FramedAgent};
     use remint::{
-        flush_and_teardown_old_wire, write_new_wire_attach_resume, LiveCaps, RemintError,
-        RemintEventKind, RemintSession, RemintWireMethod, WireAction,
+        flush_and_teardown_old_wire, write_new_wire_attach_resume, LiveCaps, OldWireWrite,
+        RemintError, RemintEventKind, RemintSession, RemintWireMethod, WireAction,
     };
 
     /// Fake JSONL child that answers `initialize` (id 0) first, then emits
@@ -1063,11 +1055,12 @@ mod tests {
         let mut next_id = 1u64;
         let flush = flush_and_teardown_old_wire(
             out,
-            |_| {
-                attempts += 1;
+            |w| {
+                if matches!(w, OldWireWrite::Reply(_)) {
+                    attempts += 1;
+                }
                 Err(BusError::Transport("old wire dead".into()))
             },
-            |_| Err(BusError::Transport("old wire dead".into())),
             &mut next_id,
         );
         assert_eq!(attempts, 1, "one try then drop");

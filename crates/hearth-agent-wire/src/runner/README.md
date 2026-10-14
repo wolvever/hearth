@@ -9,7 +9,7 @@ Host-adjacent spawn / pump / remint. **Not a kernel noun.**
 | `remint::RemintSession` | Binding remint policy (09-27…10-02 + 10-06 fail-closed) |
 | `remint::LiveCaps` | Gate resume on live `initialize` caps |
 | `AttachRunner::initialize_host` | Live attach: send ACP `initialize` with `ClientCapabilities::HOST` (all false), wait for result |
-| `AttachRunner::flush_and_teardown_after_remint` | Runner adapter: `flush_old_wire_replies` then `write_old_wire_teardown` on the OLD wire |
+| `AttachRunner::flush_and_teardown_after_remint` | Runner adapter: calls `flush_and_teardown_old_wire` via one `OldWireWrite` sink on the OLD wire |
 | `AttachRunner::attach_resume_on_new_wire` | After remint: `initialize_host` on NEW wire → `set_live_caps` → `session/resume` (fail-closed if not advertised) |
 
 ## Remint (fail-closed)
@@ -56,8 +56,8 @@ agent-bound RPC (`session/new`, prompt, …). Remint writes
 `old_wire_replies` via `flush_old_wire_replies` **before**
 `write_old_wire_teardown` (SessionClose / SessionCancel) on the old wire;
 a dead old wire drops replies and never blocks remint or retries on the
-new Binding. `flush_and_teardown_old_wire` and
-`AttachRunner::flush_and_teardown_after_remint` share those two helpers.
+new Binding. `AttachRunner::flush_and_teardown_after_remint` calls
+`flush_and_teardown_old_wire` (one `OldWireWrite` sink over those two helpers).
 
 ## New-wire AttachResume after remint (2026-10-14)
 

@@ -98,6 +98,17 @@ impl LiveCaps {
     pub fn allows_resume(self) -> bool {
         self.resume
     }
+
+    /// Typed fail-closed when [`Self::allows_resume`] is false.
+    /// Copilot load-only (`load_session`) → [`RemintError::LoadFallbackBlocked`];
+    /// otherwise [`RemintError::ResumeNotSupported`]. Never suggests `session/load`.
+    pub fn refuse_without_resume(self) -> RemintError {
+        if self.load_session {
+            RemintError::LoadFallbackBlocked
+        } else {
+            RemintError::ResumeNotSupported
+        }
+    }
 }
 
 fn flag(caps: &Value, names: &[&str]) -> bool {
@@ -370,6 +381,19 @@ pub fn flush_old_wire_replies(
         .count()
 }
 
+/// One outbound write on the OLD wire during remint flush / teardown.
+///
+/// A single [`FnMut`] can drive both phases of [`flush_and_teardown_old_wire`],
+/// so [`crate::runner::AttachRunner::flush_and_teardown_after_remint`] can call
+/// that free helper without two simultaneous `&mut self` closures.
+#[derive(Debug)]
+pub enum OldWireWrite {
+    /// In-flight agent→client reply from [`RemintOutcome::old_wire_replies`].
+    Reply(AgentCommand),
+    /// SessionClose / SessionCancel RPC (`encode_remint_rpc`).
+    Rpc(Value),
+}
+
 /// Result of [`flush_and_teardown_old_wire`]: how many in-flight replies
 /// were dropped on a dead old wire, and whether the caller still owes
 /// [`WireAction::AttachResume`] on the NEW Binding.
@@ -423,18 +447,22 @@ pub fn write_old_wire_teardown(
 /// [`WireAction::AttachResume`] is **not** written here — it belongs on the
 /// NEW Binding after teardown. Dead-wire failures never block remint and
 /// never retry on the new Binding.
+///
+/// One [`OldWireWrite`] sink covers both phases so a runner holding `&mut self`
+/// can call this helper directly (no dual-closure borrow conflict).
 pub fn flush_and_teardown_old_wire(
     outcome: RemintOutcome,
-    mut send_old: impl FnMut(AgentCommand) -> Result<(), BusError>,
-    write_old_rpc: impl FnMut(Value) -> Result<(), BusError>,
+    mut write_old: impl FnMut(OldWireWrite) -> Result<(), BusError>,
     next_rpc_id: &mut u64,
 ) -> OldWireFlush {
     let agent_session_id = outcome.agent_session_id.clone();
-    let dropped = flush_old_wire_replies(outcome.old_wire_replies, &mut send_old);
+    let dropped = flush_old_wire_replies(outcome.old_wire_replies, |cmd| {
+        write_old(OldWireWrite::Reply(cmd))
+    });
     let (needs_attach_resume, teardown_failed) = write_old_wire_teardown(
         &agent_session_id,
         outcome.wire_actions,
-        write_old_rpc,
+        |rpc| write_old(OldWireWrite::Rpc(rpc)),
         next_rpc_id,
     );
     OldWireFlush {
@@ -615,14 +643,7 @@ impl RemintSession {
             return Err(RemintError::SessionGone);
         }
         if !g.live_caps.allows_resume() {
-            let reason = if g.live_caps.load_session {
-                RemintError::LoadFallbackBlocked
-            } else {
-                RemintError::ResumeNotSupported
-            };
-            Self::push_event(&mut g, RemintEventKind::FailClosed, reason.as_event_text());
-            Self::mark_interrupted_if_in_flight(&mut g, reason.as_event_text());
-            return Err(reason);
+            return Err(Self::fail_closed_without_resume(&mut g));
         }
         Ok(())
     }
@@ -816,6 +837,14 @@ impl RemintSession {
             g.producer_ring.drain(..overflow);
         }
         ev
+    }
+
+    /// Push FailClosed + mark mid-turn interrupted when live caps refuse resume.
+    fn fail_closed_without_resume(g: &mut Inner) -> RemintError {
+        let reason = g.live_caps.refuse_without_resume();
+        Self::push_event(g, RemintEventKind::FailClosed, reason.as_event_text());
+        Self::mark_interrupted_if_in_flight(g, reason.as_event_text());
+        reason
     }
 
     /// On fail-closed remint that abandons an in-flight turn, mark it
@@ -1213,14 +1242,7 @@ impl RemintSession {
         // Gate on live initialize caps (not static flags alone).
         if !g.live_caps.allows_resume() {
             // Copilot load-only: still fail closed — never session/load fallback.
-            let reason = if g.live_caps.load_session {
-                RemintError::LoadFallbackBlocked
-            } else {
-                RemintError::ResumeNotSupported
-            };
-            Self::push_event(&mut g, RemintEventKind::FailClosed, reason.as_event_text());
-            Self::mark_interrupted_if_in_flight(&mut g, reason.as_event_text());
-            return Err(reason);
+            return Err(Self::fail_closed_without_resume(&mut g));
         }
 
         // Live or resurfaced asks are healthy HITL (also across a 2nd remint).
@@ -1373,11 +1395,7 @@ impl RemintSession {
         match attempted {
             RemintWireMethod::SessionResume => {
                 if !g.live_caps.allows_resume() {
-                    let reason = if g.live_caps.load_session {
-                        RemintError::LoadFallbackBlocked
-                    } else {
-                        RemintError::ResumeNotSupported
-                    };
+                    let reason = g.live_caps.refuse_without_resume();
                     Self::push_event(&mut g, RemintEventKind::FailClosed, reason.as_event_text());
                     return Err(reason);
                 }
