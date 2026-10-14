@@ -11,6 +11,7 @@ Host-adjacent spawn / pump / remint. **Not a kernel noun.**
 | `AttachRunner::initialize_host` | Live attach: send ACP `initialize` with `ClientCapabilities::HOST` (all false), wait for result |
 | `AttachRunner::flush_and_teardown_after_remint` | Runner adapter: calls `flush_and_teardown_old_wire` via one `OldWireWrite` sink on the OLD wire |
 | `AttachRunner::attach_resume_on_new_wire` | After remint: `initialize_host` on NEW wire → `set_live_caps` → `session/resume` (fail-closed if not advertised) |
+| `host_remint_two_step` | Host orchestration: OLD `flush_and_teardown_after_remint` → if `needs_attach_resume` → NEW `attach_resume_on_new_wire` |
 
 ## Remint (fail-closed)
 
@@ -73,6 +74,15 @@ production path lands AttachResume on the **NEW** Binding/wire via
    `session/new`.
 
 AttachResume is never written on the old wire (already torn down).
+
+## Host remint two-step (2026-10-14)
+
+Production Host path after `RemintSession::remint_and_attach` is
+`host_remint_two_step`: it **must** call `flush_and_teardown_after_remint` on
+the OLD Binding/runner, then when `needs_attach_resume` call
+`attach_resume_on_new_wire` on the NEW Binding/runner (same agent session id).
+LiveCaps fail-closed stays inside attach_resume. Never resume on the old wire;
+never `session/load` or `session/new`. `ClientCapabilities::HOST` stays all false.
 
 Init gate: until `initialize_host` returns Ok, every agent-bound write
 (`write_command`, `write_value`, `write_jsonl`, `write_jsonrpc`,

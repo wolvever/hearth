@@ -505,6 +505,73 @@ impl AttachRunner {
     }
 }
 
+/// Inputs for [`host_remint_two_step`] besides the OLD/NEW runners and
+/// NEW-wire transport (keeps the Host entry arity small).
+pub struct HostRemintArgs<'a> {
+    pub session: &'a RemintSession,
+    pub outcome: RemintOutcome,
+    pub init_rpc_id: &'a RpcId,
+    pub old_next_rpc_id: &'a mut u64,
+    pub new_next_rpc_id: &'a mut u64,
+}
+
+/// Result of [`host_remint_two_step`]: OLD-wire flush plus NEW-wire LiveCaps
+/// when AttachResume was owed and landed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostRemintWires {
+    pub flush: OldWireFlush,
+    /// `Some` when `flush.needs_attach_resume` and NEW-wire attach_resume
+    /// succeeded. `None` when AttachResume was not owed.
+    pub live_caps: Option<LiveCaps>,
+}
+
+/// Host remint production path after [`RemintSession::remint_and_attach`].
+///
+/// Order is load-bearing (never resume on the old wire):
+/// 1. [`AttachRunner::flush_and_teardown_after_remint`] on the OLD Binding
+/// 2. When `needs_attach_resume`, [`AttachRunner::attach_resume_on_new_wire`]
+///    on the NEW Binding (same agent session id)
+///
+/// LiveCaps fail-closed stays inside attach_resume. Never `session/load` or
+/// `session/new`. [`ClientCapabilities::HOST`] stays all false.
+///
+/// This is the Host orchestration that must compose the two runner steps —
+/// callers must not write AttachResume on the old wire or skip the NEW-wire
+/// resume when `needs_attach_resume` is set.
+pub fn host_remint_two_step(
+    old: &mut AttachRunner,
+    new: &mut AttachRunner,
+    new_transport: &mut RunnerTransport,
+    args: HostRemintArgs<'_>,
+) -> Result<HostRemintWires, RemintError> {
+    let HostRemintArgs {
+        session,
+        outcome,
+        init_rpc_id,
+        old_next_rpc_id,
+        new_next_rpc_id,
+    } = args;
+    let agent_session_id = outcome.agent_session_id.clone();
+    let flush = old.flush_and_teardown_after_remint(outcome, old_next_rpc_id);
+    if !flush.needs_attach_resume {
+        return Ok(HostRemintWires {
+            flush,
+            live_caps: None,
+        });
+    }
+    let live_caps = new.attach_resume_on_new_wire(
+        new_transport,
+        session,
+        &agent_session_id,
+        init_rpc_id,
+        new_next_rpc_id,
+    )?;
+    Ok(HostRemintWires {
+        flush,
+        live_caps: Some(live_caps),
+    })
+}
+
 fn set_nonblocking(out: &ChildStdout) -> Result<(), BusError> {
     let fd = out.as_raw_fd();
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
@@ -1537,5 +1604,218 @@ mod tests {
         assert_eq!(written[0]["id"], 30);
         assert_eq!(next, 31);
         assert!(session.live_caps().resume);
+    }
+
+    /// Host two-step: flush+teardown OLD then attach_resume NEW via
+    /// [`host_remint_two_step`] — ordering + same agent session id; never
+    /// resume on old wire; never session/load or session/new.
+    #[test]
+    fn host_remint_two_step_composes_flush_then_attach_resume() {
+        let (session, _, _) = RemintSession::open(
+            "sess-1",
+            "S-stable",
+            LiveCaps {
+                resume: true,
+                cancel: true,
+                close: true,
+                load_session: false,
+            },
+        );
+        session.begin_turn("mid");
+        let out = session.remint_and_attach().unwrap();
+        assert!(
+            out.wire_actions.contains(&WireAction::SessionClose)
+                || out.wire_actions.contains(&WireAction::SessionCancel)
+        );
+        assert!(out.wire_actions.contains(&WireAction::AttachResume));
+        let agent_sid = out.agent_session_id.clone();
+
+        let mut old_runner = initialized_fake(Vec::new());
+        let init_result = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "protocolVersion": 1,
+                "agentCapabilities": {
+                    "session": { "resume": true, "cancel": true, "close": true }
+                }
+            }
+        });
+        let mut new_runner = AttachRunner::spawn_fake(
+            WireKind::JsonlRpc,
+            JsonlRpcTransport::encode_jsonl(&init_result).unwrap(),
+        );
+        let mut transport = transport_for_wire(WireKind::JsonlRpc);
+        let mut old_next = 10u64;
+        let mut new_next = 2u64;
+
+        let wires = host_remint_two_step(
+            &mut old_runner,
+            &mut new_runner,
+            &mut transport,
+            HostRemintArgs {
+                session: &session,
+                outcome: out,
+                init_rpc_id: &RpcId::Num(1),
+                old_next_rpc_id: &mut old_next,
+                new_next_rpc_id: &mut new_next,
+            },
+        )
+        .expect("host remint two-step");
+        assert!(wires.flush.needs_attach_resume);
+        let caps = wires.live_caps.expect("attach resume owed");
+        assert!(caps.resume);
+        assert!(session.live_caps().resume);
+
+        // OLD: teardown present, resume absent.
+        let old_raw = std::str::from_utf8(old_runner.stdin_log().unwrap()).unwrap();
+        assert!(
+            old_raw.contains("session/close") || old_raw.contains("session/cancel"),
+            "old wire must teardown: {old_raw}"
+        );
+        assert!(!old_raw.contains("session/resume"));
+
+        // NEW: initialize (HOST all-false) then session/resume same id.
+        let new_raw = std::str::from_utf8(new_runner.stdin_log().unwrap()).unwrap();
+        let frames: Vec<serde_json::Value> = new_raw
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(frames.len(), 2, "initialize then resume: {frames:?}");
+        assert_eq!(frames[0]["method"], "initialize");
+        assert_eq!(
+            frames[0]["params"]["clientCapabilities"],
+            ClientCapabilities::HOST.to_json()
+        );
+        assert_eq!(frames[1]["method"], "session/resume");
+        assert_eq!(frames[1]["params"]["sessionId"], agent_sid);
+        assert!(
+            frames
+                .iter()
+                .all(|f| f["method"].as_str() != Some("session/new")
+                    && f["method"].as_str() != Some("session/load")),
+            "never session/new or session/load: {frames:?}"
+        );
+        // OLD teardown bytes precede NEW resume in wall-clock: Host calls
+        // flush on old before attach_resume on new (composition order).
+        assert_eq!(new_next, 3);
+    }
+
+    /// Host two-step fail-closed: NEW wire lacks resume → typed error; no
+    /// load/new fallback; old wire still tore down without resume.
+    #[test]
+    fn host_remint_two_step_fail_closed_no_load_new_fallback() {
+        let (session, _, _) = RemintSession::open(
+            "sess-1",
+            "S-stable",
+            LiveCaps {
+                resume: true,
+                cancel: true,
+                close: true,
+                load_session: false,
+            },
+        );
+        let out = session.remint_and_attach().unwrap();
+        assert!(out.wire_actions.contains(&WireAction::AttachResume));
+
+        let mut old_runner = initialized_fake(Vec::new());
+        // Copilot shape: loadSession only — no resume.
+        let init_result = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "protocolVersion": 1,
+                "agentCapabilities": { "loadSession": true }
+            }
+        });
+        let mut new_runner = AttachRunner::spawn_fake(
+            WireKind::JsonlRpc,
+            JsonlRpcTransport::encode_jsonl(&init_result).unwrap(),
+        );
+        let mut transport = transport_for_wire(WireKind::JsonlRpc);
+        let mut old_next = 1u64;
+        let mut new_next = 2u64;
+
+        let err = host_remint_two_step(
+            &mut old_runner,
+            &mut new_runner,
+            &mut transport,
+            HostRemintArgs {
+                session: &session,
+                outcome: out,
+                init_rpc_id: &RpcId::Num(1),
+                old_next_rpc_id: &mut old_next,
+                new_next_rpc_id: &mut new_next,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err, RemintError::LoadFallbackBlocked);
+        assert!(session
+            .observe()
+            .iter()
+            .any(|e| e.kind == RemintEventKind::FailClosed && e.text == "LoadFallbackBlocked"));
+
+        let old_raw = std::str::from_utf8(old_runner.stdin_log().unwrap()).unwrap();
+        assert!(!old_raw.contains("session/resume"));
+
+        let new_raw = std::str::from_utf8(new_runner.stdin_log().unwrap()).unwrap();
+        assert!(new_raw.contains("initialize"));
+        assert!(!new_raw.contains("session/resume"));
+        assert!(!new_raw.contains("session/load"));
+        assert!(!new_raw.contains("session/new"));
+        assert_eq!(
+            new_next, 2,
+            "rpc id must not advance when resume not written"
+        );
+    }
+
+    /// Host two-step: empty NEW caps → ResumeNotSupported; still no load/new.
+    #[test]
+    fn host_remint_two_step_fail_closed_resume_not_supported() {
+        let (session, _, _) = RemintSession::open(
+            "sess-1",
+            "S-stable",
+            LiveCaps {
+                resume: true,
+                cancel: true,
+                close: true,
+                load_session: false,
+            },
+        );
+        let out = session.remint_and_attach().unwrap();
+
+        let mut old_runner = initialized_fake(Vec::new());
+        let init_result = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": { "protocolVersion": 1, "agentCapabilities": {} }
+        });
+        let mut new_runner = AttachRunner::spawn_fake(
+            WireKind::JsonlRpc,
+            JsonlRpcTransport::encode_jsonl(&init_result).unwrap(),
+        );
+        let mut transport = transport_for_wire(WireKind::JsonlRpc);
+        let mut old_next = 1u64;
+        let mut new_next = 5u64;
+
+        let err = host_remint_two_step(
+            &mut old_runner,
+            &mut new_runner,
+            &mut transport,
+            HostRemintArgs {
+                session: &session,
+                outcome: out,
+                init_rpc_id: &RpcId::Num(1),
+                old_next_rpc_id: &mut old_next,
+                new_next_rpc_id: &mut new_next,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err, RemintError::ResumeNotSupported);
+        let new_raw = std::str::from_utf8(new_runner.stdin_log().unwrap()).unwrap();
+        assert!(!new_raw.contains("session/resume"));
+        assert!(!new_raw.contains("session/load"));
+        assert!(!new_raw.contains("session/new"));
     }
 }
