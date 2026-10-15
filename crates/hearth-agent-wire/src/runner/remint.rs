@@ -943,6 +943,23 @@ impl RemintSession {
             .map_err(|e| RemintError::HostLog(e.to_string()))
     }
 
+    /// Wire reply for one ask: `optionId: Some` → `selected`, `None` →
+    /// `cancelled`. Mirrors Host's `permission_reply`.
+    fn permission_reply(
+        g: &Inner,
+        rpc_id: &RpcId,
+        allow: bool,
+        option_id: Option<String>,
+    ) -> AgentCommand {
+        AgentCommand::ReplyPermission {
+            session_id: g.agent_session_id.clone(),
+            permission_id: rpc_id.to_string(),
+            allow,
+            option_id,
+            rpc_id: Some(rpc_id.clone()),
+        }
+    }
+
     /// Record a decoded ACP `session/request_permission` (must carry its
     /// JSON-RPC id). See [`Self::request_permission`].
     pub fn on_permission_ask(&self, ev: &AgentEvent) -> Result<PermissionRef, RemintError> {
@@ -1068,13 +1085,12 @@ impl RemintSession {
         // the tool and is still mid-turn. Only its terminal
         // (`turn_ended` / `complete_turn`, keyed by turn) clears it, so a
         // later remint still runs Cancel-before-reattach (10-10).
-        Ok(AgentCommand::ReplyPermission {
-            session_id: g.agent_session_id.clone(),
-            permission_id: rpc_id.to_string(),
-            allow: allowed,
-            option_id: Some(option_id.into()),
-            rpc_id: Some(rpc_id.clone()),
-        })
+        Ok(Self::permission_reply(
+            &g,
+            rpc_id,
+            allowed,
+            Some(option_id.into()),
+        ))
     }
 
     /// User cancel: answer **every** live ask `{outcome:"cancelled"}` on its
@@ -1097,13 +1113,7 @@ impl RemintSession {
         let live = std::mem::take(&mut g.pending);
         let dead = std::mem::take(&mut g.resurfaced);
         for ask in live.values() {
-            out.push(AgentCommand::ReplyPermission {
-                session_id: g.agent_session_id.clone(),
-                permission_id: ask.rpc_id.to_string(),
-                allow: false,
-                option_id: None,
-                rpc_id: Some(ask.rpc_id.clone()),
-            });
+            out.push(Self::permission_reply(&g, &ask.rpc_id, false, None));
         }
         for ask in live.values().chain(dead.values()) {
             Self::push_event(
