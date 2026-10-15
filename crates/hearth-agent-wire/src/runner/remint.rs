@@ -250,6 +250,9 @@ pub enum RemintError {
     HostLog(String),
     /// NEW-wire `initialize_host` or `session/resume` write failed after remint.
     NewWire(String),
+    /// Binding already live / ownership recheck failed (competing holder or
+    /// stale snapshot). Typed conflict — never silent steal.
+    BindingConflict,
 }
 
 impl RemintError {
@@ -268,6 +271,7 @@ impl RemintError {
             Self::NotAPermissionRequest => "NotAPermissionRequest",
             Self::HostLog(_) => "HostLog",
             Self::NewWire(_) => "NewWire",
+            Self::BindingConflict => "BindingConflict",
         }
     }
 }
@@ -818,6 +822,26 @@ impl RemintSession {
         self.inner.lock().unwrap().host_agent
     }
 
+    /// Test seam: inject a competing rebind between Binding snapshot and claim.
+    #[cfg(test)]
+    pub fn inject_before_claim(
+        &self,
+        hook: impl FnOnce(&HostSession, Option<hearth::BindingId>) + Send + 'static,
+    ) {
+        self.inner.lock().unwrap().before_claim = Some(Box::new(hook));
+    }
+
+    /// Test helper: Host BindingId mapped from a remint Binding id.
+    #[cfg(test)]
+    pub fn host_binding_of(&self, remint_bid: &str) -> Option<hearth::BindingId> {
+        self.inner
+            .lock()
+            .unwrap()
+            .host_bindings
+            .get(remint_bid)
+            .copied()
+    }
+
     pub fn turn_in_flight(&self) -> bool {
         self.inner.lock().unwrap().turn_in_flight
     }
@@ -1299,7 +1323,10 @@ impl RemintSession {
                 Host::from_bind("acp", Some(g.agent_session_id.clone()), None),
             )
             .map_err(|e| {
-                let err = RemintError::HostLog(e.to_string());
+                let err = match e {
+                    hearth::Error::BindingOwnerChanged => RemintError::BindingConflict,
+                    other => RemintError::HostLog(other.to_string()),
+                };
                 Self::push_event(&mut g, RemintEventKind::FailClosed, err.as_event_text());
                 err
             })?;
@@ -2806,7 +2833,7 @@ mod tests {
         s.start_tool("t1", "bash");
 
         let err = s.remint_and_attach().unwrap_err();
-        assert!(matches!(err, RemintError::HostLog(_)), "{err:?}");
+        assert_eq!(err, RemintError::BindingConflict, "{err:?}");
         let winner = winner.lock().unwrap().expect("competitor ran");
         assert_eq!(live_host_bindings(&s), vec![winner], "no duplicate");
         assert_eq!(s.binding_id(), bid, "remint state unchanged");

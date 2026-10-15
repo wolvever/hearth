@@ -7,7 +7,8 @@
 //! [`AgentCommand::Compact`]; it does not replace EventLog compact.
 //!
 //! Wire remint after Binding swap is Host-orchestrated via
-//! [`crate::runner::host_remint_two_step`] (OLD flush+teardown → NEW
+//! [`crate::runner::host_remint_full_path`] (`remint_and_attach` then
+//! [`crate::runner::host_remint_two_step`]: OLD flush+teardown → NEW
 //! attach_resume when owed) — not via this attach type.
 //!
 //! SoftExpiring / DualGate / AdmitCommit / Flush-before-dispatch stay parked.

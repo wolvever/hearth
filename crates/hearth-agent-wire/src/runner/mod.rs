@@ -525,9 +525,10 @@ pub struct HostRemintWires {
     pub live_caps: Option<LiveCaps>,
 }
 
-/// Host remint production path after [`RemintSession::remint_and_attach`].
+/// Host remint wire steps after [`RemintSession::remint_and_attach`].
 ///
-/// Order is load-bearing (never resume on the old wire):
+/// Prefer [`host_remint_full_path`] in production (it owns remint_and_attach
+/// → this two-step). Order is load-bearing (never resume on the old wire):
 /// 1. [`AttachRunner::flush_and_teardown_after_remint`] on the OLD Binding
 /// 2. When `needs_attach_resume`, [`AttachRunner::attach_resume_on_new_wire`]
 ///    on the NEW Binding (same agent session id)
@@ -535,8 +536,7 @@ pub struct HostRemintWires {
 /// LiveCaps fail-closed stays inside attach_resume. Never `session/load` or
 /// `session/new`. [`ClientCapabilities::HOST`] stays all false.
 ///
-/// This is the Host orchestration that must compose the two runner steps —
-/// callers must not write AttachResume on the old wire or skip the NEW-wire
+/// Callers must not write AttachResume on the old wire or skip the NEW-wire
 /// resume when `needs_attach_resume` is set.
 pub fn host_remint_two_step(
     old: &mut AttachRunner,
@@ -570,6 +570,64 @@ pub fn host_remint_two_step(
         flush,
         live_caps: Some(live_caps),
     })
+}
+
+/// Inputs for [`host_remint_full_path`] (session + rpc ids; runners stay
+/// separate args so OLD/NEW wires stay explicit).
+pub struct HostRemintFullArgs<'a> {
+    pub session: &'a RemintSession,
+    pub init_rpc_id: &'a RpcId,
+    pub old_next_rpc_id: &'a mut u64,
+    pub new_next_rpc_id: &'a mut u64,
+}
+
+/// Result of [`host_remint_full_path`]: Binding remint outcome plus the
+/// OLD/NEW wire steps from [`host_remint_two_step`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostRemintFullPath {
+    pub outcome: RemintOutcome,
+    pub wires: HostRemintWires,
+}
+
+/// Host remint **full** production path: one entry that composes
+/// [`RemintSession::remint_and_attach`] then [`host_remint_two_step`].
+///
+/// Production must not call `remint_and_attach` alone — this composer owns
+/// the order:
+/// 1. `remint_and_attach` (Binding swap + outcome; hard refuse with
+///    [`RemintError::BindingConflict`] when Binding already live / ownership
+///    changed — no silent steal)
+/// 2. OLD `flush_and_teardown_after_remint`
+/// 3. when `needs_attach_resume` → NEW `attach_resume_on_new_wire`
+///
+/// Never `session/load` or `session/new`. [`ClientCapabilities::HOST`] stays
+/// all false. SoftExpiring / Flush / Stage / Evidence / EffectId parked.
+pub fn host_remint_full_path(
+    old: &mut AttachRunner,
+    new: &mut AttachRunner,
+    new_transport: &mut RunnerTransport,
+    args: HostRemintFullArgs<'_>,
+) -> Result<HostRemintFullPath, RemintError> {
+    let HostRemintFullArgs {
+        session,
+        init_rpc_id,
+        old_next_rpc_id,
+        new_next_rpc_id,
+    } = args;
+    let outcome = session.remint_and_attach()?;
+    let wires = host_remint_two_step(
+        old,
+        new,
+        new_transport,
+        HostRemintArgs {
+            session,
+            outcome: outcome.clone(),
+            init_rpc_id,
+            old_next_rpc_id,
+            new_next_rpc_id,
+        },
+    )?;
+    Ok(HostRemintFullPath { outcome, wires })
 }
 
 fn set_nonblocking(out: &ChildStdout) -> Result<(), BusError> {
@@ -1817,5 +1875,183 @@ mod tests {
         assert!(!new_raw.contains("session/resume"));
         assert!(!new_raw.contains("session/load"));
         assert!(!new_raw.contains("session/new"));
+    }
+
+    /// Host full path: remint_and_attach then host_remint_two_step in one
+    /// entry — happy path; never load/new; HOST caps all false.
+    #[test]
+    fn host_remint_full_path_composes_remint_then_two_step() {
+        let (session, _, _) = RemintSession::open(
+            "sess-1",
+            "S-stable",
+            LiveCaps {
+                resume: true,
+                cancel: true,
+                close: true,
+                load_session: false,
+            },
+        );
+        session.begin_turn("mid");
+        let agent_sid_before = session.agent_session_id();
+
+        let mut old_runner = initialized_fake(Vec::new());
+        let init_result = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "protocolVersion": 1,
+                "agentCapabilities": {
+                    "session": { "resume": true, "cancel": true, "close": true }
+                }
+            }
+        });
+        let mut new_runner = AttachRunner::spawn_fake(
+            WireKind::JsonlRpc,
+            JsonlRpcTransport::encode_jsonl(&init_result).unwrap(),
+        );
+        let mut transport = transport_for_wire(WireKind::JsonlRpc);
+        let mut old_next = 10u64;
+        let mut new_next = 2u64;
+
+        let full = host_remint_full_path(
+            &mut old_runner,
+            &mut new_runner,
+            &mut transport,
+            HostRemintFullArgs {
+                session: &session,
+                init_rpc_id: &RpcId::Num(1),
+                old_next_rpc_id: &mut old_next,
+                new_next_rpc_id: &mut new_next,
+            },
+        )
+        .expect("host remint full path");
+
+        assert!(
+            full.outcome
+                .wire_actions
+                .contains(&WireAction::SessionClose)
+                || full
+                    .outcome
+                    .wire_actions
+                    .contains(&WireAction::SessionCancel)
+        );
+        assert!(full
+            .outcome
+            .wire_actions
+            .contains(&WireAction::AttachResume));
+        assert_eq!(full.outcome.agent_session_id, agent_sid_before);
+        assert!(full.wires.flush.needs_attach_resume);
+        let caps = full.wires.live_caps.expect("attach resume owed");
+        assert!(caps.resume);
+        assert!(session.live_caps().resume);
+
+        let old_raw = std::str::from_utf8(old_runner.stdin_log().unwrap()).unwrap();
+        assert!(
+            old_raw.contains("session/close") || old_raw.contains("session/cancel"),
+            "old wire must teardown: {old_raw}"
+        );
+        assert!(!old_raw.contains("session/resume"));
+        assert!(!old_raw.contains("session/load"));
+        assert!(!old_raw.contains("session/new"));
+
+        let new_raw = std::str::from_utf8(new_runner.stdin_log().unwrap()).unwrap();
+        let frames: Vec<serde_json::Value> = new_raw
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(frames.len(), 2, "initialize then resume: {frames:?}");
+        assert_eq!(frames[0]["method"], "initialize");
+        assert_eq!(
+            frames[0]["params"]["clientCapabilities"],
+            ClientCapabilities::HOST.to_json()
+        );
+        assert_eq!(
+            frames[0]["params"]["clientCapabilities"],
+            serde_json::json!({
+                "fs": {"readTextFile": false, "writeTextFile": false},
+                "terminal": false
+            })
+        );
+        assert_eq!(frames[1]["method"], "session/resume");
+        assert_eq!(frames[1]["params"]["sessionId"], agent_sid_before);
+        assert!(
+            frames
+                .iter()
+                .all(|f| f["method"].as_str() != Some("session/new")
+                    && f["method"].as_str() != Some("session/load")),
+            "never session/new or session/load: {frames:?}"
+        );
+        assert_eq!(new_next, 3);
+    }
+
+    /// Host full path hard-refuse: competing Binding holder → typed
+    /// [`RemintError::BindingConflict`]; no wire writes (no silent steal,
+    /// no load/new).
+    #[test]
+    fn host_remint_full_path_refuses_binding_conflict() {
+        let (session, _, bid) = RemintSession::open(
+            "sess-1",
+            "S-stable",
+            LiveCaps {
+                resume: true,
+                cancel: true,
+                close: true,
+                load_session: false,
+            },
+        );
+        // Competing rebind wins between snapshot and claim (same as
+        // remint_claim_rechecks_owner_after_competing_rebind).
+        let old = session.host_binding_of(&bid);
+        let agent = session.host_agent_id();
+        session.inject_before_claim(move |host, snap| {
+            assert_eq!(snap, old);
+            let _ = host
+                .rebind(snap, agent, hearth::Host::from_bind("acp", None, None))
+                .unwrap();
+        });
+        session.begin_turn("mid");
+
+        let mut old_runner = initialized_fake(Vec::new());
+        let mut new_runner = AttachRunner::spawn_fake(WireKind::JsonlRpc, Vec::new());
+        let mut transport = transport_for_wire(WireKind::JsonlRpc);
+        let mut old_next = 1u64;
+        let mut new_next = 2u64;
+
+        let err = host_remint_full_path(
+            &mut old_runner,
+            &mut new_runner,
+            &mut transport,
+            HostRemintFullArgs {
+                session: &session,
+                init_rpc_id: &RpcId::Num(1),
+                old_next_rpc_id: &mut old_next,
+                new_next_rpc_id: &mut new_next,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err, RemintError::BindingConflict);
+        assert!(session
+            .observe()
+            .iter()
+            .any(|e| e.kind == RemintEventKind::FailClosed && e.text == "BindingConflict"));
+
+        // Remint state unchanged; no OLD/NEW wire traffic from the composer
+        // (old runner may only have its prior initialize from initialized_fake).
+        assert_eq!(session.binding_id(), bid);
+        let old_raw = std::str::from_utf8(old_runner.stdin_log().unwrap()).unwrap();
+        let old_after_init = frames_after_initialize(&old_runner);
+        assert!(
+            old_after_init.is_empty(),
+            "no flush/teardown on conflict: {old_after_init:?}"
+        );
+        assert!(!old_raw.contains("session/resume"));
+        assert!(!old_raw.contains("session/load"));
+        assert!(!old_raw.contains("session/new"));
+        assert!(
+            new_runner.stdin_log().unwrap().is_empty(),
+            "NEW wire must stay silent on conflict"
+        );
+        assert_eq!(new_next, 2);
     }
 }
