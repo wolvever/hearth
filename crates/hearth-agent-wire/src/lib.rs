@@ -40,10 +40,11 @@ pub use host::{
     binding_kind, event_bodies, host_for, AttachError, AttachResult, HostAttach, PendingAsk,
 };
 pub use runner::{
-    encode_remint_rpc, flush_and_teardown_old_wire, flush_old_wire_replies, host_remint_two_step,
-    transport_for_wire, write_new_wire_attach_resume, write_old_wire_teardown, AttachRunner,
-    HostRemintArgs, HostRemintWires, LiveCaps, OldWireFlush, OldWireWrite, RemintError,
-    RemintEvent, RemintEventKind, RemintOutcome, RemintSession, RemintWireMethod, RunnerTransport,
+    encode_remint_rpc, flush_and_teardown_old_wire, flush_old_wire_replies, host_remint_full_path,
+    host_remint_two_step, transport_for_wire, write_new_wire_attach_resume,
+    write_old_wire_teardown, AttachRunner, HostRemintArgs, HostRemintFullArgs, HostRemintFullPath,
+    HostRemintWires, LiveCaps, OldWireFlush, OldWireWrite, RemintError, RemintEvent,
+    RemintEventKind, RemintOutcome, RemintSession, RemintWireMethod, RunnerTransport,
 };
 pub use transport::{
     JsonRpcTransport, JsonlProblem, JsonlRpcTransport, SseFrame, SseTransport, Transport,
