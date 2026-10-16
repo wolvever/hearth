@@ -12,6 +12,7 @@ Host-adjacent spawn / pump / remint. **Not a kernel noun.**
 | `AttachRunner::flush_and_teardown_after_remint` | Runner adapter: calls `flush_and_teardown_old_wire` via one `OldWireWrite` sink on the OLD wire |
 | `AttachRunner::attach_resume_on_new_wire` | After remint: `initialize_host` on NEW wire → `set_live_caps` → `session/resume` (fail-closed if not advertised) |
 | `host_remint_two_step` | Host orchestration: OLD `flush_and_teardown_after_remint` → if `needs_attach_resume` → NEW `attach_resume_on_new_wire` |
+| `host_wake` | Host wake driver: proven-lost `OldWire` → `host_remint_full_path`; live → reuse; unknown → `Waiting(LivenessUnknown)` |
 | `host_remint_full_path` | Host production entry: `remint_and_attach` → `host_remint_two_step` (typed `BindingConflict` on live/steal) |
 
 ## Remint (fail-closed)
