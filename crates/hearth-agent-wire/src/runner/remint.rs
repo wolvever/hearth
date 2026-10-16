@@ -52,7 +52,7 @@ use hearth::{
 use serde_json::Value;
 
 use crate::adapters::acp::{self, ClientCapabilities, ClientRequestRoute};
-use crate::host::option_allows;
+use crate::host::{option_allows, reply_permission};
 use crate::{AgentCommand, AgentEvent, BusError, PermissionOption, RpcId};
 
 /// Live agent capabilities from an ACP `initialize` result (not static
@@ -968,20 +968,14 @@ impl RemintSession {
     }
 
     /// Wire reply for one ask: `optionId: Some` → `selected`, `None` →
-    /// `cancelled`. Mirrors Host's `permission_reply`.
+    /// `cancelled`. Thin wrapper over [`reply_permission`] (shared with Host).
     fn permission_reply(
         g: &Inner,
         rpc_id: &RpcId,
         allow: bool,
         option_id: Option<String>,
     ) -> AgentCommand {
-        AgentCommand::ReplyPermission {
-            session_id: g.agent_session_id.clone(),
-            permission_id: rpc_id.to_string(),
-            allow,
-            option_id,
-            rpc_id: Some(rpc_id.clone()),
-        }
+        reply_permission(g.agent_session_id.clone(), rpc_id, allow, option_id)
     }
 
     /// Record a decoded ACP `session/request_permission` (must carry its

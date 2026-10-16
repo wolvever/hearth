@@ -87,6 +87,24 @@ pub(crate) fn option_allows(opt: &PermissionOption) -> bool {
     }
 }
 
+/// Wire reply for one ask: `optionId: Some` → `selected`, `None` →
+/// `cancelled`. Shared by [`HostAttach`] and [`crate::runner::RemintSession`]
+/// so ReplyPermission construction stays one place (post-#27 residual).
+pub(crate) fn reply_permission(
+    session_id: String,
+    rpc_id: &RpcId,
+    allow: bool,
+    option_id: Option<String>,
+) -> AgentCommand {
+    AgentCommand::ReplyPermission {
+        session_id,
+        permission_id: rpc_id.to_string(),
+        allow,
+        option_id,
+        rpc_id: Some(rpc_id.clone()),
+    }
+}
+
 pub type AttachResult<T> = std::result::Result<T, AttachError>;
 
 /// Binding `kind` string for an [`AgentKind`]. [`AgentKind::GrokBuild`] is
@@ -404,13 +422,7 @@ impl<A: CodingAgent> HostAttach<A> {
         allowed: bool,
         option_id: Option<String>,
     ) -> AgentCommand {
-        AgentCommand::ReplyPermission {
-            session_id: self.wire_session(),
-            permission_id: rpc_id.to_string(),
-            allow: allowed,
-            option_id,
-            rpc_id: Some(rpc_id.clone()),
-        }
+        reply_permission(self.wire_session(), rpc_id, allowed, option_id)
     }
 
     /// Answer one ask on its JSON-RPC id with `{outcome:"selected", optionId}`.
