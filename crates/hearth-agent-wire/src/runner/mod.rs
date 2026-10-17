@@ -630,6 +630,105 @@ pub fn host_remint_full_path(
     Ok(HostRemintFullPath { outcome, wires })
 }
 
+/// What the Host knows about the OLD wire at wake time. Only `Exited`,
+/// `StdoutEof` and `TransportError` prove the wire lost; a running child
+/// alone is not proof of anything (`Unknown`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OldWire {
+    /// Child `try_wait` returned `Some(code)`.
+    Exited(i32),
+    /// Child stdout hit EOF.
+    StdoutEof,
+    /// Real IO error on the old wire (read/write failure, EPIPE). A read
+    /// timeout is NOT this: `read_stdout` returns no bytes on timeout
+    /// (never an error), and callers must report a timeout as
+    /// [`OldWire::Unknown`].
+    TransportError(String),
+    /// Wire alive, no turn open.
+    LiveIdle,
+    /// Wire alive, turn open.
+    LiveInTurn,
+    /// No evidence either way.
+    Unknown,
+}
+
+impl OldWire {
+    pub fn is_lost(&self) -> bool {
+        matches!(
+            self,
+            Self::Exited(_) | Self::StdoutEof | Self::TransportError(_)
+        )
+    }
+}
+
+impl AttachRunner {
+    /// Probe the child via `try_wait`:
+    /// - `Ok(Some(code))` → [`OldWire::Exited`] (observed exit: proof of loss)
+    /// - `Ok(None)` → [`OldWire::Unknown`] (running is not proof of a live,
+    ///   answering wire)
+    /// - `Err(_)` → [`OldWire::Unknown`]: a failed probe is not an observed
+    ///   exit, so it never mints. Only observed exit, stdout EOF, or a real
+    ///   wire IO error ([`OldWire::TransportError`], reported by the caller
+    ///   from a read/write) prove loss.
+    pub fn probe_exit(&mut self) -> OldWire {
+        old_wire_from_try_wait(self.try_wait())
+    }
+}
+
+fn old_wire_from_try_wait(r: Result<Option<i32>, BusError>) -> OldWire {
+    match r {
+        Ok(Some(code)) => OldWire::Exited(code),
+        Ok(None) | Err(_) => OldWire::Unknown,
+    }
+}
+
+/// Result of [`host_wake`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostWake {
+    /// Old wire proven lost: one Binding mint, new wire resumed.
+    Reminted(Box<HostRemintFullPath>),
+    /// Old wire alive: existing Binding reused, no wire action.
+    ReuseLive,
+    /// No evidence: zero wire actions, zero mints.
+    Waiting(hearth::WaitReason),
+}
+
+/// Host wake driver — the production caller of [`host_remint_full_path`].
+///
+/// - Old wire proven lost → kill + reap the old child, then
+///   [`host_remint_full_path`] (cancel-before-reattach
+///   if a turn is in flight, flush/teardown, new wire, `session/resume` with
+///   the same session id).
+/// - `LiveIdle` / `LiveInTurn` → reuse the Binding. No remint, no cancel.
+/// - `Unknown` → `Waiting(LivenessUnknown)`, no wire action.
+///
+/// Exactly one Binding mint per wake: the only mint is the rebind inside
+/// [`RemintSession::remint_and_attach`]. Callers must not also claim a
+/// Binding (e.g. `Runtime::wake` / `claim_binding`) for the same wake — that
+/// rebind(None) would move ownership off the snapshotted old Binding and the
+/// remint would refuse with [`RemintError::BindingConflict`].
+pub fn host_wake(
+    old_wire: OldWire,
+    old: &mut AttachRunner,
+    new: &mut AttachRunner,
+    new_transport: &mut RunnerTransport,
+    args: HostRemintFullArgs<'_>,
+) -> Result<HostWake, RemintError> {
+    match old_wire {
+        OldWire::LiveIdle | OldWire::LiveInTurn => Ok(HostWake::ReuseLive),
+        OldWire::Unknown => Ok(HostWake::Waiting(hearth::WaitReason::LivenessUnknown)),
+        OldWire::Exited(_) | OldWire::StdoutEof | OldWire::TransportError(_) => {
+            // EOF / EPIPE can happen while the child still runs: kill and
+            // reap it BEFORE the new Binding is minted so two live agents
+            // never share a session. Teardown writes then drop (dead wire).
+            old.kill()
+                .map_err(|e| RemintError::HostLog(format!("kill old: {e}")))?;
+            host_remint_full_path(old, new, new_transport, args)
+                .map(|full| HostWake::Reminted(Box::new(full)))
+        }
+    }
+}
+
 fn set_nonblocking(out: &ChildStdout) -> Result<(), BusError> {
     let fd = out.as_raw_fd();
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
@@ -2053,5 +2152,234 @@ mod tests {
             "NEW wire must stay silent on conflict"
         );
         assert_eq!(new_next, 2);
+    }
+    // ---- host_wake driver ----
+
+    fn wake_session() -> RemintSession {
+        RemintSession::open(
+            "sess-1",
+            "S-stable",
+            LiveCaps {
+                resume: true,
+                cancel: true,
+                close: true,
+                load_session: false,
+            },
+        )
+        .0
+    }
+
+    fn mints(session: &RemintSession) -> usize {
+        session
+            .host_events()
+            .iter()
+            .filter(|e| matches!(e.body, hearth::EventBody::BindingAttached { .. }))
+            .count()
+    }
+
+    fn new_wire_fake() -> AttachRunner {
+        let init = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": { "protocolVersion": 1,
+                "agentCapabilities": { "session": { "resume": true, "cancel": true, "close": true } } }
+        });
+        AttachRunner::spawn_fake(
+            WireKind::JsonlRpc,
+            JsonlRpcTransport::encode_jsonl(&init).unwrap(),
+        )
+    }
+
+    fn run_wake(
+        session: &RemintSession,
+        old_wire: OldWire,
+        old: &mut AttachRunner,
+        new: &mut AttachRunner,
+    ) -> Result<HostWake, RemintError> {
+        let mut transport = transport_for_wire(WireKind::JsonlRpc);
+        let (mut old_next, mut new_next) = (10u64, 2u64);
+        host_wake(
+            old_wire,
+            old,
+            new,
+            &mut transport,
+            HostRemintFullArgs {
+                session,
+                init_rpc_id: &RpcId::Num(1),
+                old_next_rpc_id: &mut old_next,
+                new_next_rpc_id: &mut new_next,
+            },
+        )
+    }
+
+    /// Lost wire (each proof kind): exactly one mint, cancel-before-reattach
+    /// mid-turn, new wire initialize (HOST false) + resume same session id.
+    #[test]
+    fn host_wake_lost_wire_remints_once_and_resumes() {
+        for kind in ["exit", "eof", "transport"] {
+            let session = wake_session();
+            session.begin_turn("mid");
+            let sid = session.agent_session_id();
+            let bid = session.binding_id();
+            let mut old = initialized_fake(Vec::new());
+            let old_wire = match kind {
+                // Fake stdout exhausted → try_wait reports exit.
+                "exit" => old.probe_exit(),
+                "eof" => OldWire::StdoutEof,
+                _ => OldWire::TransportError("broken pipe".into()),
+            };
+            assert!(old_wire.is_lost(), "{kind}: {old_wire:?}");
+            let mut new = new_wire_fake();
+            let before = mints(&session);
+
+            let HostWake::Reminted(full) = run_wake(&session, old_wire, &mut old, &mut new)
+                .unwrap_or_else(|e| panic!("{kind}: {e:?}"))
+            else {
+                panic!("{kind}: expected Reminted");
+            };
+
+            assert_eq!(mints(&session), before + 1, "{kind}: exactly one mint");
+            assert_ne!(session.binding_id(), bid);
+            let w = &full.outcome.wire_actions;
+            assert!(
+                w.contains(&WireAction::SessionCancel) || w.contains(&WireAction::SessionClose),
+                "{kind}: cancel-before-reattach: {w:?}"
+            );
+            assert!(!session.turn_in_flight());
+            let frames: Vec<serde_json::Value> = std::str::from_utf8(new.stdin_log().unwrap())
+                .unwrap()
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+            assert_eq!(frames.len(), 2, "{kind}: {frames:?}");
+            assert_eq!(frames[0]["method"], "initialize");
+            assert_eq!(
+                frames[0]["params"]["clientCapabilities"],
+                ClientCapabilities::HOST.to_json()
+            );
+            assert_eq!(frames[1]["method"], "session/resume");
+            assert_eq!(frames[1]["params"]["sessionId"], sid);
+            for raw in [old.stdin_log().unwrap(), new.stdin_log().unwrap()] {
+                let raw = std::str::from_utf8(raw).unwrap();
+                assert!(!raw.contains("session/load") && !raw.contains("session/new"));
+            }
+        }
+    }
+
+    /// Live wire (idle or in turn): reuse Binding, zero wire writes, zero
+    /// mints, healthy turn not cancelled.
+    #[test]
+    fn host_wake_live_wire_reuses_binding_without_wire_writes() {
+        for (old_wire, in_turn) in [(OldWire::LiveIdle, false), (OldWire::LiveInTurn, true)] {
+            let session = wake_session();
+            if in_turn {
+                session.begin_turn("mid");
+            }
+            let bid = session.binding_id();
+            let before = mints(&session);
+            let mut old = initialized_fake(Vec::new());
+            let old_log = old.stdin_log().unwrap().len();
+            let mut new = new_wire_fake();
+
+            let r = run_wake(&session, old_wire.clone(), &mut old, &mut new).unwrap();
+            assert_eq!(r, HostWake::ReuseLive, "{old_wire:?}");
+            assert_eq!(session.binding_id(), bid);
+            assert_eq!(mints(&session), before);
+            assert_eq!(session.turn_in_flight(), in_turn);
+            assert_eq!(
+                old.stdin_log().unwrap().len(),
+                old_log,
+                "no old-wire writes"
+            );
+            assert!(new.stdin_log().unwrap().is_empty(), "no new-wire writes");
+        }
+    }
+
+    /// No evidence: typed Waiting(LivenessUnknown), zero wire writes/mints.
+    #[test]
+    fn host_wake_unknown_waits_without_wire_action() {
+        let session = wake_session();
+        session.begin_turn("mid");
+        let bid = session.binding_id();
+        let before = mints(&session);
+        let mut old = initialized_fake(Vec::new());
+        let old_log = old.stdin_log().unwrap().len();
+        let mut new = new_wire_fake();
+
+        let r = run_wake(&session, OldWire::Unknown, &mut old, &mut new).unwrap();
+        assert_eq!(r, HostWake::Waiting(hearth::WaitReason::LivenessUnknown));
+        assert_eq!(session.binding_id(), bid);
+        assert_eq!(mints(&session), before);
+        assert!(session.turn_in_flight());
+        assert_eq!(old.stdin_log().unwrap().len(), old_log);
+        assert!(new.stdin_log().unwrap().is_empty());
+    }
+
+    /// One-mint guard: a second claim on the same wake (Runtime::wake-style
+    /// `rebind(None)` / `claim_binding`) while the old Binding is still owned
+    /// is refused (`BindingOwnerChanged` → `AlreadyLive`), so the driver's
+    /// rebind inside `remint_and_attach` is the only mint.
+    #[test]
+    fn host_wake_second_claim_refused_single_mint() {
+        let session = wake_session();
+        let agent = session.host_agent_id();
+        let claimed = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let c = claimed.clone();
+        session.inject_before_claim(move |host, _snap| {
+            let r = host.rebind(None, agent, hearth::Host::from_bind("acp", None, None));
+            *c.lock().unwrap() = Some(r.is_err());
+        });
+        let before = mints(&session);
+        let mut old = initialized_fake(Vec::new());
+        let mut new = new_wire_fake();
+        let r = run_wake(&session, OldWire::StdoutEof, &mut old, &mut new).unwrap();
+        assert!(matches!(r, HostWake::Reminted(_)));
+        assert_eq!(*claimed.lock().unwrap(), Some(true), "second claim refused");
+        assert_eq!(mints(&session), before + 1, "exactly one mint");
+    }
+    /// try_wait error is not proof of loss: Unknown → Waiting, zero
+    /// mints, zero wire writes.
+    #[test]
+    fn host_wake_probe_error_waits_without_wire_action() {
+        let old_wire = old_wire_from_try_wait(Err(BusError::Transport("try_wait: EINVAL".into())));
+        assert_eq!(old_wire, OldWire::Unknown);
+        assert!(!old_wire.is_lost());
+        let session = wake_session();
+        let bid = session.binding_id();
+        let before = mints(&session);
+        let mut old = initialized_fake(Vec::new());
+        let old_log = old.stdin_log().unwrap().len();
+        let mut new = new_wire_fake();
+        let r = run_wake(&session, old_wire, &mut old, &mut new).unwrap();
+        assert_eq!(r, HostWake::Waiting(hearth::WaitReason::LivenessUnknown));
+        assert_eq!(session.binding_id(), bid);
+        assert_eq!(mints(&session), before);
+        assert_eq!(old.stdin_log().unwrap().len(), old_log);
+        assert!(new.stdin_log().unwrap().is_empty());
+    }
+    /// Lost via StdoutEof while the child still runs: old child is killed
+    /// and reaped before the mint — no teardown frame reaches it (kill
+    /// precedes remint_and_attach), exactly one mint.
+    #[test]
+    fn host_wake_kills_running_old_child_before_mint() {
+        let session = wake_session();
+        session.begin_turn("mid");
+        let before = mints(&session);
+        // Unread stdout keeps the fake child running.
+        let mut old = initialized_fake(b"{}\n".to_vec());
+        let old_log = old.stdin_log().unwrap().len();
+        let mut new = new_wire_fake();
+        let r = run_wake(&session, OldWire::StdoutEof, &mut old, &mut new).unwrap();
+        assert!(matches!(r, HostWake::Reminted(_)));
+        assert_eq!(
+            old.try_wait().unwrap(),
+            Some(9),
+            "old child killed + reaped"
+        );
+        assert_eq!(
+            old.stdin_log().unwrap().len(),
+            old_log,
+            "killed before mint: teardown writes dropped"
+        );
+        assert_eq!(mints(&session), before + 1);
     }
 }
