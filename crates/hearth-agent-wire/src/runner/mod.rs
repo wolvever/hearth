@@ -639,7 +639,10 @@ pub enum OldWire {
     Exited(i32),
     /// Child stdout hit EOF.
     StdoutEof,
-    /// Transport / IO error on the old wire.
+    /// Real IO error on the old wire (read/write failure, EPIPE). A read
+    /// timeout is NOT this: `read_stdout` returns no bytes on timeout
+    /// (never an error), and callers must report a timeout as
+    /// [`OldWire::Unknown`].
     TransportError(String),
     /// Wire alive, no turn open.
     LiveIdle,
@@ -659,15 +662,23 @@ impl OldWire {
 }
 
 impl AttachRunner {
-    /// Probe the child: `Some` exit → [`OldWire::Exited`], probe error →
-    /// [`OldWire::TransportError`], still running → [`OldWire::Unknown`]
-    /// (running is not proof of a live, answering wire).
+    /// Probe the child via `try_wait`:
+    /// - `Ok(Some(code))` → [`OldWire::Exited`] (observed exit: proof of loss)
+    /// - `Ok(None)` → [`OldWire::Unknown`] (running is not proof of a live,
+    ///   answering wire)
+    /// - `Err(_)` → [`OldWire::Unknown`]: a failed probe is not an observed
+    ///   exit, so it never mints. Only observed exit, stdout EOF, or a real
+    ///   wire IO error ([`OldWire::TransportError`], reported by the caller
+    ///   from a read/write) prove loss.
     pub fn probe_exit(&mut self) -> OldWire {
-        match self.try_wait() {
-            Ok(Some(code)) => OldWire::Exited(code),
-            Ok(None) => OldWire::Unknown,
-            Err(e) => OldWire::TransportError(e.to_string()),
-        }
+        old_wire_from_try_wait(self.try_wait())
+    }
+}
+
+fn old_wire_from_try_wait(r: Result<Option<i32>, BusError>) -> OldWire {
+    match r {
+        Ok(Some(code)) => OldWire::Exited(code),
+        Ok(None) | Err(_) => OldWire::Unknown,
     }
 }
 
@@ -684,7 +695,8 @@ pub enum HostWake {
 
 /// Host wake driver — the production caller of [`host_remint_full_path`].
 ///
-/// - Old wire proven lost → [`host_remint_full_path`] (cancel-before-reattach
+/// - Old wire proven lost → kill + reap the old child, then
+///   [`host_remint_full_path`] (cancel-before-reattach
 ///   if a turn is in flight, flush/teardown, new wire, `session/resume` with
 ///   the same session id).
 /// - `LiveIdle` / `LiveInTurn` → reuse the Binding. No remint, no cancel.
@@ -706,6 +718,11 @@ pub fn host_wake(
         OldWire::LiveIdle | OldWire::LiveInTurn => Ok(HostWake::ReuseLive),
         OldWire::Unknown => Ok(HostWake::Waiting(hearth::WaitReason::LivenessUnknown)),
         OldWire::Exited(_) | OldWire::StdoutEof | OldWire::TransportError(_) => {
+            // EOF / EPIPE can happen while the child still runs: kill and
+            // reap it BEFORE the new Binding is minted so two live agents
+            // never share a session. Teardown writes then drop (dead wire).
+            old.kill()
+                .map_err(|e| RemintError::HostLog(format!("kill old: {e}")))?;
             host_remint_full_path(old, new, new_transport, args)
                 .map(|full| HostWake::Reminted(Box::new(full)))
         }
@@ -2318,5 +2335,51 @@ mod tests {
         assert!(matches!(r, HostWake::Reminted(_)));
         assert_eq!(*claimed.lock().unwrap(), Some(true), "second claim refused");
         assert_eq!(mints(&session), before + 1, "exactly one mint");
+    }
+    /// try_wait error is not proof of loss: Unknown → Waiting, zero
+    /// mints, zero wire writes.
+    #[test]
+    fn host_wake_probe_error_waits_without_wire_action() {
+        let old_wire = old_wire_from_try_wait(Err(BusError::Transport("try_wait: EINVAL".into())));
+        assert_eq!(old_wire, OldWire::Unknown);
+        assert!(!old_wire.is_lost());
+        let session = wake_session();
+        let bid = session.binding_id();
+        let before = mints(&session);
+        let mut old = initialized_fake(Vec::new());
+        let old_log = old.stdin_log().unwrap().len();
+        let mut new = new_wire_fake();
+        let r = run_wake(&session, old_wire, &mut old, &mut new).unwrap();
+        assert_eq!(r, HostWake::Waiting(hearth::WaitReason::LivenessUnknown));
+        assert_eq!(session.binding_id(), bid);
+        assert_eq!(mints(&session), before);
+        assert_eq!(old.stdin_log().unwrap().len(), old_log);
+        assert!(new.stdin_log().unwrap().is_empty());
+    }
+    /// Lost via StdoutEof while the child still runs: old child is killed
+    /// and reaped before the mint — no teardown frame reaches it (kill
+    /// precedes remint_and_attach), exactly one mint.
+    #[test]
+    fn host_wake_kills_running_old_child_before_mint() {
+        let session = wake_session();
+        session.begin_turn("mid");
+        let before = mints(&session);
+        // Unread stdout keeps the fake child running.
+        let mut old = initialized_fake(b"{}\n".to_vec());
+        let old_log = old.stdin_log().unwrap().len();
+        let mut new = new_wire_fake();
+        let r = run_wake(&session, OldWire::StdoutEof, &mut old, &mut new).unwrap();
+        assert!(matches!(r, HostWake::Reminted(_)));
+        assert_eq!(
+            old.try_wait().unwrap(),
+            Some(9),
+            "old child killed + reaped"
+        );
+        assert_eq!(
+            old.stdin_log().unwrap().len(),
+            old_log,
+            "killed before mint: teardown writes dropped"
+        );
+        assert_eq!(mints(&session), before + 1);
     }
 }
