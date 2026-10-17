@@ -161,23 +161,31 @@ impl AttachRunner {
     }
 
     /// Read available stdout bytes into a JSONL transport.
+    ///
+    /// [`StdoutRead::Eof`] yields `Ok(0)` here (no frames to push). Wake
+    /// callers that need the loss proof must use [`Self::probe_stdout`]
+    /// or map [`Self::read_stdout`] via [`old_wire_from_stdout`].
     pub fn pump_jsonl(&mut self, t: &mut JsonlRpcTransport) -> Result<usize, BusError> {
-        let chunk = self.read_stdout()?;
-        let n = chunk.len();
-        if n > 0 {
-            t.push_bytes(&chunk);
+        match self.read_stdout()? {
+            StdoutRead::Bytes(chunk) => {
+                let n = chunk.len();
+                t.push_bytes(&chunk);
+                Ok(n)
+            }
+            StdoutRead::Empty | StdoutRead::Eof => Ok(0),
         }
-        Ok(n)
     }
 
     /// Read available stdout bytes into a Content-Length JSON-RPC transport.
     pub fn pump_jsonrpc(&mut self, t: &mut JsonRpcTransport) -> Result<usize, BusError> {
-        let chunk = self.read_stdout()?;
-        let n = chunk.len();
-        if n > 0 {
-            t.push_bytes(&chunk)?;
+        match self.read_stdout()? {
+            StdoutRead::Bytes(chunk) => {
+                let n = chunk.len();
+                t.push_bytes(&chunk)?;
+                Ok(n)
+            }
+            StdoutRead::Empty | StdoutRead::Eof => Ok(0),
         }
-        Ok(n)
     }
 
     /// Pump into the transport selected by [`Self::wire`].
@@ -287,38 +295,55 @@ impl AttachRunner {
         }
     }
 
-    fn read_stdout(&mut self) -> Result<Vec<u8>, BusError> {
+    /// One Real/Fake stdout read. Distinguishes real EOF (`Ok(0)` after
+    /// poll-readable / POLLHUP) from timeout / WouldBlock empty so wake can
+    /// surface [`OldWire::StdoutEof`] without treating idle as lost.
+    pub fn read_stdout(&mut self) -> Result<StdoutRead, BusError> {
         match &mut self.io {
             ChildIo::Real { stdout, .. } => {
                 let Some(out) = stdout.as_mut() else {
-                    return Ok(Vec::new());
+                    // Handle already gone — wire closed.
+                    return Ok(StdoutRead::Eof);
                 };
                 if !poll_readable(out.as_raw_fd(), READ_STDOUT_TIMEOUT)? {
-                    // Timeout / no data — return empty rather than hang.
-                    return Ok(Vec::new());
+                    // Timeout / no data — NOT proof of loss.
+                    return Ok(StdoutRead::Empty);
                 }
                 let mut buf = [0u8; 4096];
                 match out.read(&mut buf) {
-                    Ok(0) => Ok(Vec::new()),
-                    Ok(n) => Ok(buf[..n].to_vec()),
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(Vec::new()),
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => Ok(Vec::new()),
+                    // Poll said readable (incl. POLLHUP) but no bytes: EOF.
+                    Ok(0) => Ok(StdoutRead::Eof),
+                    Ok(n) => Ok(StdoutRead::Bytes(buf[..n].to_vec())),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(StdoutRead::Empty),
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => Ok(StdoutRead::Empty),
                     Err(e) => Err(BusError::Transport(format!("read stdout: {e}"))),
                 }
             }
             ChildIo::Fake { stdout, pos, .. } => {
-                // Exhausting stdout does not kill the fake child — try_wait
-                // does. Live attach may still write after initialize returns.
+                // Fake queue exhaust is Empty, not Eof — try_wait owns the
+                // Exited proof when the buffer drains. Real Ok(0) is the only
+                // StdoutEof source from I/O. Live attach may still write after
+                // initialize returns.
                 if *pos >= stdout.len() {
-                    return Ok(Vec::new());
+                    return Ok(StdoutRead::Empty);
                 }
                 // Chunked reads exercise partial-frame buffering.
                 let end = (*pos + 64).min(stdout.len());
                 let chunk = stdout[*pos..end].to_vec();
                 *pos = end;
-                Ok(chunk)
+                Ok(StdoutRead::Bytes(chunk))
             }
         }
+    }
+
+    /// Probe stdout once for wake: [`StdoutRead::Eof`] → [`OldWire::StdoutEof`],
+    /// timeout/WouldBlock empty → [`OldWire::Unknown`], bytes → [`OldWire::LiveIdle`]
+    /// (caller with turn state may upgrade to [`OldWire::LiveInTurn`]).
+    ///
+    /// Bytes returned here are consumed from the pipe; prefer
+    /// [`Self::read_stdout`] + push when also pumping the transport.
+    pub fn probe_stdout(&mut self) -> Result<OldWire, BusError> {
+        self.read_stdout().map(|r| old_wire_from_stdout(&r))
     }
 
     /// Write one JSON value on the runner's wire (JSONL or Content-Length).
@@ -630,6 +655,36 @@ pub fn host_remint_full_path(
     Ok(HostRemintFullPath { outcome, wires })
 }
 
+/// Outcome of one [`AttachRunner::read_stdout`] attempt.
+///
+/// Real `Ok(0)` after poll-readable (including POLLHUP with no bytes) is
+/// [`StdoutRead::Eof`] — proven wire loss for [`OldWire::StdoutEof`].
+/// Timeout / WouldBlock / Interrupted stay [`StdoutRead::Empty`] so idle
+/// never remints.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StdoutRead {
+    /// Some bytes arrived.
+    Bytes(Vec<u8>),
+    /// Timeout / WouldBlock / Interrupted — NOT proof of loss.
+    Empty,
+    /// `read` returned `Ok(0)` after poll reported readable (or POLLHUP).
+    Eof,
+}
+
+/// Map a stdout read to an [`OldWire`] hint for [`host_wake`].
+///
+/// - [`StdoutRead::Eof`] → [`OldWire::StdoutEof`] (proven lost)
+/// - [`StdoutRead::Empty`] → [`OldWire::Unknown`] (timeout must not remint)
+/// - [`StdoutRead::Bytes`] → [`OldWire::LiveIdle`] (caller may upgrade to
+///   [`OldWire::LiveInTurn`] when a turn is open)
+pub fn old_wire_from_stdout(read: &StdoutRead) -> OldWire {
+    match read {
+        StdoutRead::Eof => OldWire::StdoutEof,
+        StdoutRead::Empty => OldWire::Unknown,
+        StdoutRead::Bytes(_) => OldWire::LiveIdle,
+    }
+}
+
 /// What the Host knows about the OLD wire at wake time. Only `Exited`,
 /// `StdoutEof` and `TransportError` prove the wire lost; a running child
 /// alone is not proof of anything (`Unknown`).
@@ -637,12 +692,14 @@ pub fn host_remint_full_path(
 pub enum OldWire {
     /// Child `try_wait` returned `Some(code)`.
     Exited(i32),
-    /// Child stdout hit EOF.
+    /// Child stdout hit EOF (`read` Ok(0) / POLLHUP with no bytes).
+    /// Produced by [`old_wire_from_stdout`] / [`AttachRunner::probe_stdout`]
+    /// from Real I/O — never from a read timeout.
     StdoutEof,
     /// Real IO error on the old wire (read/write failure, EPIPE). A read
-    /// timeout is NOT this: `read_stdout` returns no bytes on timeout
-    /// (never an error), and callers must report a timeout as
-    /// [`OldWire::Unknown`].
+    /// timeout is NOT this: [`AttachRunner::read_stdout`] returns
+    /// [`StdoutRead::Empty`] on timeout / WouldBlock (never an error), and
+    /// [`old_wire_from_stdout`] maps that to [`OldWire::Unknown`].
     TransportError(String),
     /// Wire alive, no turn open.
     LiveIdle,
@@ -1072,6 +1129,98 @@ mod tests {
             "expected a bounded wait, got {elapsed:?}"
         );
         let _ = runner.kill();
+    }
+
+    // ---- stdout EOF vs timeout (Runner-stdout-eof-as-lost) ----
+
+    /// Real child closes stdout but stays alive: Ok(0)/POLLHUP → StdoutEof.
+    #[test]
+    fn real_stdout_eof_surfaces_as_old_wire_stdout_eof() {
+        let spec = LaunchSpec {
+            program: "sh".into(),
+            // Close fd 1 then sleep — half-dead: stdout EOF, child still running.
+            args: vec!["-c".into(), "exec 1>&-; sleep 30".into()],
+            cwd: None,
+            env: Vec::new(),
+            wire: WireKind::JsonlRpc,
+        };
+        let mut runner = AttachRunner::spawn(spec).expect("spawn");
+        // Child may need a beat to close fd 1 after spawn.
+        let mut read = StdoutRead::Empty;
+        for _ in 0..25 {
+            read = runner.read_stdout().expect("read");
+            if read == StdoutRead::Eof {
+                break;
+            }
+        }
+        assert_eq!(read, StdoutRead::Eof, "Ok(0) after POLLHUP must be Eof");
+        assert_eq!(old_wire_from_stdout(&read), OldWire::StdoutEof);
+        assert!(old_wire_from_stdout(&read).is_lost());
+        // Child still running — try_wait alone would be Unknown; EOF is the proof.
+        assert_eq!(runner.try_wait().unwrap(), None, "child still alive");
+        assert_eq!(
+            runner.probe_exit(),
+            OldWire::Unknown,
+            "try_wait Exited path unchanged / not fired"
+        );
+        let _ = runner.kill();
+    }
+
+    /// Silent live child: poll timeout → Empty → Unknown (never remint).
+    #[test]
+    fn real_stdout_timeout_stays_unknown_not_eof() {
+        let spec = LaunchSpec {
+            program: "sleep".into(),
+            args: vec!["30".into()],
+            cwd: None,
+            env: Vec::new(),
+            wire: WireKind::JsonlRpc,
+        };
+        let mut runner = AttachRunner::spawn(spec).expect("spawn sleep");
+        let read = runner.read_stdout().expect("read");
+        assert_eq!(read, StdoutRead::Empty, "timeout must be Empty, not Eof");
+        assert_eq!(old_wire_from_stdout(&read), OldWire::Unknown);
+        assert!(!old_wire_from_stdout(&read).is_lost());
+        assert_eq!(runner.probe_stdout().unwrap(), OldWire::Unknown);
+        let _ = runner.kill();
+    }
+
+    /// Correct mapping + naives as contrasts (toy parity).
+    #[test]
+    fn stdout_read_mapping_contrasts_naive_eof_as_empty_and_timeout_as_eof() {
+        // Correct: Eof → StdoutEof (remint); Empty → Unknown (wait).
+        assert_eq!(old_wire_from_stdout(&StdoutRead::Eof), OldWire::StdoutEof);
+        assert_eq!(old_wire_from_stdout(&StdoutRead::Empty), OldWire::Unknown);
+        assert_eq!(
+            old_wire_from_stdout(&StdoutRead::Bytes(b"x".to_vec())),
+            OldWire::LiveIdle
+        );
+
+        // NaiveEofAsEmpty: Ok(0) collapsed into empty → StuckUnknown.
+        fn naive_eof_as_empty(r: &StdoutRead) -> OldWire {
+            match r {
+                StdoutRead::Eof | StdoutRead::Empty => OldWire::Unknown,
+                StdoutRead::Bytes(_) => OldWire::LiveIdle,
+            }
+        }
+        let stuck = naive_eof_as_empty(&StdoutRead::Eof);
+        assert_eq!(stuck, OldWire::Unknown, "NaiveEofAsEmpty → StuckUnknown");
+        assert!(!stuck.is_lost());
+
+        // NaiveTimeoutAsEof: any empty → StdoutEof → FalseRemint.
+        fn naive_timeout_as_eof(r: &StdoutRead) -> OldWire {
+            match r {
+                StdoutRead::Eof | StdoutRead::Empty => OldWire::StdoutEof,
+                StdoutRead::Bytes(_) => OldWire::LiveIdle,
+            }
+        }
+        let false_remint = naive_timeout_as_eof(&StdoutRead::Empty);
+        assert_eq!(
+            false_remint,
+            OldWire::StdoutEof,
+            "NaiveTimeoutAsEof → FalseRemint"
+        );
+        assert!(false_remint.is_lost());
     }
 
     /// Pep Accept (1): live AttachRunner actually SENDS initialize with
@@ -2381,5 +2530,60 @@ mod tests {
             "killed before mint: teardown writes dropped"
         );
         assert_eq!(mints(&session), before + 1);
+    }
+
+    /// host_wake on Real-produced StdoutEof: one mint + session/resume.
+    #[test]
+    fn host_wake_on_probed_real_stdout_eof_remints_and_resumes() {
+        let spec = LaunchSpec {
+            program: "sh".into(),
+            args: vec!["-c".into(), "exec 1>&-; sleep 30".into()],
+            cwd: None,
+            env: Vec::new(),
+            wire: WireKind::JsonlRpc,
+        };
+        let mut old = AttachRunner::spawn(spec).expect("spawn");
+        let mut old_wire = OldWire::Unknown;
+        for _ in 0..25 {
+            old_wire = old.probe_stdout().expect("probe");
+            if old_wire == OldWire::StdoutEof {
+                break;
+            }
+        }
+        assert_eq!(old_wire, OldWire::StdoutEof);
+
+        let session = wake_session();
+        session.begin_turn("mid");
+        let sid = session.agent_session_id();
+        let before = mints(&session);
+        let mut new = new_wire_fake();
+
+        let HostWake::Reminted(full) =
+            run_wake(&session, old_wire, &mut old, &mut new).expect("wake")
+        else {
+            panic!("expected Reminted on real StdoutEof");
+        };
+        assert_eq!(mints(&session), before + 1);
+        assert!(!session.turn_in_flight());
+        let frames: Vec<serde_json::Value> = std::str::from_utf8(new.stdin_log().unwrap())
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(frames[0]["method"], "initialize");
+        assert_eq!(
+            frames[0]["params"]["clientCapabilities"],
+            ClientCapabilities::HOST.to_json()
+        );
+        assert_eq!(frames[1]["method"], "session/resume");
+        assert_eq!(frames[1]["params"]["sessionId"], sid);
+        let w = &full.outcome.wire_actions;
+        assert!(
+            w.contains(&WireAction::SessionCancel) || w.contains(&WireAction::SessionClose),
+            "cancel-before-reattach: {w:?}"
+        );
+        // Real runner has no stdin_log; only check new wire.
+        let raw = std::str::from_utf8(new.stdin_log().unwrap()).unwrap();
+        assert!(!raw.contains("session/load") && !raw.contains("session/new"));
     }
 }
