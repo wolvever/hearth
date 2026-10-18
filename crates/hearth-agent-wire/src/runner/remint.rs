@@ -1549,6 +1549,22 @@ impl RemintSession {
     }
 }
 
+/// Pure check that `place` can supply ACP `session/resume` `cwd`: present,
+/// LocalDir, absolute `instance`. Returns the cwd. No side effects — Host
+/// entries ([`crate::runner::host_wake`], [`crate::runner::host_remint_full_path`])
+/// call it before kill / mint / teardown / initialize so a bad Place never
+/// strands a Session.
+pub fn validate_resume_place(place: Option<&Place>) -> Result<&str, RemintError> {
+    let place = place.ok_or(RemintError::ResumeNoPlace)?;
+    if place.provider != PlaceProvider::LocalDir {
+        return Err(RemintError::ResumePlaceNotLocalDir);
+    }
+    if !std::path::Path::new(&place.instance).is_absolute() {
+        return Err(RemintError::ResumeCwdNotAbsolute);
+    }
+    Ok(&place.instance)
+}
+
 /// Encode ACP wire JSON for remint actions (tests / AttachRunner write path).
 ///
 /// `session/resume` carries ACP v1 required params: `sessionId`, `cwd` (the
@@ -1566,18 +1582,13 @@ pub fn encode_remint_rpc(
 ) -> Result<Value, RemintError> {
     let (method_str, params) = match method {
         RemintWireMethod::SessionResume => {
-            let place = place.ok_or(RemintError::ResumeNoPlace)?;
-            if place.provider != PlaceProvider::LocalDir {
-                return Err(RemintError::ResumePlaceNotLocalDir);
-            }
-            if !std::path::Path::new(&place.instance).is_absolute() {
-                return Err(RemintError::ResumeCwdNotAbsolute);
-            }
+            // Defense in depth: Host entries validate before any side effect.
+            let cwd = validate_resume_place(place)?;
             (
                 "session/resume",
                 serde_json::json!({
                     "sessionId": agent_session_id,
-                    "cwd": place.instance,
+                    "cwd": cwd,
                     "mcpServers": mcp_servers,
                 }),
             )
