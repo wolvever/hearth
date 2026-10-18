@@ -46,8 +46,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 
 use hearth::{
-    tool_call_is_terminal, AgentId, Event, EventBody, Host, InMemory, Member, PermissionRpc,
-    Session as HostSession, UserId,
+    tool_call_is_terminal, AgentId, Event, EventBody, Host, InMemory, Member, PermissionRpc, Place,
+    PlaceProvider, Session as HostSession, UserId,
 };
 use serde_json::Value;
 
@@ -253,6 +253,13 @@ pub enum RemintError {
     /// Binding already live / ownership recheck failed (competing holder or
     /// stale snapshot). Typed conflict — never silent steal.
     BindingConflict,
+    /// `session/resume` owes ACP `cwd` but the Session has no Place threaded
+    /// down. Fail closed — nothing written, no wire-layer default.
+    ResumeNoPlace,
+    /// `session/resume` Place is not a LocalDir; its `instance` is not a cwd.
+    ResumePlaceNotLocalDir,
+    /// LocalDir Place `instance` is not an absolute path (ACP requires it).
+    ResumeCwdNotAbsolute,
 }
 
 impl RemintError {
@@ -272,6 +279,9 @@ impl RemintError {
             Self::HostLog(_) => "HostLog",
             Self::NewWire(_) => "NewWire",
             Self::BindingConflict => "BindingConflict",
+            Self::ResumeNoPlace => "ResumeNoPlace",
+            Self::ResumePlaceNotLocalDir => "ResumePlaceNotLocalDir",
+            Self::ResumeCwdNotAbsolute => "ResumeCwdNotAbsolute",
         }
     }
 }
@@ -435,7 +445,14 @@ pub fn write_old_wire_teardown(
         };
         let id = *next_rpc_id;
         *next_rpc_id = next_rpc_id.saturating_add(1);
-        if write_old_rpc(encode_remint_rpc(method, agent_session_id, id)).is_err() {
+        let rpc = match encode_remint_rpc(method, agent_session_id, id, None, &[]) {
+            Ok(rpc) => rpc,
+            Err(_) => {
+                teardown_failed.push(method);
+                continue;
+            }
+        };
+        if write_old_rpc(rpc).is_err() {
             teardown_failed.push(method);
         }
     }
@@ -488,18 +505,30 @@ pub fn flush_and_teardown_old_wire(
 ///
 /// `ClientCapabilities::HOST` stays all false on the initialize that produced
 /// `live_caps` — this helper does not re-advertise client caps.
+///
+/// `place` / `mcp_servers` come from the Session (its LocalDir Place and the
+/// `mcpServers` config) and are threaded down by the caller; this helper
+/// never invents a default. A missing / non-LocalDir / relative Place fails
+/// closed before any write and before the rpc id is consumed.
 pub fn write_new_wire_attach_resume(
     session: &RemintSession,
     agent_session_id: &str,
+    place: Option<&Place>,
+    mcp_servers: &[Value],
     live_caps: LiveCaps,
     mut write_new_rpc: impl FnMut(Value) -> Result<(), BusError>,
     next_rpc_id: &mut u64,
 ) -> Result<(), RemintError> {
     session.set_live_caps(live_caps);
     session.gate_attach_resume()?;
-    let id = *next_rpc_id;
+    let rpc = encode_remint_rpc(
+        RemintWireMethod::SessionResume,
+        agent_session_id,
+        *next_rpc_id,
+        place,
+        mcp_servers,
+    )?;
     *next_rpc_id = next_rpc_id.saturating_add(1);
-    let rpc = encode_remint_rpc(RemintWireMethod::SessionResume, agent_session_id, id);
     write_new_rpc(rpc).map_err(|e| RemintError::NewWire(e.to_string()))
 }
 
@@ -1521,18 +1550,53 @@ impl RemintSession {
 }
 
 /// Encode ACP wire JSON for remint actions (tests / AttachRunner write path).
-pub fn encode_remint_rpc(method: RemintWireMethod, agent_session_id: &str, id: u64) -> Value {
-    let method_str = match method {
-        RemintWireMethod::SessionResume => "session/resume",
-        RemintWireMethod::SessionCancel => "session/cancel",
-        RemintWireMethod::SessionClose => "session/close",
+///
+/// `session/resume` carries ACP v1 required params: `sessionId`, `cwd` (the
+/// absolute `instance` of the Session's LocalDir [`Place`]) and `mcpServers`
+/// (from Session config, `[]` if none). No Place / non-LocalDir / relative
+/// path fails closed with a typed [`RemintError`] — never a process-cwd
+/// default. Cancel / close ignore `place` / `mcp_servers` and carry only
+/// `sessionId`.
+pub fn encode_remint_rpc(
+    method: RemintWireMethod,
+    agent_session_id: &str,
+    id: u64,
+    place: Option<&Place>,
+    mcp_servers: &[Value],
+) -> Result<Value, RemintError> {
+    let (method_str, params) = match method {
+        RemintWireMethod::SessionResume => {
+            let place = place.ok_or(RemintError::ResumeNoPlace)?;
+            if place.provider != PlaceProvider::LocalDir {
+                return Err(RemintError::ResumePlaceNotLocalDir);
+            }
+            if !std::path::Path::new(&place.instance).is_absolute() {
+                return Err(RemintError::ResumeCwdNotAbsolute);
+            }
+            (
+                "session/resume",
+                serde_json::json!({
+                    "sessionId": agent_session_id,
+                    "cwd": place.instance,
+                    "mcpServers": mcp_servers,
+                }),
+            )
+        }
+        RemintWireMethod::SessionCancel => (
+            "session/cancel",
+            serde_json::json!({ "sessionId": agent_session_id }),
+        ),
+        RemintWireMethod::SessionClose => (
+            "session/close",
+            serde_json::json!({ "sessionId": agent_session_id }),
+        ),
     };
-    serde_json::json!({
+    Ok(serde_json::json!({
         "jsonrpc": "2.0",
         "id": id,
         "method": method_str,
-        "params": { "sessionId": agent_session_id }
-    })
+        "params": params
+    }))
 }
 
 #[cfg(test)]
@@ -2032,7 +2096,17 @@ mod tests {
             1
         );
         // encode helper still never produces session/new.
-        let allowed = encode_remint_rpc(RemintWireMethod::SessionResume, "S-stable", 1);
+        let allowed = encode_remint_rpc(
+            RemintWireMethod::SessionResume,
+            "S-stable",
+            1,
+            Some(&Place::local_dir(
+                "/work/repo",
+                hearth::PlaceAttach::RecreateFromGit,
+            )),
+            &[],
+        )
+        .unwrap();
         assert_ne!(allowed["method"], "session/new");
     }
 
@@ -2167,11 +2241,107 @@ mod tests {
 
     #[test]
     fn encode_remint_rpc_is_resume_not_new_or_load() {
-        let v = encode_remint_rpc(RemintWireMethod::SessionResume, "S-abc", 7);
+        let place = Place::local_dir("/work/repo", hearth::PlaceAttach::RecreateFromGit);
+        let mcp = vec![
+            serde_json::json!({"name": "fs", "command": "/bin/mcp-fs", "args": [], "env": []}),
+        ];
+        let v = encode_remint_rpc(
+            RemintWireMethod::SessionResume,
+            "S-abc",
+            7,
+            Some(&place),
+            &mcp,
+        )
+        .unwrap();
         assert_eq!(v["method"], "session/resume");
         assert_eq!(v["params"]["sessionId"], "S-abc");
+        assert_eq!(v["params"]["cwd"], "/work/repo");
+        assert_eq!(v["params"]["mcpServers"], serde_json::json!(mcp));
         assert_ne!(v["method"], "session/new");
         assert_ne!(v["method"], "session/load");
+        // No mcpServers in Session config → explicit empty array, not absent.
+        let v = encode_remint_rpc(
+            RemintWireMethod::SessionResume,
+            "S-abc",
+            8,
+            Some(&place),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(v["params"]["mcpServers"], serde_json::json!([]));
+        // Cancel / close unchanged: sessionId only.
+        for m in [
+            RemintWireMethod::SessionCancel,
+            RemintWireMethod::SessionClose,
+        ] {
+            let v = encode_remint_rpc(m, "S-abc", 9, None, &[]).unwrap();
+            assert_eq!(v["params"], serde_json::json!({"sessionId": "S-abc"}));
+        }
+    }
+
+    fn resume_session() -> RemintSession {
+        let (s, _, _) = RemintSession::open(
+            "sess-1",
+            "S-keep",
+            LiveCaps {
+                resume: true,
+                load_session: false,
+                cancel: true,
+                close: true,
+            },
+        );
+        s
+    }
+
+    fn resume_fail_closed(place: Option<&Place>) -> RemintError {
+        let s = resume_session();
+        let mut writes = 0usize;
+        let mut next = 4u64;
+        let err = write_new_wire_attach_resume(
+            &s,
+            "S-keep",
+            place,
+            &[],
+            LiveCaps {
+                resume: true,
+                load_session: false,
+                cancel: true,
+                close: true,
+            },
+            |_| {
+                writes += 1;
+                Ok(())
+            },
+            &mut next,
+        )
+        .unwrap_err();
+        assert_eq!(writes, 0, "fail-closed resume must write nothing");
+        assert_eq!(next, 4, "rpc id must not be consumed");
+        err
+    }
+
+    #[test]
+    fn resume_without_place_fails_closed_no_wire() {
+        assert_eq!(resume_fail_closed(None), RemintError::ResumeNoPlace);
+    }
+
+    #[test]
+    fn resume_non_local_dir_place_fails_closed_no_wire() {
+        let mut place = Place::local_dir("/work/repo", hearth::PlaceAttach::MustExist);
+        place.provider = hearth::PlaceProvider::Aws;
+        assert_eq!(
+            resume_fail_closed(Some(&place)),
+            RemintError::ResumePlaceNotLocalDir
+        );
+    }
+
+    #[test]
+    fn resume_relative_cwd_fails_closed_no_wire() {
+        let place = Place::local_dir("work/repo", hearth::PlaceAttach::RecreateFromGit);
+        assert_eq!(
+            resume_fail_closed(Some(&place)),
+            RemintError::ResumeCwdNotAbsolute
+        );
     }
 
     #[test]

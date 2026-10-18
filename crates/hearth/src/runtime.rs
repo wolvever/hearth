@@ -568,10 +568,8 @@ fn classify_session(session: &Session, agent: AgentId) -> Result<Liveness> {
                 attached = true;
                 released_without_live = false;
             }
-            EventBody::BindingReleased { binding } => {
-                if !live_ids.contains(&binding) {
-                    released_without_live = true;
-                }
+            EventBody::BindingReleased { binding } if !live_ids.contains(&binding) => {
+                released_without_live = true;
             }
             _ => {}
         }

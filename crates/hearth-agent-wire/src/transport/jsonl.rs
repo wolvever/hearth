@@ -115,10 +115,7 @@ impl JsonlRpcTransport {
     /// in the buffer. Invalid JSON is queued as [`JsonlProblem::InvalidJson`].
     pub fn push_bytes(&mut self, bytes: &[u8]) {
         self.line_buf.extend_from_slice(bytes);
-        loop {
-            let Some(i) = self.line_buf.iter().position(|&b| b == b'\n') else {
-                break;
-            };
+        while let Some(i) = self.line_buf.iter().position(|&b| b == b'\n') {
             let mut line: Vec<u8> = self.line_buf.drain(..=i).collect();
             line.pop(); // '\n'
             if line.last() == Some(&b'\r') {
@@ -297,7 +294,7 @@ fn decode_base64(data: &str) -> Option<Vec<u8>> {
         return None;
     }
     let mut out = Vec::with_capacity(data.len() / 4 * 3);
-    for chunk in data.as_bytes().chunks_exact(4) {
+    for chunk in data.as_bytes().as_chunks::<4>().0 {
         let (a, b, c, d) = (
             val(chunk[0])?,
             val(chunk[1])?,
