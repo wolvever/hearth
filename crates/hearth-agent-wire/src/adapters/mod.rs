@@ -127,6 +127,17 @@ pub fn encode_command(kind: AgentKind, cmd: &AgentCommand) -> Result<WireFrame, 
     }
 }
 
+/// Load a captured native frame from `adapters/<agent>/fixtures/<name>`.
+#[cfg(test)]
+pub(crate) fn fixture(agent: &str, name: &str) -> serde_json::Value {
+    let path = format!(
+        "{}/src/adapters/{agent}/fixtures/{name}",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+    serde_json::from_str(&raw).unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
