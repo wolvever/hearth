@@ -286,7 +286,10 @@ impl Runtime {
     }
 
     /// For each kept session with a due timer (`next_due_ms <= now`), `wake(Timer)`,
-    /// then set `next_due_ms = now + every_ms`. Pass `now` for a deterministic clock
+    /// then set `next_due_ms = now + every_ms`. A Session that answers
+    /// [`Error::Waiting`] (turn open, liveness unknown) is skipped for this tick
+    /// with `next_due_ms` unchanged; any other error aborts the tick.
+    /// Pass `now` for a deterministic clock
     /// (same epoch-ms as [`crate::Event::ts`]); `None` uses the wall clock.
     /// This is how tests drive the infinite loop without sleeping.
     pub fn tick(&self, now_ms: Option<u64>) -> Result<Vec<(SessionId, Vec<Event>)>> {
@@ -302,7 +305,13 @@ impl Runtime {
 
         let mut out = Vec::new();
         for sid in due {
-            let events = self.wake(sid, Wake::Timer)?;
+            let events = match self.wake(sid, Wake::Timer) {
+                Ok(ev) => ev,
+                // Busy or liveness-unknown: skip this Session this tick, write
+                // nothing, keep it due so it fires on a later tick.
+                Err(Error::Waiting(_)) => continue,
+                Err(e) => return Err(e),
+            };
             {
                 let mut g = self.lock_kept()?;
                 if let Some(k) = g.get_mut(&sid) {
@@ -1385,5 +1394,67 @@ mod tests {
         rt.wake(session.id(), Wake::Timer).unwrap();
         let live: Vec<_> = session.bindings().unwrap().iter().map(|b| b.id).collect();
         assert_eq!(live, vec![first]);
+    }
+
+    fn next_due(rt: &Runtime, sid: SessionId) -> Option<u64> {
+        rt.lock_kept().unwrap().get(&sid).unwrap().next_due_ms
+    }
+
+    #[test]
+    fn tick_skips_busy_session_and_wakes_others() {
+        let rt = Runtime::new();
+        let agent = rt.store().create_agent("scribe", "");
+        let a = rt.create_session();
+        let b = rt.create_session();
+        rt.keep(a.id(), agent.id, goose()).unwrap();
+        rt.keep(b.id(), agent.id, goose()).unwrap();
+        rt.schedule(a.id(), 1_000).unwrap();
+        rt.schedule(b.id(), 1_000).unwrap();
+        rt.wake(a.id(), Wake::Timer).unwrap(); // A turn open
+        let a_len = a.events().unwrap().len();
+        let a_due = next_due(&rt, a.id());
+        let now = now_ts().saturating_add(5_000);
+
+        let fired = rt.tick(Some(now)).unwrap();
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].0, b.id());
+        assert_eq!(a.events().unwrap().len(), a_len, "skip writes nothing");
+        assert_eq!(next_due(&rt, a.id()), a_due, "skip keeps next_due_ms");
+
+        // B rescheduled, A still due but busy: same now fires nothing.
+        assert!(rt.tick(Some(now)).unwrap().is_empty());
+        a.turn_end(agent.id).unwrap();
+        let later = rt.tick(Some(now)).unwrap();
+        assert_eq!(later.len(), 1);
+        assert_eq!(later[0].0, a.id());
+        assert!(later[0].1.iter().any(|e| matches!(
+            e.body,
+            EventBody::Wake {
+                source: WakeSource::Timer
+            }
+        )));
+    }
+
+    #[test]
+    fn tick_propagates_non_waiting_error() {
+        let rt = Runtime::new();
+        let agent = rt.store().create_agent("scribe", "");
+        // Kept record whose Session is not in the store: wake fails with
+        // UnknownSession, which is not Waiting and must abort the tick.
+        let ghost = SessionId::new();
+        rt.lock_kept().unwrap().insert(
+            ghost,
+            Kept {
+                agent: agent.id,
+                host: goose(),
+                timer_every_ms: Some(1_000),
+                next_due_ms: Some(0),
+                lease: None,
+            },
+        );
+        assert!(matches!(
+            rt.tick(Some(1)),
+            Err(Error::UnknownSession(id)) if id == ghost
+        ));
     }
 }
