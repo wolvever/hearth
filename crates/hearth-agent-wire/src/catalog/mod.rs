@@ -376,6 +376,42 @@ mod tests {
     }
 
     #[test]
+    fn empty_env_key_is_rejected() {
+        let err = load_profiles_str(
+            r#"
+            [[profile]]
+            id = "blankenv"
+            label = "Blank env"
+            command = ["agent", "acp"]
+            extends = "acp"
+            env = [{ key = "", value = "x" }]
+            "#,
+        )
+        .unwrap_err();
+        match err {
+            BusError::Decode(msg) => assert!(msg.contains("env key is empty"), "{msg}"),
+            other => panic!("expected decode error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn launch_spec_rejects_hand_built_empty_program() {
+        let profile = CatalogProfile {
+            id: "handmade".into(),
+            label: "Hand made".into(),
+            command: vec![String::new(), "acp".into()],
+            extends: CatalogExtends::Acp,
+            wire: WireKind::JsonlRpc,
+            caps_override: None,
+            env: Vec::new(),
+        };
+        match profile.launch_spec().unwrap_err() {
+            BusError::Decode(msg) => assert!(msg.contains("empty program"), "{msg}"),
+            other => panic!("expected decode error, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn acp_profiles_frame_commands_as_newline_jsonrpc_not_content_length() {
         use crate::transport::{JsonlRpcTransport, Transport};
         use crate::AgentCommand;
