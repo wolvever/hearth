@@ -814,6 +814,97 @@ pub fn host_wake(
     }
 }
 
+/// Result of [`wake_through_host_wake`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum WakeThroughHost {
+    /// Wire live or reminted: Runtime recorded the wake without claiming.
+    Woke {
+        host: HostWake,
+        events: Vec<hearth::Event>,
+    },
+    /// No wire evidence: Runtime was not called (zero EventLog writes from wake).
+    Waiting(hearth::WaitReason),
+}
+
+/// Error from [`wake_through_host_wake`].
+#[derive(Debug)]
+pub enum WakeThroughError {
+    Remint(RemintError),
+    Runtime(hearth::Error),
+}
+
+impl std::fmt::Display for WakeThroughError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Remint(e) => write!(f, "{e:?}"),
+            Self::Runtime(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for WakeThroughError {}
+
+impl From<RemintError> for WakeThroughError {
+    fn from(e: RemintError) -> Self {
+        Self::Remint(e)
+    }
+}
+
+impl From<hearth::Error> for WakeThroughError {
+    fn from(e: hearth::Error) -> Self {
+        Self::Runtime(e)
+    }
+}
+
+/// Inputs for [`wake_through_host_wake`] (Runtime wake + wire remint args).
+pub struct WakeThroughHostArgs<'a> {
+    pub runtime: &'a hearth::Runtime,
+    pub session_id: hearth::SessionId,
+    pub wake: hearth::Wake,
+    pub old_wire: OldWire,
+    pub remint: HostRemintFullArgs<'a>,
+}
+
+/// Production Host wake: splice [`hearth::Runtime`] through [`host_wake`].
+///
+/// Order (load-bearing):
+/// 1. [`host_wake`] — proven-lost remints once via [`host_remint_full_path`];
+///    live → [`HostWake::ReuseLive`]; unknown → [`HostWake::Waiting`].
+/// 2. On Reminted / ReuseLive → [`hearth::Runtime::wake_with`]
+///    [`hearth::AlreadyBound`] (record prompt / turn_start; **never**
+///    `claim_binding`).
+/// 3. On Waiting → return Waiting without touching Runtime.
+///
+/// `RemintSession` must wrap the same Host Session the Runtime keeps
+/// ([`RemintSession::on_host_session`]). Callers must not also
+/// [`hearth::Runtime::wake`] (default claim) on this path — that is the
+/// double-mint / `BindingConflict` naive path.
+///
+/// Never `session/load` or `session/new`. [`ClientCapabilities::HOST`] stays
+/// all false. SoftExpiring / Flush / Stage / Evidence / EffectId parked.
+pub fn wake_through_host_wake(
+    old: &mut AttachRunner,
+    new: &mut AttachRunner,
+    new_transport: &mut RunnerTransport,
+    args: WakeThroughHostArgs<'_>,
+) -> Result<WakeThroughHost, WakeThroughError> {
+    let WakeThroughHostArgs {
+        runtime,
+        session_id,
+        wake,
+        old_wire,
+        remint,
+    } = args;
+    let host = host_wake(old_wire, old, new, new_transport, remint)?;
+    match host {
+        HostWake::Waiting(reason) => Ok(WakeThroughHost::Waiting(reason)),
+        host => {
+            let events = runtime.wake_with(session_id, wake, &mut hearth::AlreadyBound)?;
+            Ok(WakeThroughHost::Woke { host, events })
+        }
+    }
+}
+
 fn set_nonblocking(out: &ChildStdout) -> Result<(), BusError> {
     let fd = out.as_raw_fd();
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
@@ -2734,5 +2825,265 @@ mod tests {
         // Real runner has no stdin_log; only check new wire.
         let raw = std::str::from_utf8(new.stdin_log().unwrap()).unwrap();
         assert!(!raw.contains("session/load") && !raw.contains("session/new"));
+    }
+
+    // ---- wake_through_host_wake (Runtime splice) ----
+
+    fn shared_runtime_remint() -> (
+        hearth::Runtime,
+        hearth::SessionId,
+        hearth::UserId,
+        RemintSession,
+        hearth::Place,
+    ) {
+        let rt = hearth::Runtime::new();
+        let user = rt.store().create_user("cheng");
+        let agent = rt.store().create_agent("scribe", "");
+        let session = rt.create_session();
+        session
+            .join(hearth::Member::User(user.id))
+            .expect("join user");
+        session
+            .join(hearth::Member::Agent(agent.id))
+            .expect("join agent");
+        let agent_sid = "S-stable".to_string();
+        let host = hearth::Host::from_bind("acp", Some(agent_sid.clone()), None);
+        session
+            .rebind(None, agent.id, host.clone())
+            .expect("initial Binding");
+        rt.keep(session.id(), agent.id, host).expect("keep");
+        let remint = RemintSession::on_host_session(
+            session.clone(),
+            agent.id,
+            user.id,
+            agent_sid,
+            LiveCaps {
+                resume: true,
+                cancel: true,
+                close: true,
+                load_session: false,
+            },
+        )
+        .expect("on_host_session");
+        let place = ws_place();
+        (rt, session.id(), user.id, remint, place)
+    }
+
+    fn binding_attached_count(rt: &hearth::Runtime, sid: hearth::SessionId) -> usize {
+        rt.store()
+            .session(sid)
+            .unwrap()
+            .events()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e.body, hearth::EventBody::BindingAttached { .. }))
+            .count()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_through(
+        rt: &hearth::Runtime,
+        sid: hearth::SessionId,
+        wake: hearth::Wake,
+        remint: &RemintSession,
+        place: &hearth::Place,
+        old_wire: OldWire,
+        old: &mut AttachRunner,
+        new: &mut AttachRunner,
+    ) -> Result<WakeThroughHost, WakeThroughError> {
+        let mut transport = transport_for_wire(WireKind::JsonlRpc);
+        let (mut old_next, mut new_next) = (10u64, 2u64);
+        wake_through_host_wake(
+            old,
+            new,
+            &mut transport,
+            WakeThroughHostArgs {
+                runtime: rt,
+                session_id: sid,
+                wake,
+                old_wire,
+                remint: HostRemintFullArgs {
+                    session: remint,
+                    place: Some(place),
+                    mcp_servers: &[],
+                    init_rpc_id: &RpcId::Num(1),
+                    old_next_rpc_id: &mut old_next,
+                    new_next_rpc_id: &mut new_next,
+                },
+            },
+        )
+    }
+
+    /// Lost wire: exactly one Binding mint (host_wake remint), Runtime records
+    /// wake via AlreadyBound — claim_binding is never on this path.
+    #[test]
+    fn wake_through_host_wake_lost_remints_once_no_claim_binding() {
+        let (rt, sid, uid, remint, place) = shared_runtime_remint();
+        let before = binding_attached_count(&rt, sid);
+        let mut old = initialized_fake(Vec::new());
+        let mut new = new_wire_fake();
+        let r = run_through(
+            &rt,
+            sid,
+            hearth::Wake::UserQuery {
+                user: uid,
+                text: "hi".into(),
+            },
+            &remint,
+            &place,
+            OldWire::StdoutEof,
+            &mut old,
+            &mut new,
+        )
+        .expect("through");
+        let WakeThroughHost::Woke { host, events } = r else {
+            panic!("expected Woke, got {r:?}");
+        };
+        assert!(matches!(host, HostWake::Reminted(_)));
+        assert_eq!(
+            binding_attached_count(&rt, sid),
+            before + 1,
+            "exactly one mint from host_wake remint"
+        );
+        assert!(events.iter().any(|e| matches!(
+            &e.body,
+            hearth::EventBody::UserMessage { text, .. } if text == "hi"
+        )));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e.body, hearth::EventBody::TurnStart { .. })));
+        // New wire: initialize (HOST false) + session/resume, never load/new.
+        let raw = std::str::from_utf8(new.stdin_log().unwrap()).unwrap();
+        assert!(raw.contains("session/resume"));
+        assert!(!raw.contains("session/load") && !raw.contains("session/new"));
+        let frames: Vec<serde_json::Value> = raw
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(
+            frames[0]["params"]["clientCapabilities"],
+            ClientCapabilities::HOST.to_json()
+        );
+    }
+
+    /// Live wire: ReuseLive, zero mints, Runtime still records the wake.
+    #[test]
+    fn wake_through_host_wake_live_reuses_zero_mints() {
+        let (rt, sid, uid, remint, place) = shared_runtime_remint();
+        let before = binding_attached_count(&rt, sid);
+        let bid = remint.binding_id();
+        let mut old = initialized_fake(Vec::new());
+        let old_log = old.stdin_log().unwrap().len();
+        let mut new = new_wire_fake();
+        let r = run_through(
+            &rt,
+            sid,
+            hearth::Wake::UserQuery {
+                user: uid,
+                text: "ping".into(),
+            },
+            &remint,
+            &place,
+            OldWire::LiveIdle,
+            &mut old,
+            &mut new,
+        )
+        .expect("through");
+        let WakeThroughHost::Woke { host, events } = r else {
+            panic!("expected Woke");
+        };
+        assert_eq!(host, HostWake::ReuseLive);
+        assert_eq!(remint.binding_id(), bid);
+        assert_eq!(binding_attached_count(&rt, sid), before);
+        assert_eq!(old.stdin_log().unwrap().len(), old_log);
+        assert!(new.stdin_log().unwrap().is_empty());
+        assert!(events.iter().any(|e| matches!(
+            &e.body,
+            hearth::EventBody::UserMessage { text, .. } if text == "ping"
+        )));
+    }
+
+    /// Unknown wire: Waiting, Runtime not called (no UserMessage / TurnStart).
+    #[test]
+    fn wake_through_host_wake_unknown_waits_no_runtime_write() {
+        let (rt, sid, uid, remint, place) = shared_runtime_remint();
+        let before_len = rt.store().session(sid).unwrap().events().unwrap().len();
+        let before_mints = binding_attached_count(&rt, sid);
+        let mut old = initialized_fake(Vec::new());
+        let mut new = new_wire_fake();
+        let r = run_through(
+            &rt,
+            sid,
+            hearth::Wake::UserQuery {
+                user: uid,
+                text: "nope".into(),
+            },
+            &remint,
+            &place,
+            OldWire::Unknown,
+            &mut old,
+            &mut new,
+        )
+        .expect("through");
+        assert_eq!(
+            r,
+            WakeThroughHost::Waiting(hearth::WaitReason::LivenessUnknown)
+        );
+        assert_eq!(
+            rt.store().session(sid).unwrap().events().unwrap().len(),
+            before_len,
+            "Runtime wake must not run on Waiting"
+        );
+        assert_eq!(binding_attached_count(&rt, sid), before_mints);
+        assert!(new.stdin_log().unwrap().is_empty());
+    }
+
+    /// Splice path must not also claim_binding: a competing rebind(None)
+    /// injected at remint claim time is refused, and wake_through still
+    /// completes with exactly one mint (AlreadyBound records the prompt).
+    #[test]
+    fn wake_through_host_wake_refuses_parallel_claim_single_mint() {
+        let (rt, sid, uid, remint, place) = shared_runtime_remint();
+        let agent = remint.host_agent_id();
+        let claimed = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let c = claimed.clone();
+        remint.inject_before_claim(move |host, _snap| {
+            let r = host.rebind(None, agent, hearth::Host::from_bind("acp", None, None));
+            *c.lock().unwrap() = Some(r.is_err());
+        });
+        let before = binding_attached_count(&rt, sid);
+        let mut old = initialized_fake(Vec::new());
+        let mut new = new_wire_fake();
+        let r = run_through(
+            &rt,
+            sid,
+            hearth::Wake::UserQuery {
+                user: uid,
+                text: "hi".into(),
+            },
+            &remint,
+            &place,
+            OldWire::StdoutEof,
+            &mut old,
+            &mut new,
+        )
+        .expect("through");
+        assert!(matches!(
+            r,
+            WakeThroughHost::Woke {
+                host: HostWake::Reminted(_),
+                ..
+            }
+        ));
+        assert_eq!(
+            *claimed.lock().unwrap(),
+            Some(true),
+            "parallel claim refused"
+        );
+        assert_eq!(
+            binding_attached_count(&rt, sid),
+            before + 1,
+            "exactly one mint"
+        );
     }
 }

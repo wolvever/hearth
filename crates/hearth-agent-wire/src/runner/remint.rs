@@ -647,6 +647,62 @@ impl RemintSession {
         (store, session_id, binding_id)
     }
 
+    /// Wrap an existing Host [`hearth::Session`] that already has a live Binding
+    /// for `host_agent`. Used so [`crate::runner::wake_through_host_wake`] can
+    /// remint the same Session [`hearth::Runtime`] keeps — one store, one mint.
+    ///
+    /// The Session's store Arc keeps the EventLog alive (no private store).
+    pub fn on_host_session(
+        host_session: HostSession,
+        host_agent: AgentId,
+        host_user: UserId,
+        agent_session_id: impl Into<String>,
+        live_caps: LiveCaps,
+    ) -> Result<Self, RemintError> {
+        let host_binding = host_session
+            .bindings()
+            .map_err(|e| RemintError::HostLog(e.to_string()))?
+            .into_iter()
+            .find(|b| b.agent == Some(host_agent))
+            .ok_or_else(|| RemintError::HostLog("no live Binding for agent".into()))?;
+        let agent_session_id: AgentSessionId = agent_session_id.into();
+        let binding_id = "bind-1".to_string();
+        let session_id = host_session.id().0.to_string();
+        let store = host_session.store().clone();
+        let mut host_bindings = HashMap::new();
+        host_bindings.insert(binding_id.clone(), host_binding.id);
+        Ok(Self {
+            inner: Mutex::new(Inner {
+                session_id,
+                binding_id: binding_id.clone(),
+                next_binding: 2,
+                agent_session_id,
+                live_caps,
+                events: Vec::new(),
+                next_event: 1,
+                turn_in_flight: false,
+                turn: 0,
+                in_flight_prompt: None,
+                pending: BTreeMap::new(),
+                resurfaced: BTreeMap::new(),
+                client_caps: ClientCapabilities::HOST,
+                client_requests: BTreeMap::new(),
+                host_bindings,
+                attach_cursor: 0,
+                transport_owner: TransportOwner::Binding(binding_id.clone()),
+                closed: false,
+                producer_ring: Vec::new(),
+                producer_ring_cap: 3,
+                _store: store,
+                host_session,
+                host_agent,
+                host_user,
+                #[cfg(test)]
+                before_claim: None,
+            }),
+        })
+    }
+
     pub fn session_id(&self) -> SessionId {
         self.inner.lock().unwrap().session_id.clone()
     }
