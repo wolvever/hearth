@@ -48,12 +48,7 @@ mod map_tests {
     use crate::ToolStatus;
 
     fn fixture(name: &str) -> serde_json::Value {
-        let path = format!(
-            "{}/src/adapters/grok_build/fixtures/{name}",
-            env!("CARGO_MANIFEST_DIR")
-        );
-        let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
-        serde_json::from_str(&raw).unwrap()
+        crate::adapters::fixture("grok_build", name)
     }
 
     #[test]

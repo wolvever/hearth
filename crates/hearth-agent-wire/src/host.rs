@@ -406,12 +406,35 @@ impl<A: CodingAgent> HostAttach<A> {
         v
     }
 
-    fn permission_rpc(&self, ask: &PendingAsk) -> PermissionRpc {
-        PermissionRpc {
+    /// Record the Host decision for `ask` (occupancy check + `PermissionDecided`
+    /// via [`Session::decide_permission_rpc`]) and stash it on the pending
+    /// entry, so a retry after a failed wire send reuses it instead of
+    /// deciding again. Shared by [`Self::answer_permission`] and [`Self::cancel`].
+    fn decide(
+        &mut self,
+        session: &Session,
+        by: UserId,
+        ask: &PendingAsk,
+        allowed: bool,
+        option_id: Option<String>,
+    ) -> AttachResult<(Event, bool, Option<String>)> {
+        let rpc = PermissionRpc {
             binding: self.binding.id,
             rpc_id: ask.rpc_id.to_string(),
             tool_call_id: ask.tool_call_id.clone(),
+        };
+        let ev = session.decide_permission_rpc(
+            ask.title.clone(),
+            allowed,
+            by,
+            rpc,
+            option_id.clone(),
+        )?;
+        let decided = (ev, allowed, option_id);
+        if let Some(p) = self.pending.get_mut(&(self.binding.id, ask.rpc_id.clone())) {
+            p.decided = Some(decided.clone());
         }
+        Ok(decided)
     }
 
     /// Wire reply for one ask: `optionId: Some` → `selected`, `None` →
@@ -473,20 +496,14 @@ impl<A: CodingAgent> HostAttach<A> {
                         option_id: option_id.into(),
                     });
                 };
-                let allowed = option_allows(opt);
-                let wire_option = Some(option_id.to_string());
                 // require_user + append BEFORE anything reaches the wire.
-                let ev = session.decide_permission_rpc(
-                    ask.title.clone(),
-                    allowed,
+                self.decide(
+                    session,
                     by,
-                    self.permission_rpc(&ask),
-                    wire_option.clone(),
-                )?;
-                if let Some(p) = self.pending.get_mut(&key) {
-                    p.decided = Some((ev.clone(), allowed, wire_option.clone()));
-                }
-                (ev, allowed, wire_option)
+                    &ask,
+                    option_allows(opt),
+                    Some(option_id.into()),
+                )?
             }
         };
         self.coding
@@ -515,24 +532,11 @@ impl<A: CodingAgent> HostAttach<A> {
         let mut out = Vec::with_capacity(asks.len());
         let mut replies = Vec::with_capacity(asks.len());
         for ask in &asks {
-            let key = (self.binding.id, ask.rpc_id.clone());
             let (ev, allowed, wire_option) = match ask.decided.clone() {
                 // Already decided (e.g. a failed answer_permission): the
                 // wire reply follows the stash, not `cancelled`.
                 Some(stashed) => stashed,
-                None => {
-                    let ev = session.decide_permission_rpc(
-                        ask.title.clone(),
-                        false,
-                        by,
-                        self.permission_rpc(ask),
-                        None,
-                    )?;
-                    if let Some(p) = self.pending.get_mut(&key) {
-                        p.decided = Some((ev.clone(), false, None));
-                    }
-                    (ev, false, None)
-                }
+                None => self.decide(session, by, ask, false, None)?,
             };
             out.push(ev);
             replies.push((ask.rpc_id.clone(), allowed, wire_option));
