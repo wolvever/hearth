@@ -224,7 +224,7 @@ crates/hearth-agent-wire/
 
 `FramedAgent<T, C>` is `Transport` + `AdapterCodec`. Decoded path: `JsonRpcTransport::push_decoded` / `SseTransport::push_frame` / `JsonlRpcTransport::push_decoded`. Byte path: `try_decode_content_length` / `parse_event_block` / `decode_text` / `JsonlRpcTransport::push_bytes`, then codec. Live process spawn is optional and not required for the kernel bar.
 
-`catalog/` is profile data only. Builtin Copilot (`copilot --acp`) and Cursor (`cursor-agent acp`) resolve to a `LaunchSpec` and share `AcpCodec`. Reattach is `HostAttach::resume` with `Binding.native_resume_id`, not Gemini `session/load`. `AttachRunner` spawn is not in this crate yet.
+`catalog/` is profile data only. Builtin Copilot (`copilot --acp`) and Cursor (`cursor-agent acp`) resolve to a `LaunchSpec` and share `AcpCodec`. Reattach is `HostAttach::resume` with `Binding.native_resume_id`, not Gemini `session/load`. `AttachRunner::spawn` exists (`hearth-agent-wire` `runner/mod.rs`); the missing link is that `Runtime::wake` does not route through `host_wake` yet. Remint `session/resume` carries `sessionId`, `cwd` (absolute `instance` of the Session's LocalDir Place) and `mcpServers` (Session config, `[]` if none); no Place / non-LocalDir / relative path fails closed with a typed `RemintError` and writes nothing.
 
 ### Outbound `AgentCommand` (Hearth → agent)
 

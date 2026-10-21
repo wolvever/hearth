@@ -435,11 +435,14 @@ impl AttachRunner {
     ///    silent skip, never `session/load` / `session/new`).
     ///
     /// AttachResume must not be written on the old wire (already torn down).
+    #[allow(clippy::too_many_arguments)]
     pub fn attach_resume_on_new_wire(
         &mut self,
         transport: &mut RunnerTransport,
         session: &RemintSession,
         agent_session_id: &str,
+        place: Option<&hearth::Place>,
+        mcp_servers: &[serde_json::Value],
         init_rpc_id: &RpcId,
         next_rpc_id: &mut u64,
     ) -> Result<LiveCaps, RemintError> {
@@ -449,6 +452,8 @@ impl AttachRunner {
         remint::write_new_wire_attach_resume(
             session,
             agent_session_id,
+            place,
+            mcp_servers,
             caps,
             |rpc| self.write_value(&rpc),
             next_rpc_id,
@@ -534,6 +539,10 @@ impl AttachRunner {
 /// NEW-wire transport (keeps the Host entry arity small).
 pub struct HostRemintArgs<'a> {
     pub session: &'a RemintSession,
+    /// Session's LocalDir Place → ACP `cwd` on `session/resume` (absolute).
+    pub place: Option<&'a hearth::Place>,
+    /// Session config `mcpServers` (`[]` if none) → ACP `mcpServers`.
+    pub mcp_servers: &'a [serde_json::Value],
     pub outcome: RemintOutcome,
     pub init_rpc_id: &'a RpcId,
     pub old_next_rpc_id: &'a mut u64,
@@ -571,11 +580,15 @@ pub fn host_remint_two_step(
 ) -> Result<HostRemintWires, RemintError> {
     let HostRemintArgs {
         session,
+        place,
+        mcp_servers,
         outcome,
         init_rpc_id,
         old_next_rpc_id,
         new_next_rpc_id,
     } = args;
+    // Before OLD teardown / NEW initialize.
+    remint::validate_resume_place(place)?;
     let agent_session_id = outcome.agent_session_id.clone();
     let flush = old.flush_and_teardown_after_remint(outcome, old_next_rpc_id);
     if !flush.needs_attach_resume {
@@ -588,6 +601,8 @@ pub fn host_remint_two_step(
         new_transport,
         session,
         &agent_session_id,
+        place,
+        mcp_servers,
         init_rpc_id,
         new_next_rpc_id,
     )?;
@@ -601,6 +616,10 @@ pub fn host_remint_two_step(
 /// separate args so OLD/NEW wires stay explicit).
 pub struct HostRemintFullArgs<'a> {
     pub session: &'a RemintSession,
+    /// Session's LocalDir Place → ACP `cwd` on `session/resume` (absolute).
+    pub place: Option<&'a hearth::Place>,
+    /// Session config `mcpServers` (`[]` if none) → ACP `mcpServers`.
+    pub mcp_servers: &'a [serde_json::Value],
     pub init_rpc_id: &'a RpcId,
     pub old_next_rpc_id: &'a mut u64,
     pub new_next_rpc_id: &'a mut u64,
@@ -635,10 +654,14 @@ pub fn host_remint_full_path(
 ) -> Result<HostRemintFullPath, RemintError> {
     let HostRemintFullArgs {
         session,
+        place,
+        mcp_servers,
         init_rpc_id,
         old_next_rpc_id,
         new_next_rpc_id,
     } = args;
+    // Before any side effect (mint, cancel, teardown, initialize).
+    remint::validate_resume_place(place)?;
     let outcome = session.remint_and_attach()?;
     let wires = host_remint_two_step(
         old,
@@ -646,6 +669,8 @@ pub fn host_remint_full_path(
         new_transport,
         HostRemintArgs {
             session,
+            place,
+            mcp_servers,
             outcome: outcome.clone(),
             init_rpc_id,
             old_next_rpc_id,
@@ -775,6 +800,9 @@ pub fn host_wake(
         OldWire::LiveIdle | OldWire::LiveInTurn => Ok(HostWake::ReuseLive),
         OldWire::Unknown => Ok(HostWake::Waiting(hearth::WaitReason::LivenessUnknown)),
         OldWire::Exited(_) | OldWire::StdoutEof | OldWire::TransportError(_) => {
+            // Place/cwd first: a resume we could never write must not kill
+            // the old child, mint, cancel or touch either wire.
+            remint::validate_resume_place(args.place)?;
             // EOF / EPIPE can happen while the child still runs: kill and
             // reap it BEFORE the new Binding is minted so two live agents
             // never share a session. Teardown writes then drop (dead wire).
@@ -862,6 +890,10 @@ mod tests {
         let mut t = transport_for_wire(WireKind::JsonlRpc);
         runner.initialize_host(&mut t, &RpcId::Num(0)).unwrap();
         (runner, t)
+    }
+
+    fn ws_place() -> hearth::Place {
+        hearth::Place::local_dir("/work/repo", hearth::PlaceAttach::RecreateFromGit)
     }
 
     fn initialized_fake(rest: Vec<u8>) -> AttachRunner {
@@ -978,7 +1010,14 @@ mod tests {
     #[test]
     fn resume_wire_write_is_session_resume_not_new() {
         let mut runner = initialized_fake(Vec::new());
-        let rpc = encode_remint_rpc(RemintWireMethod::SessionResume, "S-keep", 1);
+        let rpc = encode_remint_rpc(
+            RemintWireMethod::SessionResume,
+            "S-keep",
+            1,
+            Some(&ws_place()),
+            &[],
+        )
+        .unwrap();
         runner.write_jsonl(&rpc).unwrap();
         let log = std::str::from_utf8(runner.stdin_log().unwrap()).unwrap();
         assert!(log.contains("session/resume"));
@@ -1003,7 +1042,14 @@ mod tests {
         assert_eq!(out.agent_session_id, "S-stable");
         assert!(out.wire_actions.contains(&WireAction::AttachResume));
 
-        let resumed = encode_remint_rpc(RemintWireMethod::SessionResume, &out.agent_session_id, 2);
+        let resumed = encode_remint_rpc(
+            RemintWireMethod::SessionResume,
+            &out.agent_session_id,
+            2,
+            Some(&ws_place()),
+            &[],
+        )
+        .unwrap();
         let (mut runner, mut transport) = initialized_fake_with_transport(
             JsonlRpcTransport::encode_jsonl(&serde_json::json!({
                 "jsonrpc": "2.0",
@@ -1055,7 +1101,14 @@ mod tests {
         });
         runner.write_jsonl(&banned).unwrap();
         // Guard: remint encode helper never emits session/new.
-        let allowed = encode_remint_rpc(RemintWireMethod::SessionResume, "S-orig", 1);
+        let allowed = encode_remint_rpc(
+            RemintWireMethod::SessionResume,
+            "S-orig",
+            1,
+            Some(&ws_place()),
+            &[],
+        )
+        .unwrap();
         assert_ne!(allowed["method"], "session/new");
         assert_ne!(allowed["method"], "session/load");
     }
@@ -1678,6 +1731,8 @@ mod tests {
                 &mut transport,
                 &session,
                 &agent_sid,
+                Some(&ws_place()),
+                &[],
                 &RpcId::Num(1),
                 &mut new_next,
             )
@@ -1764,6 +1819,8 @@ mod tests {
                 &mut transport,
                 &session,
                 &agent_sid,
+                Some(&ws_place()),
+                &[],
                 &RpcId::Num(1),
                 &mut new_next,
             )
@@ -1836,6 +1893,8 @@ mod tests {
                 &mut transport,
                 &session,
                 &agent_sid,
+                Some(&ws_place()),
+                &[],
                 &RpcId::Num(1),
                 &mut new_next,
             )
@@ -1891,6 +1950,8 @@ mod tests {
         write_new_wire_attach_resume(
             &session,
             &agent_sid,
+            Some(&ws_place()),
+            &[],
             LiveCaps {
                 resume: true,
                 cancel: true,
@@ -1907,6 +1968,8 @@ mod tests {
         assert_eq!(written.len(), 1);
         assert_eq!(written[0]["method"], "session/resume");
         assert_eq!(written[0]["params"]["sessionId"], "S-keep");
+        assert_eq!(written[0]["params"]["cwd"], "/work/repo");
+        assert_eq!(written[0]["params"]["mcpServers"], serde_json::json!([]));
         assert_eq!(written[0]["id"], 30);
         assert_eq!(next, 31);
         assert!(session.live_caps().resume);
@@ -1961,6 +2024,8 @@ mod tests {
             &mut transport,
             HostRemintArgs {
                 session: &session,
+                place: Some(&ws_place()),
+                mcp_servers: &[],
                 outcome: out,
                 init_rpc_id: &RpcId::Num(1),
                 old_next_rpc_id: &mut old_next,
@@ -2049,6 +2114,8 @@ mod tests {
             &mut transport,
             HostRemintArgs {
                 session: &session,
+                place: Some(&ws_place()),
+                mcp_servers: &[],
                 outcome: out,
                 init_rpc_id: &RpcId::Num(1),
                 old_next_rpc_id: &mut old_next,
@@ -2111,6 +2178,8 @@ mod tests {
             &mut transport,
             HostRemintArgs {
                 session: &session,
+                place: Some(&ws_place()),
+                mcp_servers: &[],
                 outcome: out,
                 init_rpc_id: &RpcId::Num(1),
                 old_next_rpc_id: &mut old_next,
@@ -2167,6 +2236,8 @@ mod tests {
             &mut transport,
             HostRemintFullArgs {
                 session: &session,
+                place: Some(&ws_place()),
+                mcp_servers: &[],
                 init_rpc_id: &RpcId::Num(1),
                 old_next_rpc_id: &mut old_next,
                 new_next_rpc_id: &mut new_next,
@@ -2272,6 +2343,8 @@ mod tests {
             &mut transport,
             HostRemintFullArgs {
                 session: &session,
+                place: Some(&ws_place()),
+                mcp_servers: &[],
                 init_rpc_id: &RpcId::Num(1),
                 old_next_rpc_id: &mut old_next,
                 new_next_rpc_id: &mut new_next,
@@ -2353,6 +2426,8 @@ mod tests {
             &mut transport,
             HostRemintFullArgs {
                 session,
+                place: Some(&ws_place()),
+                mcp_servers: &[],
                 init_rpc_id: &RpcId::Num(1),
                 old_next_rpc_id: &mut old_next,
                 new_next_rpc_id: &mut new_next,
@@ -2530,6 +2605,80 @@ mod tests {
             "killed before mint: teardown writes dropped"
         );
         assert_eq!(mints(&session), before + 1);
+    }
+
+    /// Bad Place on a lost wire: typed fail-closed BEFORE kill / mint /
+    /// cancel / either wire write; no rpc id consumed (Pep #32 Must).
+    fn assert_wake_bad_place_zero_side_effects(place: Option<&hearth::Place>, want: RemintError) {
+        {
+            let session = wake_session();
+            session.begin_turn("mid");
+            let bid = session.binding_id();
+            let before = mints(&session);
+            // Unread stdout keeps the fake old child running.
+            let mut old = initialized_fake(b"{}\n".to_vec());
+            let old_log = old.stdin_log().unwrap().len();
+            let mut new = new_wire_fake();
+            let mut transport = transport_for_wire(WireKind::JsonlRpc);
+            let (mut old_next, mut new_next) = (10u64, 2u64);
+            let err = host_wake(
+                OldWire::StdoutEof,
+                &mut old,
+                &mut new,
+                &mut transport,
+                HostRemintFullArgs {
+                    session: &session,
+                    place,
+                    mcp_servers: &[],
+                    init_rpc_id: &RpcId::Num(1),
+                    old_next_rpc_id: &mut old_next,
+                    new_next_rpc_id: &mut new_next,
+                },
+            )
+            .unwrap_err();
+            assert_eq!(err, want);
+            assert_eq!(mints(&session), before, "{want:?}: no mint");
+            assert_eq!(session.binding_id(), bid, "{want:?}: Binding kept");
+            assert!(session.turn_in_flight(), "{want:?}: turn not cancelled");
+            // Fake child may exit on its own (0); killed+reaped would be 9.
+            assert_ne!(
+                old.try_wait().unwrap(),
+                Some(9),
+                "{want:?}: old child not killed"
+            );
+            assert_eq!(
+                old.stdin_log().unwrap().len(),
+                old_log,
+                "{want:?}: no old writes"
+            );
+            assert!(
+                new.stdin_log().unwrap().is_empty(),
+                "{want:?}: zero new frames"
+            );
+            assert_eq!(
+                (old_next, new_next),
+                (10, 2),
+                "{want:?}: no rpc id consumed"
+            );
+        }
+    }
+
+    #[test]
+    fn host_wake_no_place_zero_side_effects() {
+        assert_wake_bad_place_zero_side_effects(None, RemintError::ResumeNoPlace);
+    }
+
+    #[test]
+    fn host_wake_non_local_dir_place_zero_side_effects() {
+        let mut aws = ws_place();
+        aws.provider = hearth::PlaceProvider::Aws;
+        assert_wake_bad_place_zero_side_effects(Some(&aws), RemintError::ResumePlaceNotLocalDir);
+    }
+
+    #[test]
+    fn host_wake_relative_cwd_zero_side_effects() {
+        let rel = hearth::Place::local_dir("work/repo", hearth::PlaceAttach::RecreateFromGit);
+        assert_wake_bad_place_zero_side_effects(Some(&rel), RemintError::ResumeCwdNotAbsolute);
     }
 
     /// host_wake on Real-produced StdoutEof: one mint + session/resume.
