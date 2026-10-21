@@ -580,6 +580,9 @@ struct Inner {
 #[cfg(test)]
 type BeforeClaim = Box<dyn FnOnce(&HostSession, Option<hearth::BindingId>) + Send>;
 
+/// Remint Binding id every fresh [`RemintSession`] starts on.
+const FIRST_BINDING: &str = "bind-1";
+
 /// Host-owned remint state for AttachRunner. Session-first: remint never
 /// mints `session/new` under an existing Session.
 pub struct RemintSession {
@@ -593,7 +596,6 @@ impl RemintSession {
         live_caps: LiveCaps,
     ) -> (Self, SessionId, BindingId) {
         let session_id = session_id.into();
-        let binding_id = "bind-1".to_string();
         let host_store = InMemory::new();
         let host_user = host_store.create_user("remint-user");
         let host_agent = host_store.create_agent("remint-agent", "");
@@ -612,39 +614,17 @@ impl RemintSession {
                 Host::from_bind("acp", Some(agent_session_id.clone()), None),
             )
             .expect("bind remint host");
-        let mut host_bindings = HashMap::new();
-        host_bindings.insert(binding_id.clone(), host_binding.id);
-        let store = Self {
-            inner: Mutex::new(Inner {
-                session_id: session_id.clone(),
-                binding_id: binding_id.clone(),
-                next_binding: 2,
-                agent_session_id,
-                live_caps,
-                events: Vec::new(),
-                next_event: 1,
-                turn_in_flight: false,
-                turn: 0,
-                in_flight_prompt: None,
-                pending: BTreeMap::new(),
-                resurfaced: BTreeMap::new(),
-                client_caps: ClientCapabilities::HOST,
-                client_requests: BTreeMap::new(),
-                host_bindings,
-                attach_cursor: 0,
-                transport_owner: TransportOwner::Binding(binding_id.clone()),
-                closed: false,
-                producer_ring: Vec::new(),
-                producer_ring_cap: 3,
-                _store: host_store,
-                host_session,
-                host_agent: host_agent.id,
-                host_user: host_user.id,
-                #[cfg(test)]
-                before_claim: None,
-            }),
-        };
-        (store, session_id, binding_id)
+        let store = Self::from_host_parts(
+            session_id.clone(),
+            agent_session_id,
+            live_caps,
+            host_store,
+            host_session,
+            host_agent.id,
+            host_user.id,
+            host_binding.id,
+        );
+        (store, session_id, FIRST_BINDING.to_string())
     }
 
     /// Wrap an existing Host [`hearth::Session`] that already has a live Binding
@@ -665,13 +645,38 @@ impl RemintSession {
             .into_iter()
             .find(|b| b.agent == Some(host_agent))
             .ok_or_else(|| RemintError::HostLog("no live Binding for agent".into()))?;
-        let agent_session_id: AgentSessionId = agent_session_id.into();
-        let binding_id = "bind-1".to_string();
         let session_id = host_session.id().0.to_string();
         let store = host_session.store().clone();
+        Ok(Self::from_host_parts(
+            session_id,
+            agent_session_id.into(),
+            live_caps,
+            store,
+            host_session,
+            host_agent,
+            host_user,
+            host_binding.id,
+        ))
+    }
+
+    /// Shared constructor for [`Self::open`] and [`Self::on_host_session`]:
+    /// remint Binding [`FIRST_BINDING`] maps to `host_binding`; everything else starts
+    /// empty.
+    #[allow(clippy::too_many_arguments)]
+    fn from_host_parts(
+        session_id: SessionId,
+        agent_session_id: AgentSessionId,
+        live_caps: LiveCaps,
+        store: InMemory,
+        host_session: HostSession,
+        host_agent: AgentId,
+        host_user: UserId,
+        host_binding: hearth::BindingId,
+    ) -> Self {
+        let binding_id: BindingId = FIRST_BINDING.to_string();
         let mut host_bindings = HashMap::new();
-        host_bindings.insert(binding_id.clone(), host_binding.id);
-        Ok(Self {
+        host_bindings.insert(binding_id.clone(), host_binding);
+        Self {
             inner: Mutex::new(Inner {
                 session_id,
                 binding_id: binding_id.clone(),
@@ -689,7 +694,7 @@ impl RemintSession {
                 client_requests: BTreeMap::new(),
                 host_bindings,
                 attach_cursor: 0,
-                transport_owner: TransportOwner::Binding(binding_id.clone()),
+                transport_owner: TransportOwner::Binding(binding_id),
                 closed: false,
                 producer_ring: Vec::new(),
                 producer_ring_cap: 3,
@@ -700,7 +705,7 @@ impl RemintSession {
                 #[cfg(test)]
                 before_claim: None,
             }),
-        })
+        }
     }
 
     pub fn session_id(&self) -> SessionId {
