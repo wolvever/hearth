@@ -919,8 +919,16 @@ pub struct TickWire<'a> {
 /// Session's `Wake::Timer` runs [`wake_through_host_wake`] — same one-mint
 /// seam as explicit wake, never `claim_binding` on a timer.
 ///
-/// Waiting (from `host_wake`, from `wake_with`, or no [`TickWire`] for that
-/// Session) skips it this tick: nothing written, `next_due_ms` unchanged.
+/// Per due Session, in order (each skip: zero wire action, nothing written,
+/// `next_due_ms` unchanged, retried on a later tick):
+/// 1. No [`TickWire`] in `wires` → skip (no wire evidence = liveness
+///    unknown). The Host must supply a wire for it to fire.
+/// 2. Read-only kernel [`hearth::Runtime::classify`]: `LiveInTurn` /
+///    `Unknown` → skip, so a timer never tears down a wire under an open turn.
+/// 3. [`wake_through_host_wake`]: `HostWake::Waiting` → skip. A later
+///    Runtime `Error::Waiting` (after `host_wake` may have acted) is
+///    propagated as Err, never reported as a skip.
+///
 /// Any other error aborts the tick. `next_due_ms` advances only on Woke.
 pub fn tick_through_host_wake(
     runtime: &hearth::Runtime,
@@ -931,6 +939,12 @@ pub fn tick_through_host_wake(
         let Some(w) = wires.remove(&session_id) else {
             return Ok(None);
         };
+        if matches!(
+            runtime.classify(session_id)?,
+            hearth::Liveness::LiveInTurn | hearth::Liveness::Unknown
+        ) {
+            return Ok(None);
+        }
         let args = WakeThroughHostArgs {
             runtime,
             session_id,
@@ -938,10 +952,9 @@ pub fn tick_through_host_wake(
             old_wire: w.old_wire,
             remint: w.remint,
         };
-        match wake_through_host_wake(w.old, w.new, w.new_transport, args) {
-            Ok(WakeThroughHost::Waiting(_))
-            | Err(WakeThroughError::Runtime(hearth::Error::Waiting(_))) => Ok(None),
-            r => r.map(Some),
+        match wake_through_host_wake(w.old, w.new, w.new_transport, args)? {
+            WakeThroughHost::Waiting(_) => Ok(None),
+            woke => Ok(Some(woke)),
         }
     })
 }
@@ -3286,6 +3299,87 @@ mod tests {
         );
         assert!(new.stdin_log().unwrap().is_empty());
 
+        let again = tick_through(
+            &rt,
+            sid,
+            now,
+            &remint,
+            &place,
+            OldWire::LiveIdle,
+            &mut old,
+            &mut new,
+        )
+        .expect("tick");
+        assert_eq!(again.len(), 1, "still due at the same now");
+    }
+
+    /// Kernel turn open + Exited wire on a due timer: the read-only kernel
+    /// check skips before host_wake — 0 mints, no wire writes, no event,
+    /// still due (fires at the same `now` once the turn ends).
+    #[test]
+    fn tick_through_host_wake_turn_open_skips_before_wire() {
+        let (rt, sid, remint, place, now) = timed_runtime_remint();
+        let agent = remint.host_agent_id();
+        let session = rt.store().session(sid).unwrap();
+        session.turn_start(agent).expect("turn open");
+        let log_len = session.events().unwrap().len();
+        let before = binding_attached_count(&rt, sid);
+        // Unread stdout keeps the fake old child running.
+        let mut old = initialized_fake(b"{}\n".to_vec());
+        let old_log = old.stdin_log().unwrap().len();
+        let mut new = new_wire_fake();
+        let fired = tick_through(
+            &rt,
+            sid,
+            now,
+            &remint,
+            &place,
+            OldWire::Exited(1),
+            &mut old,
+            &mut new,
+        )
+        .expect("tick");
+        assert!(fired.is_empty());
+        assert_eq!(binding_attached_count(&rt, sid), before, "0 mints");
+        assert_eq!(old.stdin_log().unwrap().len(), old_log);
+        assert!(new.stdin_log().unwrap().is_empty());
+        assert_eq!(session.events().unwrap().len(), log_len, "no event");
+        // Fake child may exit on its own (0); killed+reaped would be 9.
+        assert_ne!(old.try_wait().unwrap(), Some(9), "old child not killed");
+
+        session.turn_end(agent).expect("turn end");
+        let again = tick_through(
+            &rt,
+            sid,
+            now,
+            &remint,
+            &place,
+            OldWire::LiveIdle,
+            &mut old,
+            &mut new,
+        )
+        .expect("tick");
+        assert_eq!(again.len(), 1, "still due at the same now");
+    }
+
+    /// Due Session with no TickWire: skipped (no wire evidence), nothing
+    /// written, still due until the Host supplies a wire.
+    #[test]
+    fn tick_through_host_wake_missing_wire_skips_and_stays_due() {
+        let (rt, sid, remint, place, now) = timed_runtime_remint();
+        let log_len = rt.store().session(sid).unwrap().events().unwrap().len();
+        let before = binding_attached_count(&rt, sid);
+        let fired =
+            tick_through_host_wake(&rt, Some(now), std::collections::HashMap::new()).expect("tick");
+        assert!(fired.is_empty());
+        assert_eq!(binding_attached_count(&rt, sid), before);
+        assert_eq!(
+            rt.store().session(sid).unwrap().events().unwrap().len(),
+            log_len
+        );
+
+        let mut old = initialized_fake(Vec::new());
+        let mut new = new_wire_fake();
         let again = tick_through(
             &rt,
             sid,
