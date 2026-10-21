@@ -29,7 +29,10 @@ pub use place_memory::{
     cross_agent_write, skill_path, topic_path, InjectedContext, MemoryFiles, MemoryPolicy,
     PlaceMemory, WorkingState, AGENTS_MD, HANDOFF_MD, MEMORY_MD, SUMMARY_BYTE_CAP, USER_MD,
 };
-pub use runtime::{HolderId, KeepSpec, Liveness, Runtime, SessionTurnLease, StepOutcome, Wake};
+pub use runtime::{
+    AlreadyBound, ClaimBinding, HolderId, KeepSpec, Liveness, Runtime, SessionTurnLease,
+    StepOutcome, Wake, WakeClaim,
+};
 pub use sandbox::FakeSandbox;
 
 // --- identities ---
@@ -656,6 +659,12 @@ pub struct Session {
 impl Session {
     pub fn id(&self) -> SessionId {
         self.id
+    }
+
+    /// Backing store handle (cloneable Arc). Hosts that wrap a Session in
+    /// wire remint state keep this alive the same way [`Runtime::store`] does.
+    pub fn store(&self) -> &InMemory {
+        &self.store
     }
 
     fn read<T>(&self, f: impl FnOnce(&SessionData) -> T) -> Result<T> {

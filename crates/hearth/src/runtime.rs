@@ -9,6 +9,14 @@
 //! It does **not** spawn a CLI, invent [`crate::EventBody::AgentMessage`],
 //! or call [`crate::Session::turn_end`] — the host runner ends the turn later.
 //!
+//! Production Host with a live AttachRunner must **not** call [`Runtime::wake`]
+//! alone for remint: that path uses `claim_binding` and never talks to the
+//! wire. Route through the wire-side `wake_through_host_wake` instead —
+//! `host_wake` / `host_remint_full_path` own the one Binding mint, then
+//! [`Runtime::wake_with`] [`AlreadyBound`] records the prompt without a second
+//! claim. Kernel unit tests may keep using [`Runtime::wake`] (default
+//! [`ClaimBinding`]).
+//!
 //! Intra-turn durable steps: [`Runtime::begin_turn`] / [`Runtime::end_turn`] hold a
 //! [`SessionTurnLease`] (holder + fence). [`Runtime::durable_step`] memoizes via
 //! [`crate::EventBody::StepCompleted`]. [`Runtime::resume_interrupted_turn`]
@@ -39,6 +47,37 @@ impl Wake {
             Wake::Timer => WakeSource::Timer,
             Wake::Trigger { name } => WakeSource::Trigger { name: name.clone() },
         }
+    }
+}
+
+/// How [`Runtime::wake_with`] ensures a Binding when none is live.
+///
+/// Production Host that already ran `host_wake` passes [`AlreadyBound`] so this
+/// path never mints. The default [`ClaimBinding`] is for kernel tests without
+/// a wire. Never use [`ClaimBinding`] on the same wake that also remints via
+/// `host_remint_full_path` — that is a double mint / `BindingConflict`.
+pub trait WakeClaim {
+    fn claim(&mut self, session: &Session, agent: AgentId, host: Host) -> Result<()>;
+}
+
+/// Kernel default: [`Session::rebind`] `(None, …)` via `claim_binding`.
+#[derive(Debug, Default)]
+pub struct ClaimBinding;
+
+impl WakeClaim for ClaimBinding {
+    fn claim(&mut self, session: &Session, agent: AgentId, host: Host) -> Result<()> {
+        claim_binding(session, agent, host).map(|_| ())
+    }
+}
+
+/// Host already ensured the Binding (e.g. via `host_wake`). Verifies a live
+/// Binding exists; never calls `rebind`.
+#[derive(Debug, Default)]
+pub struct AlreadyBound;
+
+impl WakeClaim for AlreadyBound {
+    fn claim(&mut self, session: &Session, agent: AgentId, _host: Host) -> Result<()> {
+        binding_for_agent(session, agent).map(|_| ())
     }
 }
 
@@ -259,11 +298,30 @@ impl Runtime {
     /// Wake a kept session: find_server on the agent's Binding.
     ///
     /// Prompt path never remints a live Binding. `NeverBound` / `PositivelyDead`
-    /// remint first (idle launch / empty pool), then link. `LiveInTurn` /
-    /// `Unknown` wait.
+    /// remint first via [`ClaimBinding`] (idle launch / empty pool), then link.
+    /// `LiveInTurn` / `Unknown` wait.
     /// Does **not** call [`Session::turn_end`] — the host runner would end the turn later.
     /// Does **not** spawn a real CLI or invent `AgentMessage`.
+    ///
+    /// Production wire Host: prefer `wake_through_host_wake` then
+    /// [`Self::wake_with`] [`AlreadyBound`] — never this default claim on the
+    /// same wake as `host_wake`.
     pub fn wake(&self, session: SessionId, wake: Wake) -> Result<Vec<Event>> {
+        self.wake_with(session, wake, &mut ClaimBinding)
+    }
+
+    /// Wake with a pluggable Binding ensure step.
+    ///
+    /// Same classify / record / `turn_start` as [`Self::wake`], but
+    /// `NeverBound` / `PositivelyDead` call `claim.claim` instead of the
+    /// hard-wired kernel remint. Pass [`AlreadyBound`] after `host_wake` so
+    /// this path never mints.
+    pub fn wake_with<C: WakeClaim>(
+        &self,
+        session: SessionId,
+        wake: Wake,
+        claim: &mut C,
+    ) -> Result<Vec<Event>> {
         let _gate = self.lock_durable()?;
         let (agent, host) = self.kept_recipe(session)?;
         let sess = self.store.session(session)?;
@@ -275,7 +333,7 @@ impl Runtime {
             Liveness::Unknown => return Err(Error::Waiting(WaitReason::LivenessUnknown)),
             Liveness::LiveIdle => {}
             Liveness::NeverBound | Liveness::PositivelyDead => {
-                claim_binding(&sess, agent, host)?;
+                claim.claim(&sess, agent, host)?;
             }
         }
         record_wake(&sess, &wake)?;
@@ -1454,5 +1512,72 @@ mod tests {
             rt.tick(Some(1)),
             Err(Error::UnknownSession(id)) if id == ghost
         ));
+    }
+
+    #[test]
+    fn wake_with_already_bound_refuses_never_bound_without_mint() {
+        let rt = Runtime::new();
+        let agent = rt.store().create_agent("scribe", "");
+        let session = rt.create_session();
+        rt.keep(session.id(), agent.id, goose()).unwrap();
+        assert!(session.bindings().unwrap().is_empty());
+        let err = rt
+            .wake_with(session.id(), Wake::Timer, &mut AlreadyBound)
+            .unwrap_err();
+        assert!(matches!(err, Error::Waiting(WaitReason::NoBinding)));
+        assert!(
+            session.bindings().unwrap().is_empty(),
+            "AlreadyBound must not mint"
+        );
+    }
+
+    #[test]
+    fn wake_with_already_bound_reuses_live_binding_zero_mints() {
+        let rt = Runtime::new();
+        let user = rt.store().create_user("cheng");
+        let agent = rt.store().create_agent("scribe", "");
+        let session = rt.create_session();
+        session.join(Member::User(user.id)).unwrap();
+        rt.keep(session.id(), agent.id, goose()).unwrap();
+        // First wake claims via default path.
+        rt.wake(
+            session.id(),
+            Wake::UserQuery {
+                user: user.id,
+                text: "first".into(),
+            },
+        )
+        .unwrap();
+        session.turn_end(agent.id).unwrap();
+        let before = session
+            .events()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e.body, EventBody::BindingAttached { .. }))
+            .count();
+        let binds = session.bindings().unwrap().len();
+
+        let evs = rt
+            .wake_with(
+                session.id(),
+                Wake::UserQuery {
+                    user: user.id,
+                    text: "again".into(),
+                },
+                &mut AlreadyBound,
+            )
+            .unwrap();
+        assert!(evs.iter().any(|e| matches!(
+            &e.body,
+            EventBody::UserMessage { text, .. } if text == "again"
+        )));
+        assert_eq!(session.bindings().unwrap().len(), binds);
+        let after = session
+            .events()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e.body, EventBody::BindingAttached { .. }))
+            .count();
+        assert_eq!(after, before, "AlreadyBound must not mint");
     }
 }
