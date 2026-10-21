@@ -350,7 +350,32 @@ impl Runtime {
     /// Pass `now` for a deterministic clock
     /// (same epoch-ms as [`crate::Event::ts`]); `None` uses the wall clock.
     /// This is how tests drive the infinite loop without sleeping.
+    ///
+    /// Kernel default ([`ClaimBinding`]) for tests without a wire. Production
+    /// wire Host: route through `tick_through_host_wake` ([`Self::tick_with`]).
     pub fn tick(&self, now_ms: Option<u64>) -> Result<Vec<(SessionId, Vec<Event>)>> {
+        self.tick_with(now_ms, |sid, wake| match self.wake(sid, wake) {
+            Ok(ev) => Ok(Some(ev)),
+            Err(Error::Waiting(_)) => Ok(None),
+            Err(e) => Err(e),
+        })
+    }
+
+    /// [`Self::tick`] with a pluggable per-Session timer wake (mirrors
+    /// [`Self::wake_with`]). `wake` returns `Ok(None)` for Waiting: that
+    /// Session is skipped this tick, nothing written, `next_due_ms`
+    /// unchanged. `Ok(Some(_))` advances `next_due_ms`; `Err` aborts the tick.
+    /// Production wire Host passes `wake_through_host_wake` so a timer never
+    /// mints via `claim_binding`.
+    pub fn tick_with<T, E, F>(
+        &self,
+        now_ms: Option<u64>,
+        mut wake: F,
+    ) -> std::result::Result<Vec<(SessionId, T)>, E>
+    where
+        E: From<Error>,
+        F: FnMut(SessionId, Wake) -> std::result::Result<Option<T>, E>,
+    {
         let now = now_ms.unwrap_or_else(now_ts);
         let mut due: Vec<SessionId> = {
             let g = self.lock_kept()?;
@@ -363,12 +388,10 @@ impl Runtime {
 
         let mut out = Vec::new();
         for sid in due {
-            let events = match self.wake(sid, Wake::Timer) {
-                Ok(ev) => ev,
-                // Busy or liveness-unknown: skip this Session this tick, write
-                // nothing, keep it due so it fires on a later tick.
-                Err(Error::Waiting(_)) => continue,
-                Err(e) => return Err(e),
+            // Busy or liveness-unknown: skip this Session this tick, write
+            // nothing, keep it due so it fires on a later tick.
+            let Some(woke) = wake(sid, Wake::Timer)? else {
+                continue;
             };
             {
                 let mut g = self.lock_kept()?;
@@ -378,7 +401,7 @@ impl Runtime {
                     }
                 }
             }
-            out.push((sid, events));
+            out.push((sid, woke));
         }
         Ok(out)
     }
