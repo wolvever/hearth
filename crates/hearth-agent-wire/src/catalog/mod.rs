@@ -54,31 +54,16 @@ pub struct LaunchSpec {
 impl CatalogProfile {
     /// Argv plus wire. No I/O.
     pub fn launch_spec(&self) -> Result<LaunchSpec, BusError> {
-        let Some((program, args)) = self.command.split_first() else {
-            return Err(BusError::Decode(format!(
-                "catalog profile {}: empty command",
-                self.id
-            )));
-        };
-        if program.is_empty() {
-            return Err(BusError::Decode(format!(
-                "catalog profile {}: empty program",
-                self.id
-            )));
+        match self.command.split_first() {
+            Some((program, args)) if !program.is_empty() => Ok(LaunchSpec {
+                program: program.clone(),
+                args: args.to_vec(),
+                cwd: None,
+                env: self.env.clone(),
+                wire: self.wire,
+            }),
+            _ => Err(decode(&self.id, "empty program")),
         }
-        if WireKind::parse(self.wire.as_str()) != Some(self.wire) {
-            return Err(BusError::Decode(format!(
-                "catalog profile {}: wire is not an allowed WireKind",
-                self.id
-            )));
-        }
-        Ok(LaunchSpec {
-            program: program.clone(),
-            args: args.to_vec(),
-            cwd: None,
-            env: self.env.clone(),
-            wire: self.wire,
-        })
     }
 
     /// Shared ACP codec. Copilot and Cursor do not get their own adapter.
@@ -113,12 +98,17 @@ struct RawEnv {
     value: String,
 }
 
+fn decode(id: &str, what: impl std::fmt::Display) -> BusError {
+    BusError::Decode(format!("catalog profile {id}: {what}"))
+}
+
 fn parse_extends(id: &str, extends: &str) -> Result<CatalogExtends, BusError> {
     match extends {
         "acp" => Ok(CatalogExtends::Acp),
-        other => Err(BusError::Decode(format!(
-            "catalog profile {id}: extends {other:?} is not supported (only \"acp\")"
-        ))),
+        other => Err(decode(
+            id,
+            format!("extends {other:?} is not supported (only \"acp\")"),
+        )),
     }
 }
 
@@ -127,18 +117,18 @@ fn parse_wire(id: &str, extends: CatalogExtends, wire: Option<&str>) -> Result<W
         None => match extends {
             CatalogExtends::Acp => WireKind::JsonlRpc,
         },
-        Some(name) => WireKind::parse(name).ok_or_else(|| {
-            BusError::Decode(format!(
-                "catalog profile {id}: wire {name:?} is not an allowed WireKind"
-            ))
-        })?,
+        Some(name) => WireKind::parse(name)
+            .ok_or_else(|| decode(id, format!("wire {name:?} is not an allowed WireKind")))?,
     };
     if extends == CatalogExtends::Acp && kind != WireKind::JsonlRpc {
-        return Err(BusError::Decode(format!(
-            "catalog profile {id}: acp stdio profiles use {} (newline-delimited JSON-RPC), not {}",
-            WireKind::JsonlRpc.as_str(),
-            kind.as_str()
-        )));
+        return Err(decode(
+            id,
+            format!(
+                "acp stdio profiles use {} (newline-delimited JSON-RPC), not {}",
+                WireKind::JsonlRpc.as_str(),
+                kind.as_str()
+            ),
+        ));
     }
     Ok(kind)
 }
@@ -161,23 +151,14 @@ pub fn load_profiles_str(text: &str) -> Result<Vec<CatalogProfile>, BusError> {
             )));
         }
         if raw.command.is_empty() || raw.command.iter().any(|p| p.is_empty()) {
-            return Err(BusError::Decode(format!(
-                "catalog profile {}: command must be a non-empty argv",
-                raw.id
-            )));
+            return Err(decode(&raw.id, "command must be a non-empty argv"));
         }
         let extends = parse_extends(&raw.id, &raw.extends)?;
         let wire = parse_wire(&raw.id, extends, raw.wire.as_deref())?;
-        let mut env = Vec::with_capacity(raw.env.len());
-        for pair in raw.env {
-            if pair.key.is_empty() {
-                return Err(BusError::Decode(format!(
-                    "catalog profile {}: env key is empty",
-                    raw.id
-                )));
-            }
-            env.push((pair.key, pair.value));
+        if raw.env.iter().any(|pair| pair.key.is_empty()) {
+            return Err(decode(&raw.id, "env key is empty"));
         }
+        let env = raw.env.into_iter().map(|p| (p.key, p.value)).collect();
         out.push(CatalogProfile {
             id: raw.id,
             label: raw.label,
@@ -198,16 +179,12 @@ pub fn load_profiles(path: &Path) -> Result<Vec<CatalogProfile>, BusError> {
     load_profiles_str(&text)
 }
 
-fn builtin_vec() -> &'static Vec<CatalogProfile> {
+/// Curated profiles compiled into the crate (`builtin.toml`).
+pub fn builtin_profiles() -> &'static [CatalogProfile] {
     static BUILTIN: OnceLock<Vec<CatalogProfile>> = OnceLock::new();
     BUILTIN.get_or_init(|| {
         load_profiles_str(include_str!("builtin.toml")).expect("catalog/builtin.toml")
     })
-}
-
-/// Curated profiles compiled into the crate (`builtin.toml`).
-pub fn builtin_profiles() -> &'static [CatalogProfile] {
-    builtin_vec()
 }
 
 /// Lookup a builtin profile by id (`"copilot"`, `"cursor"`).
@@ -394,6 +371,42 @@ mod tests {
         .unwrap_err();
         match err {
             BusError::Decode(msg) => assert!(msg.contains("jsonl-rpc"), "{msg}"),
+            other => panic!("expected decode error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_env_key_is_rejected() {
+        let err = load_profiles_str(
+            r#"
+            [[profile]]
+            id = "blankenv"
+            label = "Blank env"
+            command = ["agent", "acp"]
+            extends = "acp"
+            env = [{ key = "", value = "x" }]
+            "#,
+        )
+        .unwrap_err();
+        match err {
+            BusError::Decode(msg) => assert!(msg.contains("env key is empty"), "{msg}"),
+            other => panic!("expected decode error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn launch_spec_rejects_hand_built_empty_program() {
+        let profile = CatalogProfile {
+            id: "handmade".into(),
+            label: "Hand made".into(),
+            command: vec![String::new(), "acp".into()],
+            extends: CatalogExtends::Acp,
+            wire: WireKind::JsonlRpc,
+            caps_override: None,
+            env: Vec::new(),
+        };
+        match profile.launch_spec().unwrap_err() {
+            BusError::Decode(msg) => assert!(msg.contains("empty program"), "{msg}"),
             other => panic!("expected decode error, got {other:?}"),
         }
     }
