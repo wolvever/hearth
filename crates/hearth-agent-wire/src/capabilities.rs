@@ -95,64 +95,29 @@ impl CapabilityFlags {
     pub const GROK_BUILD: Self = Self::ACP;
 
     /// Codex App Server. Permission encode is a stub (flag stays false).
+    /// Differs from [`Self::ACP`] on plan / permission / compact.
     pub const CODEX: Self = Self {
-        streaming: false,
-        session_persistence: false,
-        session_listing: false,
-        dynamic_modes: false,
-        mcp_servers: false,
-        reasoning_stream: true,
-        tool_invocations: true,
-        rewind_conversation: false,
-        rewind_files: false,
-        rewind_both: false,
-        session: true,
-        message: true,
         plan: false,
         permission: false,
-        question: false,
         compact: true,
-        subagent: false,
+        ..Self::ACP
     };
 
+    /// Differs from [`Self::ACP`] on plan / permission / compact / subagent.
     pub const PI: Self = Self {
-        streaming: false,
-        session_persistence: false,
-        session_listing: false,
-        dynamic_modes: false,
-        mcp_servers: false,
-        reasoning_stream: true,
-        tool_invocations: true,
-        rewind_conversation: false,
-        rewind_files: false,
-        rewind_both: false,
-        session: true,
-        message: true,
         plan: false,
         permission: false,
-        question: false,
         compact: true,
         subagent: true,
+        ..Self::ACP
     };
 
+    /// Differs from [`Self::ACP`] on plan / question / compact.
     pub const OPENCODE: Self = Self {
-        streaming: false,
-        session_persistence: false,
-        session_listing: false,
-        dynamic_modes: false,
-        mcp_servers: false,
-        reasoning_stream: true,
-        tool_invocations: true,
-        rewind_conversation: false,
-        rewind_files: false,
-        rewind_both: false,
-        session: true,
-        message: true,
         plan: false,
-        permission: true,
         question: true,
         compact: true,
-        subagent: false,
+        ..Self::ACP
     };
 
     pub const fn for_agent(kind: AgentKind) -> Self {
