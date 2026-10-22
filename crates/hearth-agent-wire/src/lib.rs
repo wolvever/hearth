@@ -40,13 +40,15 @@ pub use host::{
     binding_kind, event_bodies, host_for, AttachError, AttachResult, HostAttach, PendingAsk,
 };
 pub use runner::{
-    encode_remint_rpc, flush_and_teardown_old_wire, flush_old_wire_replies, host_remint_full_path,
-    host_remint_two_step, host_wake, old_wire_from_stdout, tick_through_host_wake,
-    transport_for_wire, wake_through_host_wake, write_new_wire_attach_resume,
-    write_old_wire_teardown, AttachRunner, HostRemintArgs, HostRemintFullArgs, HostRemintFullPath,
-    HostRemintWires, HostWake, LiveCaps, OldWire, OldWireFlush, OldWireWrite, RemintError,
-    RemintEvent, RemintEventKind, RemintOutcome, RemintSession, RemintWireMethod, RunnerTransport,
-    StdoutRead, TickWire, WakeThroughError, WakeThroughHost, WakeThroughHostArgs,
+    begin_turn_through_host_wake, encode_remint_rpc, flush_and_teardown_old_wire,
+    flush_old_wire_replies, host_remint_full_path, host_remint_two_step, host_wake,
+    old_wire_from_stdout, remint_through_host_wake, tick_through_host_wake, transport_for_wire,
+    wake_through_host_wake, write_new_wire_attach_resume, write_old_wire_teardown, AttachRunner,
+    BeginTurnThroughHost, BeginTurnThroughHostArgs, HostRemintArgs, HostRemintFullArgs,
+    HostRemintFullPath, HostRemintWires, HostWake, LiveCaps, OldWire, OldWireFlush, OldWireWrite,
+    RemintError, RemintEvent, RemintEventKind, RemintOutcome, RemintSession, RemintThroughHost,
+    RemintThroughHostArgs, RemintWireMethod, RunnerTransport, StdoutRead, TickWire,
+    WakeThroughError, WakeThroughHost, WakeThroughHostArgs,
 };
 pub use transport::{
     JsonRpcTransport, JsonlProblem, JsonlRpcTransport, SseFrame, SseTransport, Transport,

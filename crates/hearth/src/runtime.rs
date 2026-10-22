@@ -9,13 +9,15 @@
 //! It does **not** spawn a CLI, invent [`crate::EventBody::AgentMessage`],
 //! or call [`crate::Session::turn_end`] — the host runner ends the turn later.
 //!
-//! Production Host with a live AttachRunner must **not** call [`Runtime::wake`]
-//! alone for remint: that path uses `claim_binding` and never talks to the
-//! wire. Route through the wire-side `wake_through_host_wake` instead —
+//! Production Host with a live AttachRunner must **not** call [`Runtime::wake`],
+//! [`Runtime::remint`], or [`Runtime::begin_turn`] alone for remint: those paths
+//! use `claim_binding` and never talk to the wire. Route through the wire-side
+//! `wake_through_host_wake` / `tick_through_host_wake` /
+//! `begin_turn_through_host_wake` / `remint_through_host_wake` instead —
 //! `host_wake` / `host_remint_full_path` own the one Binding mint, then
-//! [`Runtime::wake_with`] [`AlreadyBound`] records the prompt without a second
-//! claim. Kernel unit tests may keep using [`Runtime::wake`] (default
-//! [`ClaimBinding`]).
+//! [`Runtime::wake_with`] / [`Runtime::begin_turn_with`] / [`Runtime::remint_with`]
+//! [`AlreadyBound`] record without a second claim. Kernel unit tests may keep
+//! using the default [`ClaimBinding`] entry points.
 //!
 //! Intra-turn durable steps: [`Runtime::begin_turn`] / [`Runtime::end_turn`] hold a
 //! [`SessionTurnLease`] (holder + fence). [`Runtime::durable_step`] memoizes via
@@ -50,12 +52,14 @@ impl Wake {
     }
 }
 
-/// How [`Runtime::wake_with`] ensures a Binding when none is live.
+/// How [`Runtime::wake_with`] / [`Runtime::begin_turn_with`] /
+/// [`Runtime::remint_with`] ensure a Binding when none is live.
 ///
 /// Production Host that already ran `host_wake` passes [`AlreadyBound`] so this
 /// path never mints. The default [`ClaimBinding`] is for kernel tests without
-/// a wire. Never use [`ClaimBinding`] on the same wake that also remints via
-/// `host_remint_full_path` — that is a double mint / `BindingConflict`.
+/// a wire. Never use [`ClaimBinding`] on the same wake / begin_turn / remint
+/// that also remints via `host_remint_full_path` — that is a double mint /
+/// `BindingConflict`.
 pub trait WakeClaim {
     fn claim(&mut self, session: &Session, agent: AgentId, host: Host) -> Result<()>;
 }
@@ -278,7 +282,24 @@ impl Runtime {
     }
 
     /// Idle remint. Refused if a Binding is live or liveness is unknown.
+    ///
+    /// Kernel default ([`ClaimBinding`]) for tests without a wire. Production
+    /// wire Host: route through `remint_through_host_wake`
+    /// ([`Self::remint_with`] [`AlreadyBound`] after `host_wake`).
     pub fn remint(&self, session: SessionId) -> Result<crate::BindingId> {
+        self.remint_with(session, &mut ClaimBinding)
+    }
+
+    /// Idle remint with a pluggable Binding ensure step.
+    ///
+    /// Same classify as [`Self::remint`], but `NeverBound` / `PositivelyDead`
+    /// call `claim.claim` instead of the hard-wired kernel remint. Pass
+    /// [`AlreadyBound`] after `host_wake` so this path never mints.
+    pub fn remint_with<C: WakeClaim>(
+        &self,
+        session: SessionId,
+        claim: &mut C,
+    ) -> Result<crate::BindingId> {
         // Lock order (all rebind paths): durable gate -> kept -> store.
         let _gate = self.lock_durable()?;
         let (agent, host) = self.kept_recipe(session)?;
@@ -290,7 +311,8 @@ impl Runtime {
             }
             Liveness::Unknown => Err(Error::Waiting(WaitReason::LivenessUnknown)),
             Liveness::NeverBound | Liveness::PositivelyDead => {
-                Ok(claim_binding(&sess, agent, host)?.id)
+                claim.claim(&sess, agent, host)?;
+                binding_for_agent(&sess, agent)
             }
         }
     }
@@ -425,10 +447,29 @@ impl Runtime {
     /// If `wake` already opened a turn and no lease exists, attaches a lease to
     /// that turn. An interrupted turn (lease holder dropped) must use
     /// [`Self::resume_interrupted_turn`].
+    ///
+    /// Kernel default ([`ClaimBinding`]) for tests without a wire. Production
+    /// wire Host: route through `begin_turn_through_host_wake`
+    /// ([`Self::begin_turn_with`] [`AlreadyBound`] after `host_wake`).
     pub fn begin_turn(
         &self,
         session: SessionId,
         holder: HolderId,
+    ) -> Result<(u64, u64, BindingId)> {
+        self.begin_turn_with(session, holder, &mut ClaimBinding)
+    }
+
+    /// [`Self::begin_turn`] with a pluggable Binding ensure step.
+    ///
+    /// Same lease / `turn_start` as [`Self::begin_turn`], but
+    /// `NeverBound` / `PositivelyDead` call `claim.claim` instead of the
+    /// hard-wired kernel remint. Pass [`AlreadyBound`] after `host_wake` so
+    /// this path never mints.
+    pub fn begin_turn_with<C: WakeClaim>(
+        &self,
+        session: SessionId,
+        holder: HolderId,
+        claim: &mut C,
     ) -> Result<(u64, u64, BindingId)> {
         let _gate = self.lock_durable()?;
         let (agent, host) = self.kept_recipe(session)?;
@@ -458,7 +499,7 @@ impl Runtime {
             Liveness::Unknown => return Err(Error::Waiting(WaitReason::LivenessUnknown)),
             Liveness::LiveIdle => {}
             Liveness::NeverBound | Liveness::PositivelyDead => {
-                claim_binding(&sess, agent, host)?;
+                claim.claim(&sess, agent, host)?;
             }
         }
 
@@ -1602,5 +1643,73 @@ mod tests {
             .filter(|e| matches!(e.body, EventBody::BindingAttached { .. }))
             .count();
         assert_eq!(after, before, "AlreadyBound must not mint");
+    }
+
+    #[test]
+    fn remint_with_already_bound_refuses_never_bound_without_mint() {
+        let rt = Runtime::new();
+        let agent = rt.store().create_agent("scribe", "");
+        let session = rt.create_session();
+        rt.keep(session.id(), agent.id, goose()).unwrap();
+        assert!(session.bindings().unwrap().is_empty());
+        let err = rt.remint_with(session.id(), &mut AlreadyBound).unwrap_err();
+        assert!(matches!(err, Error::Waiting(WaitReason::NoBinding)));
+        assert!(
+            session.bindings().unwrap().is_empty(),
+            "AlreadyBound must not mint"
+        );
+    }
+
+    #[test]
+    fn begin_turn_with_already_bound_refuses_never_bound_without_mint() {
+        let rt = Runtime::new();
+        let agent = rt.store().create_agent("scribe", "");
+        let session = rt.create_session();
+        rt.keep(session.id(), agent.id, goose()).unwrap();
+        assert!(session.bindings().unwrap().is_empty());
+        let err = rt
+            .begin_turn_with(session.id(), HolderId::new("host-a"), &mut AlreadyBound)
+            .unwrap_err();
+        assert!(matches!(err, Error::Waiting(WaitReason::NoBinding)));
+        assert!(
+            session.bindings().unwrap().is_empty(),
+            "AlreadyBound must not mint"
+        );
+    }
+
+    #[test]
+    fn begin_turn_with_already_bound_reuses_live_binding_zero_mints() {
+        let rt = Runtime::new();
+        let agent = rt.store().create_agent("scribe", "");
+        let session = rt.create_session();
+        rt.keep(session.id(), agent.id, goose()).unwrap();
+        let (turn, fence, bid) = rt
+            .begin_turn(session.id(), HolderId::new("host-a"))
+            .unwrap();
+        rt.end_turn(session.id(), HolderId::new("host-a"), fence, false)
+            .unwrap();
+        let before = session
+            .events()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e.body, EventBody::BindingAttached { .. }))
+            .count();
+        let (turn2, fence2, bid2) = rt
+            .begin_turn_with(session.id(), HolderId::new("host-b"), &mut AlreadyBound)
+            .unwrap();
+        assert_ne!(turn2, turn);
+        assert_eq!(bid2, bid);
+        assert_eq!(
+            session
+                .events()
+                .unwrap()
+                .iter()
+                .filter(|e| matches!(e.body, EventBody::BindingAttached { .. }))
+                .count(),
+            before,
+            "AlreadyBound must not mint"
+        );
+        rt.end_turn(session.id(), HolderId::new("host-b"), fence2, false)
+            .unwrap();
     }
 }

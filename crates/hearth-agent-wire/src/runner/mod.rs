@@ -925,9 +925,11 @@ pub struct TickWire<'a> {
 ///    unknown). The Host must supply a wire for it to fire.
 /// 2. Read-only kernel [`hearth::Runtime::classify`]: `LiveInTurn` /
 ///    `Unknown` → skip, so a timer never tears down a wire under an open turn.
-/// 3. [`wake_through_host_wake`]: `HostWake::Waiting` → skip. A later
-///    Runtime `Error::Waiting` (after `host_wake` may have acted) is
-///    propagated as Err, never reported as a skip.
+/// 3. [`wake_through_host_wake`]: `HostWake::Waiting` → skip. On a live
+///    wire (`ReuseLive`, zero wire action) a Runtime `Error::Waiting` (e.g.
+///    kernel PositivelyDead / NeverBound: no live Binding, never minted
+///    here) → skip; the wire wins. After a remint it is propagated as Err,
+///    never reported as a skip.
 ///
 /// Any other error aborts the tick. `next_due_ms` advances only on Woke.
 pub fn tick_through_host_wake(
@@ -945,6 +947,8 @@ pub fn tick_through_host_wake(
         ) {
             return Ok(None);
         }
+        // Live wire: host_wake reuses it with zero wire action.
+        let wire_live = matches!(w.old_wire, OldWire::LiveIdle | OldWire::LiveInTurn);
         let args = WakeThroughHostArgs {
             runtime,
             session_id,
@@ -952,11 +956,191 @@ pub fn tick_through_host_wake(
             old_wire: w.old_wire,
             remint: w.remint,
         };
-        match wake_through_host_wake(w.old, w.new, w.new_transport, args)? {
-            WakeThroughHost::Waiting(_) => Ok(None),
-            woke => Ok(Some(woke)),
+        match wake_through_host_wake(w.old, w.new, w.new_transport, args) {
+            Ok(WakeThroughHost::Waiting(_)) => Ok(None),
+            // Wire wins: kernel has no live Binding (dead / never bound) but
+            // the wire is live. Nothing was written and the timer never mints,
+            // so this is a skip. After a remint it would be an Err instead.
+            Err(WakeThroughError::Runtime(hearth::Error::Waiting(_))) if wire_live => Ok(None),
+            r => r.map(Some),
         }
     })
+}
+
+/// Result of [`begin_turn_through_host_wake`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum BeginTurnThroughHost {
+    /// Wire live or reminted: Runtime opened the turn without claiming.
+    Begun {
+        host: HostWake,
+        turn_id: u64,
+        fence: u64,
+        binding: hearth::BindingId,
+    },
+    /// No wire evidence, kernel Unknown / turn open, or live wire with no
+    /// Host Binding (wire wins): Runtime was not given a mint.
+    Waiting(hearth::WaitReason),
+}
+
+/// Inputs for [`begin_turn_through_host_wake`].
+pub struct BeginTurnThroughHostArgs<'a> {
+    pub runtime: &'a hearth::Runtime,
+    pub session_id: hearth::SessionId,
+    pub holder: hearth::HolderId,
+    pub old_wire: OldWire,
+    pub remint: HostRemintFullArgs<'a>,
+}
+
+/// Production Host begin_turn: splice [`hearth::Runtime`] through [`host_wake`].
+///
+/// Order (load-bearing):
+/// 1. Read-only [`hearth::Runtime::classify`]: `LiveInTurn` / `Unknown` →
+///    Waiting with zero wire action (never remint under an open turn or when
+///    kernel liveness is unknown).
+/// 2. [`host_wake`] — proven-lost remints once; live → [`HostWake::ReuseLive`];
+///    unknown → [`HostWake::Waiting`].
+/// 3. On Reminted / ReuseLive → [`hearth::Runtime::begin_turn_with`]
+///    [`hearth::AlreadyBound`] (turn_start + lease; **never** `claim_binding`).
+///    On a live wire, Runtime `Waiting` (e.g. kernel PositivelyDead) →
+///    Waiting; the wire wins, zero mints.
+/// 4. On Waiting → return Waiting without touching Runtime turn state.
+///
+/// Never `session/load` or `session/new`. [`ClientCapabilities::HOST`] stays
+/// all false. SoftExpiring / Flush / Stage / Evidence / EffectId parked.
+pub fn begin_turn_through_host_wake(
+    old: &mut AttachRunner,
+    new: &mut AttachRunner,
+    new_transport: &mut RunnerTransport,
+    args: BeginTurnThroughHostArgs<'_>,
+) -> Result<BeginTurnThroughHost, WakeThroughError> {
+    let BeginTurnThroughHostArgs {
+        runtime,
+        session_id,
+        holder,
+        old_wire,
+        remint,
+    } = args;
+    match runtime.classify(session_id)? {
+        hearth::Liveness::LiveInTurn => {
+            return Ok(BeginTurnThroughHost::Waiting(hearth::WaitReason::TurnOpen));
+        }
+        hearth::Liveness::Unknown => {
+            return Ok(BeginTurnThroughHost::Waiting(
+                hearth::WaitReason::LivenessUnknown,
+            ));
+        }
+        _ => {}
+    }
+    let host = host_wake(old_wire, old, new, new_transport, remint)?;
+    match host {
+        HostWake::Waiting(reason) => Ok(BeginTurnThroughHost::Waiting(reason)),
+        host => {
+            let reuse = matches!(host, HostWake::ReuseLive);
+            match runtime.begin_turn_with(session_id, holder, &mut hearth::AlreadyBound) {
+                Ok((turn_id, fence, binding)) => Ok(BeginTurnThroughHost::Begun {
+                    host,
+                    turn_id,
+                    fence,
+                    binding,
+                }),
+                Err(hearth::Error::Waiting(reason)) if reuse => {
+                    Ok(BeginTurnThroughHost::Waiting(reason))
+                }
+                Err(e) => Err(e.into()),
+            }
+        }
+    }
+}
+
+/// Result of [`remint_through_host_wake`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum RemintThroughHost {
+    /// Wire reminted or reused with a live Host Binding.
+    Ready {
+        host: HostWake,
+        binding: hearth::BindingId,
+    },
+    /// Unknown wire / kernel, or live wire with no Host Binding (wire wins).
+    Waiting(hearth::WaitReason),
+}
+
+/// Inputs for [`remint_through_host_wake`].
+pub struct RemintThroughHostArgs<'a> {
+    pub runtime: &'a hearth::Runtime,
+    pub session_id: hearth::SessionId,
+    pub old_wire: OldWire,
+    pub remint: HostRemintFullArgs<'a>,
+}
+
+/// Production Host idle remint: splice through [`host_wake`] (one mint max).
+///
+/// Order (load-bearing):
+/// 1. Read-only [`hearth::Runtime::classify`]: `LiveInTurn` / `Unknown` →
+///    Waiting with zero wire action.
+/// 2. [`host_wake`] — Lost → one mint + `session/resume`; Live → ReuseLive;
+///    Unknown → Waiting. The mint (when any) is only inside
+///    [`host_remint_full_path`]; this path never calls
+///    [`hearth::Runtime::remint`] / `claim_binding`.
+/// 3. On ReuseLive / Reminted → resolve the live Host Binding. If ReuseLive
+///    and the kernel has none (PositivelyDead / NeverBound), return Waiting —
+///    wire wins, zero mints.
+///
+/// Kernel [`hearth::Runtime::remint`] keeps [`hearth::ClaimBinding`] for
+/// wireless tests. Never `session/load` or `session/new`.
+/// [`ClientCapabilities::HOST`] stays all false.
+pub fn remint_through_host_wake(
+    old: &mut AttachRunner,
+    new: &mut AttachRunner,
+    new_transport: &mut RunnerTransport,
+    args: RemintThroughHostArgs<'_>,
+) -> Result<RemintThroughHost, WakeThroughError> {
+    let RemintThroughHostArgs {
+        runtime,
+        session_id,
+        old_wire,
+        remint,
+    } = args;
+    match runtime.classify(session_id)? {
+        hearth::Liveness::LiveInTurn => {
+            return Ok(RemintThroughHost::Waiting(hearth::WaitReason::TurnOpen));
+        }
+        hearth::Liveness::Unknown => {
+            return Ok(RemintThroughHost::Waiting(
+                hearth::WaitReason::LivenessUnknown,
+            ));
+        }
+        _ => {}
+    }
+    let agent = remint.session.host_agent_id();
+    let host = host_wake(old_wire, old, new, new_transport, remint)?;
+    match host {
+        HostWake::Waiting(reason) => Ok(RemintThroughHost::Waiting(reason)),
+        host => {
+            let reuse = matches!(host, HostWake::ReuseLive);
+            match live_binding_for_agent(runtime, session_id, agent) {
+                Ok(binding) => Ok(RemintThroughHost::Ready { host, binding }),
+                Err(hearth::Error::Waiting(reason)) if reuse => {
+                    Ok(RemintThroughHost::Waiting(reason))
+                }
+                Err(e) => Err(e.into()),
+            }
+        }
+    }
+}
+
+fn live_binding_for_agent(
+    runtime: &hearth::Runtime,
+    session_id: hearth::SessionId,
+    agent: hearth::AgentId,
+) -> Result<hearth::BindingId, hearth::Error> {
+    runtime
+        .store()
+        .session(session_id)?
+        .bindings()?
+        .into_iter()
+        .find(|b| b.agent == Some(agent))
+        .map(|b| b.id)
+        .ok_or(hearth::Error::Waiting(hearth::WaitReason::NoBinding))
 }
 
 fn set_nonblocking(out: &ChildStdout) -> Result<(), BusError> {
@@ -3392,5 +3576,477 @@ mod tests {
         )
         .expect("tick");
         assert_eq!(again.len(), 1, "still due at the same now");
+    }
+
+    /// Kernel PositivelyDead (Binding released) but wire LiveIdle: the wire
+    /// wins. host_wake ReuseLive (no remint, no kill, no resume), the timer
+    /// never claim_binding (0 mints), the kernel refuses to record without a
+    /// live Binding, so the tick skips: no event, no wire writes, still due.
+    #[test]
+    fn tick_through_host_wake_kernel_dead_live_wire_reuses() {
+        let (rt, sid, remint, place, now) = timed_runtime_remint();
+        let session = rt.store().session(sid).unwrap();
+        let agent = remint.host_agent_id();
+        let bid = session
+            .bindings()
+            .unwrap()
+            .into_iter()
+            .find(|b| b.agent == Some(agent))
+            .unwrap()
+            .id;
+        session.unbind(bid).unwrap();
+        assert_eq!(rt.classify(sid).unwrap(), hearth::Liveness::PositivelyDead);
+        let log_len = session.events().unwrap().len();
+        let before = binding_attached_count(&rt, sid);
+        // Unread stdout keeps the fake old child running.
+        let mut old = initialized_fake(b"{}\n".to_vec());
+        let old_log = old.stdin_log().unwrap().len();
+        let mut new = new_wire_fake();
+        for _ in 0..2 {
+            let fired = tick_through(
+                &rt,
+                sid,
+                now,
+                &remint,
+                &place,
+                OldWire::LiveIdle,
+                &mut old,
+                &mut new,
+            )
+            .expect("wire wins: skip, not a tick abort");
+            assert!(fired.is_empty());
+        }
+        assert_eq!(binding_attached_count(&rt, sid), before, "0 mints");
+        assert!(session.bindings().unwrap().is_empty(), "no claim_binding");
+        assert_eq!(session.events().unwrap().len(), log_len, "no event");
+        assert_eq!(old.stdin_log().unwrap().len(), old_log);
+        assert!(new.stdin_log().unwrap().is_empty(), "no session/resume");
+        // Fake child may exit on its own (0); killed+reaped would be 9.
+        assert_ne!(old.try_wait().unwrap(), Some(9), "old child not killed");
+    }
+
+    /// Kernel Unknown + Exited wire on a due timer: classify pre-check skips
+    /// before host_wake — 0 mints, no wire writes, still due.
+    #[test]
+    fn tick_through_host_wake_kernel_unknown_exited_skips() {
+        let (rt, sid, remint, place, now) = timed_runtime_remint();
+        let session = rt.store().session(sid).unwrap();
+        let agent = remint.host_agent_id();
+        let bid = session
+            .bindings()
+            .unwrap()
+            .into_iter()
+            .find(|b| b.agent == Some(agent))
+            .unwrap()
+            .id;
+        session.unbind(bid).unwrap();
+        // Attached-on-log after release resets classify to Unknown (vanished).
+        session
+            .append(hearth::EventBody::BindingAttached {
+                binding: hearth::BindingId::new(),
+            })
+            .unwrap();
+        assert_eq!(rt.classify(sid).unwrap(), hearth::Liveness::Unknown);
+        let log_len = session.events().unwrap().len();
+        let before = binding_attached_count(&rt, sid);
+        let mut old = initialized_fake(b"{}\n".to_vec());
+        let old_log = old.stdin_log().unwrap().len();
+        let mut new = new_wire_fake();
+        let fired = tick_through(
+            &rt,
+            sid,
+            now,
+            &remint,
+            &place,
+            OldWire::Exited(1),
+            &mut old,
+            &mut new,
+        )
+        .expect("skip");
+        assert!(fired.is_empty());
+        assert_eq!(binding_attached_count(&rt, sid), before, "0 mints");
+        assert_eq!(old.stdin_log().unwrap().len(), old_log);
+        assert!(new.stdin_log().unwrap().is_empty());
+        assert_eq!(session.events().unwrap().len(), log_len, "no event");
+        assert_ne!(old.try_wait().unwrap(), Some(9), "old child not killed");
+    }
+
+    // ---- begin_turn_through_host_wake / remint_through_host_wake ----
+
+    #[allow(clippy::too_many_arguments)]
+    fn begin_through(
+        rt: &hearth::Runtime,
+        sid: hearth::SessionId,
+        holder: hearth::HolderId,
+        remint: &RemintSession,
+        place: &hearth::Place,
+        old_wire: OldWire,
+        old: &mut AttachRunner,
+        new: &mut AttachRunner,
+    ) -> Result<BeginTurnThroughHost, WakeThroughError> {
+        let mut transport = transport_for_wire(WireKind::JsonlRpc);
+        let (mut old_next, mut new_next) = (10u64, 2u64);
+        begin_turn_through_host_wake(
+            old,
+            new,
+            &mut transport,
+            BeginTurnThroughHostArgs {
+                runtime: rt,
+                session_id: sid,
+                holder,
+                old_wire,
+                remint: HostRemintFullArgs {
+                    session: remint,
+                    place: Some(place),
+                    mcp_servers: &[],
+                    init_rpc_id: &RpcId::Num(1),
+                    old_next_rpc_id: &mut old_next,
+                    new_next_rpc_id: &mut new_next,
+                },
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn remint_through(
+        rt: &hearth::Runtime,
+        sid: hearth::SessionId,
+        remint: &RemintSession,
+        place: &hearth::Place,
+        old_wire: OldWire,
+        old: &mut AttachRunner,
+        new: &mut AttachRunner,
+    ) -> Result<RemintThroughHost, WakeThroughError> {
+        let mut transport = transport_for_wire(WireKind::JsonlRpc);
+        let (mut old_next, mut new_next) = (10u64, 2u64);
+        remint_through_host_wake(
+            old,
+            new,
+            &mut transport,
+            RemintThroughHostArgs {
+                runtime: rt,
+                session_id: sid,
+                old_wire,
+                remint: HostRemintFullArgs {
+                    session: remint,
+                    place: Some(place),
+                    mcp_servers: &[],
+                    init_rpc_id: &RpcId::Num(1),
+                    old_next_rpc_id: &mut old_next,
+                    new_next_rpc_id: &mut new_next,
+                },
+            },
+        )
+    }
+
+    /// Lost wire begin_turn: exactly one mint (host_wake remint) plus
+    /// session/resume; begin_turn_with AlreadyBound opens the lease — never
+    /// claim_binding. HOST caps stay all false; never load/new.
+    #[test]
+    fn begin_turn_through_host_wake_exited_remints_once_and_resumes() {
+        let (rt, sid, _uid, remint, place) = shared_runtime_remint();
+        let before = binding_attached_count(&rt, sid);
+        let mut old = initialized_fake(Vec::new());
+        let mut new = new_wire_fake();
+        let r = begin_through(
+            &rt,
+            sid,
+            hearth::HolderId::new("host-a"),
+            &remint,
+            &place,
+            OldWire::Exited(1),
+            &mut old,
+            &mut new,
+        )
+        .expect("through");
+        let BeginTurnThroughHost::Begun {
+            host,
+            turn_id,
+            fence,
+            binding,
+        } = r
+        else {
+            panic!("expected Begun, got {r:?}");
+        };
+        assert!(matches!(host, HostWake::Reminted(_)));
+        assert!(turn_id >= 1);
+        assert!(fence >= 1);
+        assert_eq!(
+            binding_attached_count(&rt, sid),
+            before + 1,
+            "exactly one mint from host_wake remint"
+        );
+        let raw = std::str::from_utf8(new.stdin_log().unwrap()).unwrap();
+        assert!(raw.contains("session/resume"));
+        assert!(!raw.contains("session/load") && !raw.contains("session/new"));
+        let init: serde_json::Value = serde_json::from_str(raw.lines().next().unwrap()).unwrap();
+        assert_eq!(
+            init["params"]["clientCapabilities"],
+            ClientCapabilities::HOST.to_json()
+        );
+        // Lease is live for this holder/fence.
+        let lease = rt.turn_lease(sid).unwrap().expect("lease");
+        assert_eq!(lease.holder, hearth::HolderId::new("host-a"));
+        assert_eq!(lease.fence, fence);
+        assert_eq!(lease.turn_id, turn_id);
+        assert_eq!(binding, lease_binding(&rt, sid, remint.host_agent_id()));
+    }
+
+    fn lease_binding(
+        rt: &hearth::Runtime,
+        sid: hearth::SessionId,
+        agent: hearth::AgentId,
+    ) -> hearth::BindingId {
+        rt.store()
+            .session(sid)
+            .unwrap()
+            .bindings()
+            .unwrap()
+            .into_iter()
+            .find(|b| b.agent == Some(agent))
+            .unwrap()
+            .id
+    }
+
+    /// LiveIdle begin_turn: ReuseLive, zero mints, no wire writes; lease opens
+    /// on the existing Binding.
+    #[test]
+    fn begin_turn_through_host_wake_live_reuses_zero_mints() {
+        let (rt, sid, _uid, remint, place) = shared_runtime_remint();
+        let before = binding_attached_count(&rt, sid);
+        let bid = lease_binding(&rt, sid, remint.host_agent_id());
+        let mut old = initialized_fake(Vec::new());
+        let old_log = old.stdin_log().unwrap().len();
+        let mut new = new_wire_fake();
+        let r = begin_through(
+            &rt,
+            sid,
+            hearth::HolderId::new("host-a"),
+            &remint,
+            &place,
+            OldWire::LiveIdle,
+            &mut old,
+            &mut new,
+        )
+        .expect("through");
+        let BeginTurnThroughHost::Begun { host, binding, .. } = r else {
+            panic!("expected Begun, got {r:?}");
+        };
+        assert_eq!(host, HostWake::ReuseLive);
+        assert_eq!(binding, bid);
+        assert_eq!(binding_attached_count(&rt, sid), before);
+        assert_eq!(old.stdin_log().unwrap().len(), old_log);
+        assert!(new.stdin_log().unwrap().is_empty());
+    }
+
+    /// Kernel PositivelyDead + live wire begin_turn: ReuseLive path, 0 mints,
+    /// wire wins (Waiting NoBinding; no claim_binding, no resume).
+    #[test]
+    fn begin_turn_through_host_wake_kernel_dead_live_wire_reuses() {
+        let (rt, sid, _uid, remint, place) = shared_runtime_remint();
+        let session = rt.store().session(sid).unwrap();
+        let agent = remint.host_agent_id();
+        let bid = lease_binding(&rt, sid, agent);
+        session.unbind(bid).unwrap();
+        assert_eq!(rt.classify(sid).unwrap(), hearth::Liveness::PositivelyDead);
+        let before = binding_attached_count(&rt, sid);
+        let mut old = initialized_fake(b"{}\n".to_vec());
+        let old_log = old.stdin_log().unwrap().len();
+        let mut new = new_wire_fake();
+        let r = begin_through(
+            &rt,
+            sid,
+            hearth::HolderId::new("host-a"),
+            &remint,
+            &place,
+            OldWire::LiveIdle,
+            &mut old,
+            &mut new,
+        )
+        .expect("wire wins");
+        assert_eq!(
+            r,
+            BeginTurnThroughHost::Waiting(hearth::WaitReason::NoBinding)
+        );
+        assert_eq!(binding_attached_count(&rt, sid), before, "0 mints");
+        assert!(session.bindings().unwrap().is_empty());
+        assert_eq!(old.stdin_log().unwrap().len(), old_log);
+        assert!(new.stdin_log().unwrap().is_empty());
+        assert_ne!(old.try_wait().unwrap(), Some(9), "old child not killed");
+        assert!(rt.turn_lease(sid).unwrap().is_none(), "no lease");
+    }
+
+    /// Kernel Unknown + Exited begin_turn: classify pre-check → Waiting,
+    /// 0 mints, no wire writes.
+    #[test]
+    fn begin_turn_through_host_wake_kernel_unknown_exited_waits() {
+        let (rt, sid, _uid, remint, place) = shared_runtime_remint();
+        let session = rt.store().session(sid).unwrap();
+        let agent = remint.host_agent_id();
+        let bid = lease_binding(&rt, sid, agent);
+        session.unbind(bid).unwrap();
+        session
+            .append(hearth::EventBody::BindingAttached {
+                binding: hearth::BindingId::new(),
+            })
+            .unwrap();
+        assert_eq!(rt.classify(sid).unwrap(), hearth::Liveness::Unknown);
+        let before = binding_attached_count(&rt, sid);
+        let mut old = initialized_fake(b"{}\n".to_vec());
+        let old_log = old.stdin_log().unwrap().len();
+        let mut new = new_wire_fake();
+        let r = begin_through(
+            &rt,
+            sid,
+            hearth::HolderId::new("host-a"),
+            &remint,
+            &place,
+            OldWire::Exited(1),
+            &mut old,
+            &mut new,
+        )
+        .expect("wait");
+        assert_eq!(
+            r,
+            BeginTurnThroughHost::Waiting(hearth::WaitReason::LivenessUnknown)
+        );
+        assert_eq!(binding_attached_count(&rt, sid), before, "0 mints");
+        assert_eq!(old.stdin_log().unwrap().len(), old_log);
+        assert!(new.stdin_log().unwrap().is_empty());
+        assert_ne!(old.try_wait().unwrap(), Some(9), "old child not killed");
+    }
+
+    /// Lost wire remint_through: exactly one mint + session/resume; never
+    /// claim_binding / load / new; HOST all false.
+    #[test]
+    fn remint_through_host_wake_exited_remints_once_and_resumes() {
+        let (rt, sid, _uid, remint, place) = shared_runtime_remint();
+        let before = binding_attached_count(&rt, sid);
+        let mut old = initialized_fake(Vec::new());
+        let mut new = new_wire_fake();
+        let r = remint_through(
+            &rt,
+            sid,
+            &remint,
+            &place,
+            OldWire::Exited(1),
+            &mut old,
+            &mut new,
+        )
+        .expect("through");
+        let RemintThroughHost::Ready { host, binding } = r else {
+            panic!("expected Ready, got {r:?}");
+        };
+        assert!(matches!(host, HostWake::Reminted(_)));
+        assert_eq!(binding_attached_count(&rt, sid), before + 1);
+        assert_eq!(binding, lease_binding(&rt, sid, remint.host_agent_id()));
+        let raw = std::str::from_utf8(new.stdin_log().unwrap()).unwrap();
+        assert!(raw.contains("session/resume"));
+        assert!(!raw.contains("session/load") && !raw.contains("session/new"));
+        let init: serde_json::Value = serde_json::from_str(raw.lines().next().unwrap()).unwrap();
+        assert_eq!(
+            init["params"]["clientCapabilities"],
+            ClientCapabilities::HOST.to_json()
+        );
+    }
+
+    /// LiveIdle remint_through: ReuseLive, zero mints, existing Binding.
+    #[test]
+    fn remint_through_host_wake_live_reuses_zero_mints() {
+        let (rt, sid, _uid, remint, place) = shared_runtime_remint();
+        let before = binding_attached_count(&rt, sid);
+        let bid = lease_binding(&rt, sid, remint.host_agent_id());
+        let mut old = initialized_fake(Vec::new());
+        let old_log = old.stdin_log().unwrap().len();
+        let mut new = new_wire_fake();
+        let r = remint_through(
+            &rt,
+            sid,
+            &remint,
+            &place,
+            OldWire::LiveIdle,
+            &mut old,
+            &mut new,
+        )
+        .expect("through");
+        assert_eq!(
+            r,
+            RemintThroughHost::Ready {
+                host: HostWake::ReuseLive,
+                binding: bid,
+            }
+        );
+        assert_eq!(binding_attached_count(&rt, sid), before);
+        assert_eq!(old.stdin_log().unwrap().len(), old_log);
+        assert!(new.stdin_log().unwrap().is_empty());
+    }
+
+    /// Kernel PositivelyDead + live wire remint: ReuseLive path, 0 mints,
+    /// Waiting(NoBinding); wire wins.
+    #[test]
+    fn remint_through_host_wake_kernel_dead_live_wire_reuses() {
+        let (rt, sid, _uid, remint, place) = shared_runtime_remint();
+        let session = rt.store().session(sid).unwrap();
+        let agent = remint.host_agent_id();
+        let bid = lease_binding(&rt, sid, agent);
+        session.unbind(bid).unwrap();
+        assert_eq!(rt.classify(sid).unwrap(), hearth::Liveness::PositivelyDead);
+        let before = binding_attached_count(&rt, sid);
+        let mut old = initialized_fake(b"{}\n".to_vec());
+        let old_log = old.stdin_log().unwrap().len();
+        let mut new = new_wire_fake();
+        let r = remint_through(
+            &rt,
+            sid,
+            &remint,
+            &place,
+            OldWire::LiveIdle,
+            &mut old,
+            &mut new,
+        )
+        .expect("wire wins");
+        assert_eq!(r, RemintThroughHost::Waiting(hearth::WaitReason::NoBinding));
+        assert_eq!(binding_attached_count(&rt, sid), before, "0 mints");
+        assert_eq!(old.stdin_log().unwrap().len(), old_log);
+        assert!(new.stdin_log().unwrap().is_empty());
+        assert_ne!(old.try_wait().unwrap(), Some(9));
+    }
+
+    /// Kernel Unknown + Exited remint: classify pre-check → Waiting, 0 mints.
+    #[test]
+    fn remint_through_host_wake_kernel_unknown_exited_waits() {
+        let (rt, sid, _uid, remint, place) = shared_runtime_remint();
+        let session = rt.store().session(sid).unwrap();
+        let agent = remint.host_agent_id();
+        let bid = lease_binding(&rt, sid, agent);
+        session.unbind(bid).unwrap();
+        session
+            .append(hearth::EventBody::BindingAttached {
+                binding: hearth::BindingId::new(),
+            })
+            .unwrap();
+        assert_eq!(rt.classify(sid).unwrap(), hearth::Liveness::Unknown);
+        let before = binding_attached_count(&rt, sid);
+        let mut old = initialized_fake(b"{}\n".to_vec());
+        let old_log = old.stdin_log().unwrap().len();
+        let mut new = new_wire_fake();
+        let r = remint_through(
+            &rt,
+            sid,
+            &remint,
+            &place,
+            OldWire::Exited(1),
+            &mut old,
+            &mut new,
+        )
+        .expect("wait");
+        assert_eq!(
+            r,
+            RemintThroughHost::Waiting(hearth::WaitReason::LivenessUnknown)
+        );
+        assert_eq!(binding_attached_count(&rt, sid), before, "0 mints");
+        assert_eq!(old.stdin_log().unwrap().len(), old_log);
+        assert!(new.stdin_log().unwrap().is_empty());
+        assert_ne!(old.try_wait().unwrap(), Some(9));
     }
 }
