@@ -15,6 +15,8 @@ Host-adjacent spawn / pump / remint. **Not a kernel noun.**
 | `host_wake` | Host wake driver: proven-lost `OldWire` → `host_remint_full_path`; live → reuse; unknown → `Waiting(LivenessUnknown)` |
 | `wake_through_host_wake` | Production splice: `host_wake` then `Runtime::wake_with(AlreadyBound)` — one mint max, never `claim_binding` on that path |
 | `tick_through_host_wake` | Production timer: `Runtime::tick_with` runs `wake_through_host_wake` per due Session; Waiting skips (next_due unchanged), never `claim_binding` |
+| `begin_turn_through_host_wake` | Production begin_turn: classify pre-check then `host_wake` then `Runtime::begin_turn_with(AlreadyBound)` — one mint max |
+| `remint_through_host_wake` | Production idle remint: classify pre-check then `host_wake` (mint only inside `host_remint_full_path`); never `Runtime::remint` / `claim_binding` |
 | `host_remint_full_path` | Host production entry: `remint_and_attach` → `host_remint_two_step` (typed `BindingConflict` on live/steal) |
 
 ## Remint (fail-closed)
