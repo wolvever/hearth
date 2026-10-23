@@ -15,8 +15,9 @@
 //! `wake_through_host_wake` / `tick_through_host_wake` /
 //! `begin_turn_through_host_wake` / `remint_through_host_wake` instead —
 //! `host_wake` / `host_remint_full_path` own the one Binding mint, then
-//! [`Runtime::wake_with`] / [`Runtime::begin_turn_with`] / [`Runtime::remint_with`]
-//! [`AlreadyBound`] record without a second claim. Kernel unit tests may keep
+//! [`Runtime::wake_with`] / [`Runtime::begin_turn_with`] [`AlreadyBound`]
+//! record without a second claim; `remint_through_host_wake` only reads the
+//! fresh Binding via [`Runtime::binding_for`]. Kernel unit tests may keep
 //! using the default [`ClaimBinding`] entry points.
 //!
 //! Intra-turn durable steps: [`Runtime::begin_turn`] / [`Runtime::end_turn`] hold a
@@ -281,11 +282,18 @@ impl Runtime {
         classify_session(&self.store.session(session)?, agent)
     }
 
+    /// `agent`'s live Binding on `session`, or `Waiting(NoBinding)`. Read-only:
+    /// never mints. Wire `remint_through_host_wake` uses this after `host_wake`.
+    pub fn binding_for(&self, session: SessionId, agent: AgentId) -> Result<BindingId> {
+        binding_for_agent(&self.store.session(session)?, agent)
+    }
+
     /// Idle remint. Refused if a Binding is live or liveness is unknown.
     ///
     /// Kernel default ([`ClaimBinding`]) for tests without a wire. Production
-    /// wire Host: route through `remint_through_host_wake`
-    /// ([`Self::remint_with`] [`AlreadyBound`] after `host_wake`).
+    /// wire Host: route through `remint_through_host_wake`, which mints in
+    /// `host_wake` and reads the Binding via [`Self::binding_for`] — it does
+    /// not call this or [`Self::remint_with`].
     pub fn remint(&self, session: SessionId) -> Result<crate::BindingId> {
         self.remint_with(session, &mut ClaimBinding)
     }
@@ -293,8 +301,10 @@ impl Runtime {
     /// Idle remint with a pluggable Binding ensure step.
     ///
     /// Same classify as [`Self::remint`], but `NeverBound` / `PositivelyDead`
-    /// call `claim.claim` instead of the hard-wired kernel remint. Pass
-    /// [`AlreadyBound`] after `host_wake` so this path never mints.
+    /// call `claim.claim` instead of the hard-wired kernel remint.
+    /// [`AlreadyBound`] never mints, but after `host_wake` the session is
+    /// already `LiveIdle`, which this refuses as `AlreadyLive` — so the wire
+    /// path does not use it (see [`Self::remint`]).
     pub fn remint_with<C: WakeClaim>(
         &self,
         session: SessionId,
