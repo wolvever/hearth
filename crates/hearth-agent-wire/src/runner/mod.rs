@@ -1117,7 +1117,7 @@ pub fn remint_through_host_wake(
         HostWake::Waiting(reason) => Ok(RemintThroughHost::Waiting(reason)),
         host => {
             let reuse = matches!(host, HostWake::ReuseLive);
-            match live_binding_for_agent(runtime, session_id, agent) {
+            match runtime.binding_for(session_id, agent) {
                 Ok(binding) => Ok(RemintThroughHost::Ready { host, binding }),
                 Err(hearth::Error::Waiting(reason)) if reuse => {
                     Ok(RemintThroughHost::Waiting(reason))
@@ -1126,21 +1126,6 @@ pub fn remint_through_host_wake(
             }
         }
     }
-}
-
-fn live_binding_for_agent(
-    runtime: &hearth::Runtime,
-    session_id: hearth::SessionId,
-    agent: hearth::AgentId,
-) -> Result<hearth::BindingId, hearth::Error> {
-    runtime
-        .store()
-        .session(session_id)?
-        .bindings()?
-        .into_iter()
-        .find(|b| b.agent == Some(agent))
-        .map(|b| b.id)
-        .ok_or(hearth::Error::Waiting(hearth::WaitReason::NoBinding))
 }
 
 fn set_nonblocking(out: &ChildStdout) -> Result<(), BusError> {
