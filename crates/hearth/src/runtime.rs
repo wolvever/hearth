@@ -21,7 +21,10 @@
 //! using the default [`ClaimBinding`] entry points.
 //!
 //! Intra-turn durable steps: [`Runtime::begin_turn`] / [`Runtime::end_turn`] hold a
-//! [`SessionTurnLease`] (holder + fence). [`Runtime::durable_step`] memoizes via
+//! [`SessionTurnLease`] (holder + fence). The fence is stored on the Session
+//! ([`crate::EventBody::TurnFenced`], [`Session::turn_fence`]), not in the kept
+//! map, so re-keep raises it above every earlier one and an old-fence write is
+//! [`Error::TurnLeaseLost`]. [`Runtime::durable_step`] memoizes via
 //! [`crate::EventBody::StepCompleted`]. [`Runtime::resume_interrupted_turn`]
 //! reclaims after host crash, finalizes unmatched tool calls as
 //! [`crate::EventBody::ToolCallInterrupted`] (Indeterminate) via the same
@@ -161,12 +164,12 @@ struct Kept {
     timer_every_ms: Option<u64>,
     next_due_ms: Option<u64>,
     /// Live or interrupted session-turn lease. `holder: None` after a crash.
+    /// The fence is not here: it is stored on the Session ([`Session::turn_fence`]).
     lease: Option<TurnLease>,
 }
 
 struct TurnLease {
     holder: Option<HolderId>,
-    fence: u64,
     turn_id: u64,
 }
 
@@ -442,20 +445,27 @@ impl Runtime {
     pub fn turn_lease(&self, session: SessionId) -> Result<Option<SessionTurnLease>> {
         let g = self.lock_kept()?;
         let kept = g.get(&session).ok_or(Error::NotKept(session))?;
-        Ok(kept.lease.as_ref().and_then(|l| {
-            l.holder.as_ref().map(|h| SessionTurnLease {
-                holder: h.clone(),
-                fence: l.fence,
-                turn_id: l.turn_id,
-            })
+        let Some((holder, turn_id)) = kept
+            .lease
+            .as_ref()
+            .and_then(|l| l.holder.clone().map(|h| (h, l.turn_id)))
+        else {
+            return Ok(None);
+        };
+        let fence = self.store.session(session)?.turn_fence()?;
+        Ok(Some(SessionTurnLease {
+            holder,
+            fence,
+            turn_id,
         }))
     }
 
     /// Open a turn under a live [`SessionTurnLease`].
     ///
     /// Remints Binding only when `NeverBound` / `PositivelyDead` (same as wake).
-    /// If `wake` already opened a turn and no lease exists, attaches a lease to
-    /// that turn. An interrupted turn (lease holder dropped) must use
+    /// If `wake` already opened a turn (or a re-keep finds one on the EventLog)
+    /// and no lease exists, attaches a lease to that turn under a raised
+    /// stored fence. An interrupted turn (lease holder dropped) must use
     /// [`Self::resume_interrupted_turn`].
     ///
     /// Kernel default ([`ClaimBinding`]) for tests without a wire. Production
@@ -500,7 +510,7 @@ impl Runtime {
         if let Some((turn_id, _)) = open_turn_of(&sess.events()?) {
             sess.restore_open_turn()?;
             let binding = binding_for_agent(&sess, agent)?;
-            let fence = self.install_lease(session, holder, turn_id)?;
+            let fence = self.install_lease(&sess, holder, turn_id)?;
             return Ok((turn_id, fence, binding));
         }
 
@@ -516,7 +526,7 @@ impl Runtime {
         let start = sess.turn_start(agent)?;
         let turn_id = start.turn.ok_or(Error::TurnNotOpen)?;
         let binding = binding_for_agent(&sess, agent)?;
-        let fence = self.install_lease(session, holder, turn_id)?;
+        let fence = self.install_lease(&sess, holder, turn_id)?;
         Ok((turn_id, fence, binding))
     }
 
@@ -628,17 +638,18 @@ impl Runtime {
         // Completed-without-output, never Cancelled.
         sess.finalize_unmatched_tool_calls()?;
         let binding = binding_for_agent(&sess, agent)?;
-        let fence = self.install_lease(session, new_holder, turn_id)?;
+        let fence = self.install_lease(&sess, new_holder, turn_id)?;
         Ok((turn_id, fence, binding))
     }
 
-    fn install_lease(&self, session: SessionId, holder: HolderId, turn_id: u64) -> Result<u64> {
+    /// Every new lease (fresh turn, adopted open turn, crash resume) raises
+    /// the stored fence, so no two holders ever share one.
+    fn install_lease(&self, sess: &Session, holder: HolderId, turn_id: u64) -> Result<u64> {
         let mut g = self.lock_kept()?;
-        let kept = g.get_mut(&session).ok_or(Error::NotKept(session))?;
-        let fence = kept.lease.as_ref().map(|l| l.fence).unwrap_or(0) + 1;
+        let kept = g.get_mut(&sess.id()).ok_or(Error::NotKept(sess.id()))?;
+        let fence = sess.raise_turn_fence(turn_id)?;
         kept.lease = Some(TurnLease {
             holder: Some(holder),
-            fence,
             turn_id,
         });
         Ok(fence)
@@ -657,7 +668,7 @@ impl Runtime {
             Some(h) if h == holder => {}
             Some(_) | None => return Err(Error::SessionNotOwned),
         }
-        if lease.fence != fence {
+        if self.store.session(session)?.turn_fence()? != fence {
             return Err(Error::TurnLeaseLost);
         }
         Ok(())
@@ -1721,5 +1732,49 @@ mod tests {
         );
         rt.end_turn(session.id(), HolderId::new("host-b"), fence2, false)
             .unwrap();
+    }
+
+    /// Dong's probe (2026-10-24): host restart modeled as release + keep.
+    /// The fence is stored on the Session, so adopting the open turn after
+    /// re-keep raises it and a zombie write with the old fence is refused.
+    #[test]
+    fn rekeep_adopt_raises_stored_fence_old_fence_is_turn_lease_lost() {
+        let rt = Runtime::new();
+        let agent = rt.store().create_agent("scribe", "");
+        let session = rt.create_session();
+        rt.keep(session.id(), agent.id, goose()).unwrap();
+        let h = HolderId::new("host");
+        let (turn, fence, _) = rt.begin_turn(session.id(), h.clone()).unwrap();
+        // Old process dies without TurnEnd; new process re-keeps.
+        rt.release(session.id()).unwrap();
+        rt.keep(session.id(), agent.id, goose()).unwrap();
+        // Same stable HolderId adopts the open turn from the EventLog.
+        let (turn2, fence2, _) = rt.begin_turn(session.id(), h.clone()).unwrap();
+        assert_eq!(turn2, turn);
+        assert!(
+            fence2 > fence,
+            "re-keep must raise fence: {fence} -> {fence2}"
+        );
+        assert_eq!(session.turn_fence().unwrap(), fence2);
+        // Zombie write / end with the OLD fence.
+        let zombie = rt.durable_step(session.id(), h.clone(), fence, turn, "zombie", || {
+            panic!("zombie step must not run")
+        });
+        assert!(matches!(zombie, Err(Error::TurnLeaseLost)));
+        assert!(matches!(
+            rt.end_turn(session.id(), h.clone(), fence, false),
+            Err(Error::TurnLeaseLost)
+        ));
+        // Second begin_turn while the stored turn is live: reject, no enqueue.
+        assert!(matches!(
+            rt.begin_turn(session.id(), HolderId::new("other")),
+            Err(Error::LiveTurnOpen)
+        ));
+        // New fence still works.
+        rt.durable_step(session.id(), h.clone(), fence2, turn2, "fresh", || {
+            Ok("ok".into())
+        })
+        .unwrap();
+        rt.end_turn(session.id(), h, fence2, false).unwrap();
     }
 }
