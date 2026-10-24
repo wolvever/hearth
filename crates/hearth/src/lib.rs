@@ -223,6 +223,13 @@ pub enum EventBody {
         step_id: String,
         result: String,
     },
+    /// Turn lease fence raised for `turn_id`. The Session's fence is the max
+    /// on its EventLog, so it only goes up and survives re-keep / a new
+    /// Runtime. Not model-visible.
+    TurnFenced {
+        turn_id: u64,
+        fence: u64,
+    },
     BindingAttached {
         binding: BindingId,
     },
@@ -366,6 +373,18 @@ pub fn open_turn_of(events: &[Event]) -> Option<(u64, AgentId)> {
         }
     }
     open
+}
+
+/// Highest [`EventBody::TurnFenced`] fence on the EventLog (0 if none).
+pub fn turn_fence_of(events: &[Event]) -> u64 {
+    events
+        .iter()
+        .filter_map(|e| match e.body {
+            EventBody::TurnFenced { fence, .. } => Some(fence),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 /// Memoized payload of `StepCompleted` for `(turn_id, step_id)`, if present.
@@ -1050,6 +1069,22 @@ impl Session {
     /// Last `TurnStart` without a later `TurnEnd` on this session's EventLog.
     pub fn open_turn(&self) -> Result<Option<u64>> {
         self.read(|data| open_turn_of(&data.events).map(|(t, _)| t))
+    }
+
+    /// Current turn lease fence, restored from the EventLog
+    /// ([`turn_fence_of`]). 0 before any lease.
+    pub fn turn_fence(&self) -> Result<u64> {
+        self.read(|data| turn_fence_of(&data.events))
+    }
+
+    /// Raise the turn lease fence above every earlier one and record it as
+    /// [`EventBody::TurnFenced`] for `turn_id`. Returns the new fence.
+    pub fn raise_turn_fence(&self, turn_id: u64) -> Result<u64> {
+        self.write(|data| {
+            let fence = turn_fence_of(&data.events) + 1;
+            data.push(EventBody::TurnFenced { turn_id, fence });
+            Ok(fence)
+        })
     }
 
     /// Set [`Self::current_turn`] from the EventLog (`TurnStart` without `TurnEnd`).
