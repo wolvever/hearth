@@ -1590,6 +1590,97 @@ mod tests {
         assert!(false_remint.is_lost());
     }
 
+    // ---- CLI exit vs still-running (Real-CLI-exit) ----
+
+    /// Real child exits: try_wait Some(code) → OldWire::Exited(code).
+    #[test]
+    fn real_child_exit_surfaces_as_old_wire_exited() {
+        let spec = LaunchSpec {
+            program: "sh".into(),
+            args: vec!["-c".into(), "exit 42".into()],
+            cwd: None,
+            env: Vec::new(),
+            wire: WireKind::JsonlRpc,
+        };
+        let mut runner = AttachRunner::spawn(spec).expect("spawn");
+        let mut old_wire = OldWire::Unknown;
+        for _ in 0..50 {
+            old_wire = runner.probe_exit();
+            if matches!(old_wire, OldWire::Exited(_)) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            old_wire,
+            OldWire::Exited(42),
+            "observed exit must be Exited(code)"
+        );
+        assert!(old_wire.is_lost());
+        assert_eq!(runner.try_wait().unwrap(), Some(42));
+    }
+
+    /// Live child still running: try_wait None → Unknown (never remint).
+    #[test]
+    fn real_child_still_running_probe_exit_stays_unknown() {
+        let spec = LaunchSpec {
+            program: "sleep".into(),
+            args: vec!["30".into()],
+            cwd: None,
+            env: Vec::new(),
+            wire: WireKind::JsonlRpc,
+        };
+        let mut runner = AttachRunner::spawn(spec).expect("spawn sleep");
+        assert_eq!(runner.try_wait().unwrap(), None, "child still alive");
+        assert_eq!(
+            runner.probe_exit(),
+            OldWire::Unknown,
+            "try_wait None must stay Unknown"
+        );
+        assert!(!OldWire::Unknown.is_lost());
+        let _ = runner.kill();
+    }
+
+    /// Correct mapping + naives as contrasts (claude-agent-acp #338 class).
+    #[test]
+    fn try_wait_mapping_contrasts_naive_ignore_exit_and_timeout_as_exited() {
+        // Correct: Some(code) → Exited (remint); None → Unknown (wait).
+        assert_eq!(old_wire_from_try_wait(Ok(Some(143))), OldWire::Exited(143));
+        assert_eq!(old_wire_from_try_wait(Ok(None)), OldWire::Unknown);
+        assert!(old_wire_from_try_wait(Ok(Some(1))).is_lost());
+        assert!(!old_wire_from_try_wait(Ok(None)).is_lost());
+
+        // NaiveIgnoreExit: observed exit collapsed to Unknown → StuckDeadSession
+        // (claude-agent-acp #338: CLI death leaves session on a dead wire).
+        fn naive_ignore_exit(r: Result<Option<i32>, BusError>) -> OldWire {
+            match r {
+                Ok(Some(_)) | Ok(None) | Err(_) => OldWire::Unknown,
+            }
+        }
+        let stuck = naive_ignore_exit(Ok(Some(143)));
+        assert_eq!(
+            stuck,
+            OldWire::Unknown,
+            "NaiveIgnoreExit → StuckDeadSession"
+        );
+        assert!(!stuck.is_lost());
+
+        // NaiveTimeoutAsExited: try_wait None treated as exit → FalseRemint.
+        fn naive_timeout_as_exited(r: Result<Option<i32>, BusError>) -> OldWire {
+            match r {
+                Ok(Some(code)) => OldWire::Exited(code),
+                Ok(None) | Err(_) => OldWire::Exited(0),
+            }
+        }
+        let false_remint = naive_timeout_as_exited(Ok(None));
+        assert_eq!(
+            false_remint,
+            OldWire::Exited(0),
+            "NaiveTimeoutAsExited → FalseRemint"
+        );
+        assert!(false_remint.is_lost());
+    }
+
     /// Pep Accept (1): live AttachRunner actually SENDS initialize with
     /// ClientCapabilities::HOST (all false) and waits for the reply before
     /// any agent-bound RPC is written.
@@ -3025,6 +3116,64 @@ mod tests {
             run_wake(&session, old_wire, &mut old, &mut new).expect("wake")
         else {
             panic!("expected Reminted on real StdoutEof");
+        };
+        assert_eq!(mints(&session), before + 1);
+        assert!(!session.turn_in_flight());
+        let frames: Vec<serde_json::Value> = std::str::from_utf8(new.stdin_log().unwrap())
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(frames[0]["method"], "initialize");
+        assert_eq!(
+            frames[0]["params"]["clientCapabilities"],
+            ClientCapabilities::HOST.to_json()
+        );
+        assert_eq!(frames[1]["method"], "session/resume");
+        assert_eq!(frames[1]["params"]["sessionId"], sid);
+        let w = &full.outcome.wire_actions;
+        assert!(
+            w.contains(&WireAction::SessionCancel) || w.contains(&WireAction::SessionClose),
+            "cancel-before-reattach: {w:?}"
+        );
+        // Real runner has no stdin_log; only check new wire.
+        let raw = std::str::from_utf8(new.stdin_log().unwrap()).unwrap();
+        assert!(!raw.contains("session/load") && !raw.contains("session/new"));
+    }
+
+    /// host_wake on Real-produced Exited: one mint + session/resume.
+    /// Parallel to host_wake_on_probed_real_stdout_eof_remints_and_resumes;
+    /// closes the Real-CLI-exit gap (no synthetic Fake Exited injection).
+    #[test]
+    fn host_wake_on_probed_real_cli_exit_remints_and_resumes() {
+        let spec = LaunchSpec {
+            program: "sh".into(),
+            args: vec!["-c".into(), "exit 7".into()],
+            cwd: None,
+            env: Vec::new(),
+            wire: WireKind::JsonlRpc,
+        };
+        let mut old = AttachRunner::spawn(spec).expect("spawn");
+        let mut old_wire = OldWire::Unknown;
+        for _ in 0..50 {
+            old_wire = old.probe_exit();
+            if matches!(old_wire, OldWire::Exited(_)) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(old_wire, OldWire::Exited(7));
+
+        let session = wake_session();
+        session.begin_turn("mid");
+        let sid = session.agent_session_id();
+        let before = mints(&session);
+        let mut new = new_wire_fake();
+
+        let HostWake::Reminted(full) =
+            run_wake(&session, old_wire, &mut old, &mut new).expect("wake")
+        else {
+            panic!("expected Reminted on real CLI exit");
         };
         assert_eq!(mints(&session), before + 1);
         assert!(!session.turn_in_flight());
