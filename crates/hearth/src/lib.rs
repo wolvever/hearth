@@ -1106,7 +1106,8 @@ impl Session {
     ///
     /// Idempotent: already-terminal ids are skipped (at most one interrupt
     /// per id). Keyed by `tool_call_id`, never tool name. Shared by wire
-    /// remint and [`crate::Runtime::resume_interrupted_turn`] — never
+    /// remint, [`crate::Runtime::resume_interrupted_turn`], and the open-turn
+    /// re-keep adopt path in [`crate::Runtime::begin_turn_with`] — never
     /// Completed-without-output, never Cancelled.
     pub fn finalize_unmatched_tool_calls(&self) -> Result<usize> {
         self.write(|data| {
@@ -1506,6 +1507,37 @@ mod tests {
         assert_eq!(interrupts[0].0, "t1");
         assert_eq!(interrupts[0].1, ToolInterruptStatus::Indeterminate);
         assert!(unmatched_tool_calls(&session.events().unwrap()).is_empty());
+    }
+
+    /// Pep #44 Overflow-test: forge TurnFenced { fence: u64::MAX } then
+    /// raise_turn_fence → TurnLeaseLost; stored fence unchanged.
+    #[test]
+    fn raise_turn_fence_at_u64_max_is_turn_lease_lost() {
+        let store = InMemory::new();
+        let session = store.create_session();
+        session
+            .append(EventBody::TurnFenced {
+                turn_id: 1,
+                fence: u64::MAX,
+            })
+            .unwrap();
+        assert_eq!(session.turn_fence().unwrap(), u64::MAX);
+        assert!(matches!(
+            session.raise_turn_fence(1),
+            Err(Error::TurnLeaseLost)
+        ));
+        assert_eq!(
+            session.turn_fence().unwrap(),
+            u64::MAX,
+            "overflow must leave fence unchanged"
+        );
+        let fenced = session
+            .events()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e.body, EventBody::TurnFenced { .. }))
+            .count();
+        assert_eq!(fenced, 1, "no TurnFenced appended on overflow");
     }
 
     #[test]
