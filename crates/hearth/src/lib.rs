@@ -224,8 +224,10 @@ pub enum EventBody {
         result: String,
     },
     /// Turn lease fence raised for `turn_id`. The Session's fence is the max
-    /// on its EventLog, so it only goes up and survives re-keep / a new
-    /// Runtime. Not model-visible.
+    /// on its EventLog, so it only goes up and survives re-keep against the
+    /// same store/session. [`crate::Runtime::new`] always builds a fresh
+    /// [`InMemory`], so a brand-new Runtime does not preserve it; a shared-
+    /// store ctor would be needed when a durable store lands. Not model-visible.
     TurnFenced {
         turn_id: u64,
         fence: u64,
@@ -1079,9 +1081,12 @@ impl Session {
 
     /// Raise the turn lease fence above every earlier one and record it as
     /// [`EventBody::TurnFenced`] for `turn_id`. Returns the new fence.
-    pub fn raise_turn_fence(&self, turn_id: u64) -> Result<u64> {
+    /// Fail-closed on `u64` overflow ([`Error::TurnLeaseLost`]).
+    pub(crate) fn raise_turn_fence(&self, turn_id: u64) -> Result<u64> {
         self.write(|data| {
-            let fence = turn_fence_of(&data.events) + 1;
+            let fence = turn_fence_of(&data.events)
+                .checked_add(1)
+                .ok_or(Error::TurnLeaseLost)?;
             data.push(EventBody::TurnFenced { turn_id, fence });
             Ok(fence)
         })

@@ -465,8 +465,9 @@ impl Runtime {
     /// Remints Binding only when `NeverBound` / `PositivelyDead` (same as wake).
     /// If `wake` already opened a turn (or a re-keep finds one on the EventLog)
     /// and no lease exists, attaches a lease to that turn under a raised
-    /// stored fence. An interrupted turn (lease holder dropped) must use
-    /// [`Self::resume_interrupted_turn`].
+    /// stored fence. After re-keep **any** [`HolderId`] may adopt (fenced
+    /// takeover); [`Error::LiveTurnOpen`] is per-Runtime. An interrupted turn
+    /// (lease holder dropped) must use [`Self::resume_interrupted_turn`].
     ///
     /// Kernel default ([`ClaimBinding`]) for tests without a wire. Production
     /// wire Host: route through `begin_turn_through_host_wake`
@@ -484,7 +485,8 @@ impl Runtime {
     /// Same lease / `turn_start` as [`Self::begin_turn`], but
     /// `NeverBound` / `PositivelyDead` call `claim.claim` instead of the
     /// hard-wired kernel remint. Pass [`AlreadyBound`] after `host_wake` so
-    /// this path never mints.
+    /// this path never mints. Re-keep adopt: any [`HolderId`] may take the
+    /// open turn (fenced takeover); [`Error::LiveTurnOpen`] is per-Runtime.
     pub fn begin_turn_with<C: WakeClaim>(
         &self,
         session: SessionId,
