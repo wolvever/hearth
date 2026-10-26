@@ -26,9 +26,10 @@
 //! map, so re-keep raises it above every earlier one and an old-fence write is
 //! [`Error::TurnLeaseLost`]. [`Runtime::durable_step`] memoizes via
 //! [`crate::EventBody::StepCompleted`]. [`Runtime::resume_interrupted_turn`]
-//! reclaims after host crash, finalizes unmatched tool calls as
+//! and the open-turn re-keep adopt path in [`Runtime::begin_turn_with`] both
+//! finalize unmatched tool calls as
 //! [`crate::EventBody::ToolCallInterrupted`] (Indeterminate) via the same
-//! helper as wire remint, and does **not** remint Binding.
+//! helper as wire remint; resume does **not** remint Binding.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -464,10 +465,15 @@ impl Runtime {
     ///
     /// Remints Binding only when `NeverBound` / `PositivelyDead` (same as wake).
     /// If `wake` already opened a turn (or a re-keep finds one on the EventLog)
-    /// and no lease exists, attaches a lease to that turn under a raised
-    /// stored fence. After re-keep **any** [`HolderId`] may adopt (fenced
-    /// takeover); [`Error::LiveTurnOpen`] is per-Runtime. An interrupted turn
-    /// (lease holder dropped) must use [`Self::resume_interrupted_turn`].
+    /// and no lease exists, restores that turn, finalizes unmatched tool
+    /// calls as [`crate::EventBody::ToolCallInterrupted`]
+    /// ([`crate::ToolInterruptStatus::Indeterminate`]) via
+    /// [`Session::finalize_unmatched_tool_calls`] (same helper as
+    /// [`Self::resume_interrupted_turn`] / wire remint), then attaches a
+    /// lease under a raised stored fence. After re-keep **any** [`HolderId`]
+    /// may adopt (fenced takeover); [`Error::LiveTurnOpen`] is per-Runtime.
+    /// An interrupted turn (lease holder dropped while still kept) must use
+    /// [`Self::resume_interrupted_turn`].
     ///
     /// Kernel default ([`ClaimBinding`]) for tests without a wire. Production
     /// wire Host: route through `begin_turn_through_host_wake`
@@ -486,7 +492,8 @@ impl Runtime {
     /// `NeverBound` / `PositivelyDead` call `claim.claim` instead of the
     /// hard-wired kernel remint. Pass [`AlreadyBound`] after `host_wake` so
     /// this path never mints. Re-keep adopt: any [`HolderId`] may take the
-    /// open turn (fenced takeover); [`Error::LiveTurnOpen`] is per-Runtime.
+    /// open turn (fenced takeover; finalizes unmatched tool calls first);
+    /// [`Error::LiveTurnOpen`] is per-Runtime.
     pub fn begin_turn_with<C: WakeClaim>(
         &self,
         session: SessionId,
@@ -511,6 +518,11 @@ impl Runtime {
 
         if let Some((turn_id, _)) = open_turn_of(&sess.events()?) {
             sess.restore_open_turn()?;
+            // Re-keep adopt is the documented host-restart path (release +
+            // keep + begin_turn). Same Indeterminate finalize as
+            // resume_interrupted_turn / wire remint — never leave ToolCalls
+            // looking live across the rebuild.
+            sess.finalize_unmatched_tool_calls()?;
             let binding = binding_for_agent(&sess, agent)?;
             let fence = self.install_lease(&sess, holder, turn_id)?;
             return Ok((turn_id, fence, binding));
@@ -1778,5 +1790,94 @@ mod tests {
         })
         .unwrap();
         rt.end_turn(session.id(), h, fence2, false).unwrap();
+    }
+
+    /// HappyAdoptFinalizes: release + keep + begin_turn writes
+    /// ToolCallInterrupted Indeterminate for each unmatched id; terminals
+    /// untouched; second adopt is idempotent (no duplicate interrupt).
+    /// Mutation NaiveSkipFinalizeOnAdopt → OrphansLookLive (this test fails).
+    #[test]
+    fn rekeep_adopt_finalizes_unmatched_tool_as_indeterminate() {
+        let rt = Runtime::new();
+        let agent = rt.store().create_agent("scribe", "");
+        let session = rt.create_session();
+        rt.keep(session.id(), agent.id, goose()).unwrap();
+        let h = HolderId::new("host");
+        let (_turn, fence, _) = rt.begin_turn(session.id(), h.clone()).unwrap();
+        session
+            .append(EventBody::ToolCall {
+                agent: agent.id,
+                tool_call_id: "t-open".into(),
+                name: "bash".into(),
+                input: "{}".into(),
+            })
+            .unwrap();
+        session
+            .append(EventBody::ToolCall {
+                agent: agent.id,
+                tool_call_id: "t-done".into(),
+                name: "read".into(),
+                input: "{}".into(),
+            })
+            .unwrap();
+        session
+            .append(EventBody::ToolResult {
+                agent: agent.id,
+                tool_call_id: "t-done".into(),
+                name: "read".into(),
+                output: "ok".into(),
+            })
+            .unwrap();
+        // Host restart as release + keep + begin_turn (documented adopt path).
+        rt.release(session.id()).unwrap();
+        rt.keep(session.id(), agent.id, goose()).unwrap();
+        let (_turn2, fence2, _) = rt.begin_turn(session.id(), h.clone()).unwrap();
+        assert!(fence2 > fence);
+
+        let log = session.events().unwrap();
+        let interrupts: Vec<_> = log
+            .iter()
+            .filter_map(|e| match &e.body {
+                EventBody::ToolCallInterrupted {
+                    tool_call_id,
+                    status,
+                    ..
+                } => Some((tool_call_id.as_str(), *status)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(interrupts.len(), 1, "exactly one unmatched id");
+        assert_eq!(interrupts[0].0, "t-open");
+        assert_eq!(interrupts[0].1, crate::ToolInterruptStatus::Indeterminate);
+        assert!(crate::tool_call_is_terminal(&log, "t-open"));
+        assert!(crate::tool_call_is_terminal(&log, "t-done"));
+        assert!(
+            crate::unmatched_tool_calls(&log).is_empty(),
+            "NaiveSkipFinalizeOnAdopt → OrphansLookLive"
+        );
+
+        // Second adopt (another release + keep + begin_turn) is idempotent.
+        rt.end_turn(session.id(), h.clone(), fence2, true).unwrap();
+        rt.release(session.id()).unwrap();
+        rt.keep(session.id(), agent.id, goose()).unwrap();
+        rt.begin_turn(session.id(), HolderId::new("host-b"))
+            .unwrap();
+        assert_eq!(
+            session
+                .events()
+                .unwrap()
+                .iter()
+                .filter(|e| matches!(
+                    &e.body,
+                    EventBody::ToolCallInterrupted {
+                        tool_call_id,
+                        ..
+                    } if tool_call_id == "t-open"
+                ))
+                .count(),
+            1,
+            "second adopt must not duplicate interrupt"
+        );
+        assert!(crate::unmatched_tool_calls(&session.events().unwrap()).is_empty());
     }
 }
