@@ -42,7 +42,7 @@ A member is `UserId` or `AgentId`. One agent may sit in many sessions; one sessi
 - `ConfigSet { key, value }`
 - `UserMessage { user, text }`
 - `AgentMessage { agent, text, parent_tool_call_id }` — `parent_tool_call_id: Option<String>` is the tool call this message ran under (subagent nesting; see **ACP parent**). `None` = top level.
-- `AgentThink { agent, text }`
+- `AgentThink { agent, text, parent_tool_call_id }` — `parent_tool_call_id` as on `AgentMessage` (Thinking-chunk-parent)
 - `ToolCall { agent, tool_call_id, name, input, parent_tool_call_id }` — `parent_tool_call_id` as on `AgentMessage`
 - `ToolResult { agent, tool_call_id, name, output }`
 - `ToolCallInterrupted { agent, tool_call_id, name, status }` — remint terminal for an orphan; `status` is `Indeterminate` (not Cancelled)
@@ -269,7 +269,7 @@ Session/project lifecycle, message and thinking (plus deltas), tool call upsert 
 | --- | --- |
 | `TurnStarted` / `TurnCompleted` | `turn_start_with(attach decl)` (absorbed if the Agent's turn is already open; gate refusal → `Waiting(TurnOpen)`) / `turn_end` |
 | assistant `Message` / `MessageDelta` | `AgentMessage` (wire `parent` → `parent_tool_call_id`) |
-| `Thinking` / `ThinkingDelta` | `AgentThink` (log only; not `surface`) |
+| `Thinking` / `ThinkingDelta` | `AgentThink` (wire `parent` → `parent_tool_call_id` when `caps.subagent`; log only; not `surface`) |
 | `ToolCall` / `ToolResult` | `ToolCall` (wire `parent` → `parent_tool_call_id`; `subagent` not recorded) / `ToolResult` |
 | `Plan` | `AgentMessage` (joined entries) |
 | `PermissionAsk` | `PermissionAsked` |
@@ -287,13 +287,14 @@ Claude Code over ACP (claude-agent-acp, v1 / Zed form) runs subagents **inside t
 
 Hearth records that correlation and nothing more:
 
-- **Wire.** `AgentEvent::ToolCall`, `Message`, `MessageDelta` gain `parent: Option<ItemId>`; `ToolCall` also gains `subagent: bool`. `AcpCodec` decodes them from `_meta.claudeCode` per frame (Grok Build shares the map). Both are serde-additive (`default`, skipped when empty), so old JSON round-trips unchanged.
+- **Wire.** `AgentEvent::ToolCall`, `Message`, `MessageDelta`, `Thinking`, `ThinkingDelta` gain `parent: Option<ItemId>`; `ToolCall` also gains `subagent: bool`. `AcpCodec` decodes them from `_meta.claudeCode` per frame (Grok Build shares the map; `agent_thought_chunk` → `ThinkingDelta.parent`). Fields are serde-additive (`default`, skipped when empty), so old JSON round-trips unchanged.
 - **Fail-closed.** A missing `_meta`, a missing / non-object `claudeCode`, or a `parentToolUseId` that is not a non-empty string is `None`; a call never names itself as parent. `subagent` is `true` only for JSON `true`. Nothing is inferred across frames: when the wire drops the meta on a later update (the Task's own completion frames drop `subagent`), that frame decodes without it. Consumers key by `tool_call_id`.
-- **Kernel.** `EventBody::ToolCall` and `EventBody::AgentMessage` gain `parent_tool_call_id: Option<String>`, copied from the wire `parent` by `event_bodies` **when** `caps.subagent` is true (see **Host-caps-consume**). It is an Event field. It is not a seventh noun, and it mints **no child Session and no child Binding**: every child frame appends to the same Session under the same Binding, the native session id is not touched, and nothing is reminted. `surface()` / `is_model_visible` are unchanged (child activity stays visible; nesting is metadata).
+- **Kernel.** `EventBody::ToolCall`, `EventBody::AgentMessage`, and `EventBody::AgentThink` gain `parent_tool_call_id: Option<String>`, copied from the wire `parent` by `event_bodies` **when** `caps.subagent` is true (see **Host-caps-consume**). It is an Event field. It is not a seventh noun, and it mints **no child Session and no child Binding**: every child frame appends to the same Session under the same Binding, the native session id is not touched, and nothing is reminted. `surface()` / `is_model_visible` are unchanged (child activity stays visible; nesting is metadata; Think stays log-only).
 - **No `SubagentStarted` from ACP.** The launch already lands as a `ToolCall` whose `tool_call_id` is what children name, so that ToolCall *is* the parent marker. Turning the launch frame into `SubagentStarted { child_session_id: toolCallId, .. }` would drop the launch ToolCall (one frame decodes to one event) and pretend a tool-call id is a session id. `SubagentStarted` / `SubagentEnded` keep the Pi shape and stay "not appended" (table above). The wire `subagent` marker is not copied onto the kernel: nesting needs only the child → parent link.
-- **Not in this cut.** `ToolResult` gets no parent (ACP never decodes one; completion is a `tool_call_update`). Permission asks landed next (see **Permission parent**). Thinking chunks and the v2 / RFD native-subagent-session form (`subagent_update`, child `sessionId`s) are left for later slices.
+- **Not in this cut.** `ToolResult` gets no parent (ACP never decodes one; completion is a `tool_call_update`). Permission asks landed next (see **Permission parent**). Thinking chunks landed as **Thinking-chunk-parent** (below). The v2 / RFD native-subagent-session form (`subagent_update`, child `sessionId`s) is left for later slices.
 - **Claude-acp catalog (capability-honest).** Builtin profile `claude-acp` (`claude-agent-acp` argv, shared `AcpCodec`) advertises [`CapabilityFlags::CLAUDE_ACP`] (`subagent: true`) via `CatalogProfile::caps` / `caps_override`. Generic [`CapabilityFlags::ACP`].subagent stays `false`; Copilot / Cursor inherit ACP defaults. No new AgentKind, no child Session/Binding.
 - **Host-caps-consume.** Host consults `CapabilityFlags` beyond catalog discovery: `HostAttach` carries `agent_caps` (default `CapabilityFlags::for_agent(kind)`; catalog profiles pin via `with_agent_caps(profile.caps())`). On drain, `event_bodies` retains wire `parent` → `parent_tool_call_id` only when `caps.subagent` is true (`CLAUDE_ACP` / Pi). When `caps.subagent` is false (generic ACP / Copilot / Cursor / Codex / OpenCode / GrokBuild), parent is stripped to `None` even if wire `_meta` carries `parentToolUseId` — fail-closed so advertise-only is not enough. No new noun; toy Loopback + caps pin.
+- **Thinking-chunk-parent.** Closes the residual under ACP-parent / Host-caps-consume: `AgentEvent::Thinking` / `ThinkingDelta` gain serde-additive `parent: Option<ItemId>`; ACP `agent_thought_chunk` decodes `_meta.claudeCode.parentToolUseId` via the same fail-closed `claude_parent` (missing / non-string / self → `None`). Kernel `EventBody::AgentThink` gains `parent_tool_call_id`; `event_bodies` copies it only when `caps.subagent` (reuse Host-caps-consume gate; strip under generic ACP / Copilot / Cursor). Other adapters / `Thinking` constructors pass `None`. No new noun; no child Session / Binding; no `ToolResult` parent; no v2 `subagent_update`.
 
 #### Permission parent
 

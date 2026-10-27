@@ -175,6 +175,7 @@ mod tests {
             EventBody::AgentThink {
                 agent: agent.id,
                 text: "hidden from surface".into(),
+                parent_tool_call_id: None,
             },
             EventBody::AgentMessage {
                 agent: agent.id,

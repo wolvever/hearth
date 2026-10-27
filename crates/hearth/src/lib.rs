@@ -171,6 +171,10 @@ pub enum EventBody {
     AgentThink {
         agent: AgentId,
         text: String,
+        /// Tool call this think was produced under (subagent nesting from
+        /// the wire, e.g. ACP `_meta.claudeCode.parentToolUseId`). `None` =
+        /// top level. An Event field only — no child Session or Binding.
+        parent_tool_call_id: Option<String>,
     },
     ToolCall {
         agent: AgentId,
@@ -1970,6 +1974,7 @@ mod tests {
             .append(EventBody::AgentThink {
                 agent: agent.id,
                 text: "hmm".into(),
+                parent_tool_call_id: None,
             })
             .unwrap();
         session

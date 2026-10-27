@@ -65,6 +65,7 @@ pub fn map_notification(msg: &Value) -> Result<AgentEvent, BusError> {
                     .and_then(|d| d.as_str())
                     .unwrap_or("")
                     .into(),
+                parent: None,
             })
         }
         other if other.contains("compact") => Ok(AgentEvent::Compacted { session_id }),
@@ -106,6 +107,7 @@ fn map_item(method: &str, session_id: &str, params: &Value) -> Result<AgentEvent
                 .and_then(|t| t.as_str())
                 .unwrap_or("")
                 .into(),
+            parent: None,
         }),
         "commandExecution" | "mcpToolCall" | "dynamicToolCall" | "fileChange" => {
             let status = if method.ends_with("completed") {
