@@ -88,3 +88,9 @@ malformed meta decodes as `None` / `false`; no SubagentStarted and no child
 session are emitted. Host maps `parent` to `parent_tool_call_id` on the
 EventLog. See `crates/hearth/DESIGN.md` → **ACP parent**.
 
+`session/request_permission` reads `toolCall._meta.claudeCode.parentToolUseId`
+(v1 `/toolCall`, v2 `/subject/toolCall`) into `PermissionAsk.parent`, same
+fail-closed rule; Host maps it to `PermissionAsked.parent_tool_call_id`.
+An ask without it stays `None` even if a later update names a parent
+(claude-agent-acp #708; DESIGN.md → **Permission parent**).
+

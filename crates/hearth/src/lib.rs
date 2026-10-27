@@ -209,6 +209,12 @@ pub enum EventBody {
         /// Wire address when the ask is a JSON-RPC request (ACP
         /// `session/request_permission`). `None` for non-RPC asks.
         rpc: Option<PermissionRpc>,
+        /// `tool_call_id` of the subagent launch the gated tool ran under
+        /// (ACP `request_permission.toolCall._meta.claudeCode.parentToolUseId`).
+        /// `None` = top level or not stated on the ask itself — never guessed.
+        /// Outside [`PermissionRpc`]: the pending key stays `(binding, rpc_id)`.
+        /// An Event field only — no child Session or Binding.
+        parent_tool_call_id: Option<String>,
     },
     PermissionDecided {
         request: String,
@@ -1051,20 +1057,25 @@ impl Session {
             agent,
             request: request.into(),
             rpc: None,
+            parent_tool_call_id: None,
         })
     }
 
     /// Record a JSON-RPC permission ask keyed by `(binding, rpc_id)`.
+    /// `parent_tool_call_id` is the subagent launch the gated tool ran under
+    /// (`None` = top level / unstated); it is not part of the key.
     pub fn ask_permission_rpc(
         &self,
         agent: AgentId,
         request: impl Into<String>,
         rpc: PermissionRpc,
+        parent_tool_call_id: Option<String>,
     ) -> Result<Event> {
         self.append(EventBody::PermissionAsked {
             agent,
             request: request.into(),
             rpc: Some(rpc),
+            parent_tool_call_id,
         })
     }
 
@@ -1844,6 +1855,7 @@ mod tests {
                 agent: agent.id,
                 request: "git push".into(),
                 rpc: None,
+                parent_tool_call_id: None,
             })
             .unwrap();
         session.unbind(binding.id).unwrap();
@@ -1869,7 +1881,7 @@ mod tests {
             tool_call_id: Some("call_001".into()),
         };
         session
-            .ask_permission_rpc(agent.id, "read config", rpc.clone())
+            .ask_permission_rpc(agent.id, "read config", rpc.clone(), None)
             .unwrap();
         let decided = session
             .decide_permission_rpc(
@@ -1935,6 +1947,7 @@ mod tests {
                 agent: agent.id,
                 request: "rm".into(),
                 rpc: None,
+                parent_tool_call_id: None,
             })
             .unwrap();
         session

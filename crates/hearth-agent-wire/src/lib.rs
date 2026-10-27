@@ -303,6 +303,14 @@ pub enum AgentEvent {
         /// [`AgentCommand::ReplyPermission`] carrying this same id.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         rpc_id: Option<RpcId>,
+        /// Tool call the gated tool ran under (Claude Code
+        /// `request_permission.toolCall._meta.claudeCode.parentToolUseId`):
+        /// the subagent launch it nests under. Read from the ask itself, so
+        /// it holds when the ask arrives before the tool's `session/update`
+        /// (claude-agent-acp #708). `None` = top level or unstated.
+        /// Correlation only — never a child Session or Binding.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent: Option<ItemId>,
     },
     QuestionAsk {
         session_id: SessionId,

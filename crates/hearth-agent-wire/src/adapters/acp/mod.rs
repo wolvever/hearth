@@ -164,6 +164,8 @@ fn bad_permission(why: &str) -> BusError {
 ///   `/subject/toolCall/toolCallId`. It is not unique across concurrent asks
 ///   (copilot-cli #989) — never route a reply by it.
 /// - `options[*].optionId` must be non-empty strings, unique per ask.
+/// - `parent` is that toolCall's `_meta.claudeCode.parentToolUseId`
+///   (fail-closed as for updates; never the ask's own `toolCallId`).
 ///
 /// Malformed requests return [`BusError::Decode`] (never a fabricated id).
 pub fn map_permission_request(msg: &Value) -> Result<AgentEvent, BusError> {
@@ -234,6 +236,9 @@ pub fn map_permission_request(msg: &Value) -> Result<AgentEvent, BusError> {
             .get("description")
             .and_then(|d| d.as_str())
             .map(str::to_string),
+        // The ask's own toolCall `_meta` (v1 or v2 path), same fail-closed
+        // rule as updates; never borrowed from an earlier / later update.
+        parent: tool_call.and_then(|t| claude_parent(t, Some(&tool_item_id))),
         tool_item_id: Some(tool_item_id),
         options,
         rpc_id: Some(rpc_id),
@@ -859,5 +864,144 @@ mod map_tests {
             data: serde_json::json!({}),
         };
         assert!(AcpCodec.decode_event(&frame).is_err());
+    }
+
+    fn ask_parent(params_tool_call: serde_json::Value, v2: bool) -> Option<String> {
+        let mut params = serde_json::json!({"sessionId": "s",
+            "options": [{"optionId": "allow", "name": "Allow", "kind": "allow_once"}]});
+        if v2 {
+            params["subject"] = serde_json::json!({"toolCall": params_tool_call});
+        } else {
+            params["toolCall"] = params_tool_call;
+        }
+        let msg = serde_json::json!({"jsonrpc": "2.0", "id": 3,
+            "method": "session/request_permission", "params": params});
+        match map_notification(&msg, AgentKind::Acp).unwrap() {
+            AgentEvent::PermissionAsk { parent, .. } => parent,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// G4: `request_permission.toolCall._meta.claudeCode.parentToolUseId`
+    /// (v1 `/toolCall`, v2 `/subject/toolCall`) decodes onto the ask with
+    /// the same fail-closed rule as updates.
+    #[test]
+    fn permission_ask_decodes_tool_call_parent_fail_closed() {
+        let tc = |meta: Option<serde_json::Value>| {
+            let mut t = serde_json::json!({"toolCallId": "toolu_sub", "title": "Bash"});
+            if let Some(m) = meta {
+                t["_meta"] = m;
+            }
+            t
+        };
+        let meta = |p: serde_json::Value| serde_json::json!({"claudeCode": {"parentToolUseId": p}});
+        for v2 in [false, true] {
+            assert_eq!(
+                ask_parent(tc(Some(meta(serde_json::json!("toolu_task")))), v2).as_deref(),
+                Some("toolu_task"),
+                "v2={v2}"
+            );
+            assert_eq!(ask_parent(tc(None), v2), None, "v2={v2}");
+            for bad in [
+                serde_json::json!(null),
+                serde_json::json!(7),
+                serde_json::json!(""),
+                serde_json::json!("toolu_sub"), // self-parent
+            ] {
+                assert_eq!(ask_parent(tc(Some(meta(bad.clone()))), v2), None, "{bad}");
+            }
+            assert_eq!(
+                ask_parent(
+                    tc(Some(serde_json::json!({"codex": {"parentToolUseId": "p"}}))),
+                    v2
+                ),
+                None
+            );
+        }
+        // Params-level `_meta` is not the toolCall's: ignored.
+        let msg = serde_json::json!({"jsonrpc": "2.0", "id": 4,
+            "method": "session/request_permission", "params": {"sessionId": "s",
+            "_meta": {"claudeCode": {"parentToolUseId": "toolu_task"}},
+            "toolCall": {"toolCallId": "t"},
+            "options": [{"optionId": "a", "name": "A", "kind": "allow_once"}]}});
+        assert!(matches!(
+            map_notification(&msg, AgentKind::Acp).unwrap(),
+            AgentEvent::PermissionAsk { parent: None, .. }
+        ));
+    }
+
+    /// claude-agent-acp #708 ordering: the subagent's ask arrives *before*
+    /// the tool's `session/update`. Current upstream (`0ce42f2`) stamps the
+    /// parent on the ask's own `toolCall._meta`, so the ask carries it with
+    /// no cross-frame state. The #708 frame as originally reported (no ask
+    /// `_meta`) decodes to `None` — never a parent borrowed from the later
+    /// update (fail-closed; DESIGN.md "ACP parent").
+    #[test]
+    fn claude_708_ask_before_update_parent_from_ask_meta() {
+        let ask = |meta: bool| {
+            let mut tool_call = serde_json::json!({
+                "toolCallId": "toolu_01EeQjTu25w8bF7i9i8uaPmy", "title": "Touch test.json",
+                "kind": "execute", "rawInput": {"command": "touch test.json"}});
+            if meta {
+                tool_call["_meta"] = serde_json::json!({"claudeCode": {
+                    "toolName": "Bash", "parentToolUseId": "toolu_01Kvg6o7Nkes2C3iunSu2bTr"}});
+            }
+            serde_json::json!({"jsonrpc": "2.0", "id": 0, "method": "session/request_permission",
+                "params": {"sessionId": "aa7c66a6", "toolCall": tool_call, "options": [
+                    {"optionId": "allow_always", "name": "Always Allow", "kind": "allow_always"},
+                    {"optionId": "allow", "name": "Allow", "kind": "allow_once"},
+                    {"optionId": "reject", "name": "Reject", "kind": "reject_once"}]}})
+        };
+        let update = serde_json::json!({"jsonrpc": "2.0", "method": "session/update",
+            "params": {"sessionId": "aa7c66a6", "update": {"sessionUpdate": "tool_call",
+                "_meta": {"claudeCode": {"toolName": "Bash",
+                    "parentToolUseId": "toolu_01Kvg6o7Nkes2C3iunSu2bTr"}},
+                "toolCallId": "toolu_01EeQjTu25w8bF7i9i8uaPmy", "title": "Touch test.json",
+                "kind": "execute", "status": "pending"}}});
+        let parent_of = |v: &serde_json::Value| match map_notification(v, AgentKind::Acp).unwrap() {
+            AgentEvent::PermissionAsk {
+                parent,
+                tool_item_id,
+                ..
+            } => (tool_item_id, parent),
+            AgentEvent::ToolCall {
+                parent, item_id, ..
+            } => (Some(item_id), parent),
+            other => panic!("unexpected {other:?}"),
+        };
+        let want = (
+            Some("toolu_01EeQjTu25w8bF7i9i8uaPmy".to_string()),
+            Some("toolu_01Kvg6o7Nkes2C3iunSu2bTr".to_string()),
+        );
+        assert_eq!(parent_of(&ask(true)), want, "ask first, parent on ask");
+        assert_eq!(parent_of(&update), want, "update second, same parent");
+        assert_eq!(
+            parent_of(&ask(false)),
+            (want.0.clone(), None),
+            "no ask _meta: unattributed, not guessed"
+        );
+    }
+
+    #[test]
+    fn permission_ask_parent_is_additive_on_serde() {
+        let old = serde_json::json!({"event": "permission_ask", "session_id": "s",
+            "permission_id": "5", "title": "t", "description": null,
+            "tool_item_id": "c", "options": []});
+        let ev: AgentEvent = serde_json::from_value(old.clone()).unwrap();
+        assert!(matches!(ev, AgentEvent::PermissionAsk { parent: None, .. }));
+        assert_eq!(serde_json::to_value(&ev).unwrap(), old);
+        let nested = AgentEvent::PermissionAsk {
+            session_id: "s".into(),
+            permission_id: "5".into(),
+            title: "t".into(),
+            description: None,
+            tool_item_id: Some("c".into()),
+            options: vec![],
+            rpc_id: None,
+            parent: Some("toolu_task".into()),
+        };
+        let v = serde_json::to_value(&nested).unwrap();
+        assert_eq!(v["parent"], "toolu_task");
+        assert_eq!(serde_json::from_value::<AgentEvent>(v).unwrap(), nested);
     }
 }

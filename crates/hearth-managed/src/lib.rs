@@ -186,6 +186,7 @@ mod tests {
             agent: agent.id,
             request: "bash".into(),
             rpc: None,
+            parent_tool_call_id: None,
         })
         .unwrap();
 
