@@ -73,12 +73,15 @@ pub fn map_event(msg: &Value) -> Result<AgentEvent, BusError> {
                         .cloned()
                         .unwrap_or(Value::Null),
                     status: ToolStatus::InProgress,
+                    parent: None,
+                    subagent: false,
                 }),
                 "compaction" => Ok(AgentEvent::CompactStarted { session_id }),
                 _ => Ok(AgentEvent::MessageDelta {
                     session_id,
                     item_id,
                     delta: text,
+                    parent: None,
                 }),
             }
         }

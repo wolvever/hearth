@@ -1,0 +1,183 @@
+[
+ {
+  "jsonrpc": "2.0",
+  "method": "session/update",
+  "params": {
+   "sessionId": "s1",
+   "update": {
+    "_meta": {
+     "claudeCode": {
+      "subagent": true,
+      "toolName": "Agent"
+     }
+    },
+    "sessionUpdate": "tool_call",
+    "toolCallId": "toolu_outer",
+    "title": "Plan",
+    "kind": "think",
+    "status": "pending",
+    "rawInput": {
+     "description": "Plan the work",
+     "prompt": "Plan it"
+    }
+   }
+  }
+ },
+ {
+  "jsonrpc": "2.0",
+  "method": "session/update",
+  "params": {
+   "sessionId": "s1",
+   "update": {
+    "_meta": {
+     "claudeCode": {
+      "parentToolUseId": "toolu_outer"
+     }
+    },
+    "sessionUpdate": "agent_message_chunk",
+    "messageId": "msg_outer_1",
+    "content": {
+     "type": "text",
+     "text": "Reading the spec first."
+    }
+   }
+  }
+ },
+ {
+  "jsonrpc": "2.0",
+  "method": "session/update",
+  "params": {
+   "sessionId": "s1",
+   "update": {
+    "_meta": {
+     "claudeCode": {
+      "subagent": true,
+      "parentToolUseId": "toolu_outer",
+      "toolName": "Agent"
+     }
+    },
+    "sessionUpdate": "tool_call",
+    "toolCallId": "toolu_inner",
+    "title": "Explore",
+    "kind": "think",
+    "status": "pending",
+    "rawInput": {
+     "description": "Read the spec",
+     "prompt": "Read spec.md"
+    }
+   }
+  }
+ },
+ {
+  "jsonrpc": "2.0",
+  "method": "session/update",
+  "params": {
+   "sessionId": "s1",
+   "update": {
+    "_meta": {
+     "claudeCode": {
+      "parentToolUseId": "toolu_inner",
+      "toolName": "Read"
+     }
+    },
+    "sessionUpdate": "tool_call",
+    "toolCallId": "toolu_grandchild_read",
+    "title": "Read /spec.md",
+    "kind": "read",
+    "status": "pending",
+    "rawInput": {
+     "file_path": "/spec.md"
+    }
+   }
+  }
+ },
+ {
+  "jsonrpc": "2.0",
+  "method": "session/update",
+  "params": {
+   "sessionId": "s1",
+   "update": {
+    "_meta": {
+     "claudeCode": {
+      "parentToolUseId": "toolu_inner",
+      "toolName": "Read"
+     }
+    },
+    "sessionUpdate": "tool_call_update",
+    "toolCallId": "toolu_grandchild_read",
+    "status": "completed",
+    "rawOutput": "1\tspec"
+   }
+  }
+ },
+ {
+  "jsonrpc": "2.0",
+  "method": "session/update",
+  "params": {
+   "sessionId": "s1",
+   "update": {
+    "_meta": {
+     "claudeCode": {
+      "parentToolUseId": "toolu_outer",
+      "toolName": "Agent"
+     }
+    },
+    "sessionUpdate": "tool_call_update",
+    "toolCallId": "toolu_inner",
+    "status": "completed"
+   }
+  }
+ },
+ {
+  "jsonrpc": "2.0",
+  "method": "session/update",
+  "params": {
+   "sessionId": "s1",
+   "update": {
+    "_meta": {
+     "claudeCode": {
+      "parentToolUseId": "toolu_outer"
+     }
+    },
+    "sessionUpdate": "agent_message_chunk",
+    "messageId": "msg_outer_text",
+    "content": {
+     "type": "text",
+     "text": "Plan: do X."
+    }
+   }
+  }
+ },
+ {
+  "jsonrpc": "2.0",
+  "method": "session/update",
+  "params": {
+   "sessionId": "s1",
+   "update": {
+    "_meta": {
+     "claudeCode": {
+      "toolName": "Agent"
+     }
+    },
+    "sessionUpdate": "tool_call_update",
+    "toolCallId": "toolu_outer",
+    "status": "completed"
+   }
+  }
+ },
+ {
+  "jsonrpc": "2.0",
+  "method": "session/update",
+  "params": {
+   "sessionId": "s1",
+   "update": {
+    "sessionUpdate": "agent_message_chunk",
+    "messageId": "msg_root",
+    "content": {
+     "type": "text",
+     "text": "Done."
+    }
+   }
+  }
+ }
+]

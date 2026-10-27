@@ -1037,6 +1037,7 @@ mod tests {
                 .append(EventBody::AgentMessage {
                     agent,
                     text: text.into(),
+                    parent_tool_call_id: None,
                 })
                 .unwrap()
                 .turn
@@ -1671,6 +1672,7 @@ mod tests {
                 tool_call_id: "t-open".into(),
                 name: "bash".into(),
                 input: "{}".into(),
+                parent_tool_call_id: None,
             })
             .unwrap();
         session
@@ -1679,6 +1681,7 @@ mod tests {
                 tool_call_id: "t-done".into(),
                 name: "read".into(),
                 input: "{}".into(),
+                parent_tool_call_id: None,
             })
             .unwrap();
         session
@@ -1742,6 +1745,7 @@ mod tests {
                     tool_call_id: id.into(),
                     name: "bash".into(),
                     input: "{}".into(),
+                    parent_tool_call_id: None,
                 })
                 .unwrap()
         };
@@ -1803,6 +1807,7 @@ mod tests {
                 tool_call_id: "t1".into(),
                 name: "bash".into(),
                 input: "{}".into(),
+                parent_tool_call_id: None,
             })
             .unwrap();
         rt.end_turn(session.id(), host_a, fence, true).unwrap();
@@ -2202,6 +2207,7 @@ mod tests {
                 tool_call_id: "t-open".into(),
                 name: "bash".into(),
                 input: "{}".into(),
+                parent_tool_call_id: None,
             })
             .unwrap();
         session
@@ -2210,6 +2216,7 @@ mod tests {
                 tool_call_id: "t-done".into(),
                 name: "read".into(),
                 input: "{}".into(),
+                parent_tool_call_id: None,
             })
             .unwrap();
         session

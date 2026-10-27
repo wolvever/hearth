@@ -32,6 +32,7 @@ fn main() {
         .append(hearth::EventBody::AgentMessage {
             agent: agent.id,
             text: "pushed".into(),
+            parent_tool_call_id: None,
         })
         .unwrap();
 

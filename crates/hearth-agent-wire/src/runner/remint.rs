@@ -1257,6 +1257,7 @@ impl RemintSession {
                 tool_call_id: tool_call_id.into(),
                 name: title.into(),
                 input: "{}".into(),
+                parent_tool_call_id: None,
             })
             .expect("append ToolCall");
         g.turn_in_flight = true;
@@ -2043,6 +2044,7 @@ mod tests {
                     tool_call_id: "a-live".into(),
                     name: "bash".into(),
                     input: "{}".into(),
+                    parent_tool_call_id: None,
                 })
                 .unwrap();
             other.id

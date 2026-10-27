@@ -36,6 +36,8 @@ pub fn map_event(msg: &Value) -> Result<AgentEvent, BusError> {
             name: tool_name(msg),
             arguments: tool_args(msg),
             status: ToolStatus::InProgress,
+            parent: None,
+            subagent: false,
         }),
         "tool_execution_update" => Ok(AgentEvent::ToolCall {
             session_id,
@@ -47,6 +49,8 @@ pub fn map_event(msg: &Value) -> Result<AgentEvent, BusError> {
                 .or_else(|| msg.get("args").cloned())
                 .unwrap_or(Value::Null),
             status: ToolStatus::InProgress,
+            parent: None,
+            subagent: false,
         }),
         "tool_execution_end" => Ok(AgentEvent::ToolResult {
             session_id,
@@ -99,6 +103,7 @@ pub fn map_event(msg: &Value) -> Result<AgentEvent, BusError> {
                 .and_then(|t| t.as_str())
                 .unwrap_or("")
                 .into(),
+            parent: None,
         }),
         "tool.start" | "tool.started" => Ok(AgentEvent::ToolCall {
             session_id,
@@ -114,6 +119,8 @@ pub fn map_event(msg: &Value) -> Result<AgentEvent, BusError> {
                 .into(),
             arguments: msg.get("arguments").cloned().unwrap_or(Value::Null),
             status: ToolStatus::InProgress,
+            parent: None,
+            subagent: false,
         }),
         "tool.end" | "tool.ended" => Ok(AgentEvent::ToolResult {
             session_id,
@@ -214,6 +221,7 @@ fn map_message_update(msg: &Value, session_id: String) -> Result<AgentEvent, Bus
             session_id,
             item_id,
             delta,
+            parent: None,
         }),
     }
 }
@@ -236,6 +244,7 @@ fn map_message_end(msg: &Value, session_id: String) -> Result<AgentEvent, BusErr
         item_id,
         role,
         text,
+        parent: None,
     })
 }
 

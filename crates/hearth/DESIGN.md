@@ -41,9 +41,9 @@ A member is `UserId` or `AgentId`. One agent may sit in many sessions; one sessi
 - `MemberLeave { member }`
 - `ConfigSet { key, value }`
 - `UserMessage { user, text }`
-- `AgentMessage { agent, text }`
+- `AgentMessage { agent, text, parent_tool_call_id }` — `parent_tool_call_id: Option<String>` is the tool call this message ran under (subagent nesting; see **ACP parent**). `None` = top level.
 - `AgentThink { agent, text }`
-- `ToolCall { agent, tool_call_id, name, input }`
+- `ToolCall { agent, tool_call_id, name, input, parent_tool_call_id }` — `parent_tool_call_id` as on `AgentMessage`
 - `ToolResult { agent, tool_call_id, name, output }`
 - `ToolCallInterrupted { agent, tool_call_id, name, status }` — remint terminal for an orphan; `status` is `Indeterminate` (not Cancelled)
 - `AskUser { agent, prompt }`
@@ -260,9 +260,9 @@ Session/project lifecycle, message and thinking (plus deltas), tool call upsert 
 | AgentEvent | EventLog |
 | --- | --- |
 | `TurnStarted` / `TurnCompleted` | `turn_start_with(attach decl)` (absorbed if the Agent's turn is already open; gate refusal → `Waiting(TurnOpen)`) / `turn_end` |
-| assistant `Message` / `MessageDelta` | `AgentMessage` |
+| assistant `Message` / `MessageDelta` | `AgentMessage` (wire `parent` → `parent_tool_call_id`) |
 | `Thinking` / `ThinkingDelta` | `AgentThink` (log only; not `surface`) |
-| `ToolCall` / `ToolResult` | `ToolCall` / `ToolResult` |
+| `ToolCall` / `ToolResult` | `ToolCall` (wire `parent` → `parent_tool_call_id`; `subagent` not recorded) / `ToolResult` |
 | `Plan` | `AgentMessage` (joined entries) |
 | `PermissionAsk` | `PermissionAsked` |
 | `QuestionAsk` | `AskUser` |
@@ -272,6 +272,20 @@ Session/project lifecycle, message and thinking (plus deltas), tool call upsert 
 | lifecycle / `Status` / `Error` / `Native` / subagent start | not appended |
 
 `HostAttach::user_message` is occupancy-checked `Session::user_message` then outbound `UserMessage`. Permission reply is `decide_permission` then `ReplyPermission`.
+
+### ACP parent (subagent nesting)
+
+Claude Code over ACP (claude-agent-acp, v1 / Zed form) runs subagents **inside the root ACP session**. The launching Task / Agent tool call carries `update._meta.claudeCode.subagent: true`; every message chunk and tool call the subagent makes carries `update._meta.claudeCode.parentToolUseId: <launch toolCallId>`. Nested launches chain: an inner Agent call is both a child (`parentToolUseId: outer`) and a launch (`subagent: true`).
+
+Hearth records that correlation and nothing more:
+
+- **Wire.** `AgentEvent::ToolCall`, `Message`, `MessageDelta` gain `parent: Option<ItemId>`; `ToolCall` also gains `subagent: bool`. `AcpCodec` decodes them from `_meta.claudeCode` per frame (Grok Build shares the map). Both are serde-additive (`default`, skipped when empty), so old JSON round-trips unchanged.
+- **Fail-closed.** A missing `_meta`, a missing / non-object `claudeCode`, or a `parentToolUseId` that is not a non-empty string is `None`; a call never names itself as parent. `subagent` is `true` only for JSON `true`. Nothing is inferred across frames: when the wire drops the meta on a later update (the Task's own completion frames drop `subagent`), that frame decodes without it. Consumers key by `tool_call_id`.
+- **Kernel.** `EventBody::ToolCall` and `EventBody::AgentMessage` gain `parent_tool_call_id: Option<String>`, copied from the wire `parent` by `event_bodies`. It is an Event field. It is not a seventh noun, and it mints **no child Session and no child Binding**: every child frame appends to the same Session under the same Binding, the native session id is not touched, and nothing is reminted. `surface()` / `is_model_visible` are unchanged (child activity stays visible; nesting is metadata).
+- **No `SubagentStarted` from ACP.** The launch already lands as a `ToolCall` whose `tool_call_id` is what children name, so that ToolCall *is* the parent marker. Turning the launch frame into `SubagentStarted { child_session_id: toolCallId, .. }` would drop the launch ToolCall (one frame decodes to one event) and pretend a tool-call id is a session id. `SubagentStarted` / `SubagentEnded` keep the Pi shape and stay "not appended" (table above). The wire `subagent` marker is not copied onto the kernel: nesting needs only the child → parent link.
+- **Not in this cut.** `ToolResult` gets no parent (ACP never decodes one; completion is a `tool_call_update`). Thinking chunks, permission asks (`request_permission.toolCall._meta` — the ask-before-update ordering case), the v2 / RFD native-subagent-session form (`subagent_update`, child `sessionId`s), and a `claude` catalog profile with `subagent: true` caps are left for later slices. `CapabilityFlags::ACP.subagent` stays `false`.
+
+Fixtures: `adapters/acp/fixtures/claude_subagent_task.json` (claude-agent-acp origin-main Zed snapshot `subagent-task-legacy`, JSON-RPC wrapped, bulky `content` / `toolResponse` elided) and `claude_subagent_nested.json` (Agent → Agent → Read, hand-built in the same v1 shape from the upstream v2 `subagent-nested` scenario).
 
 ### Compact
 

@@ -62,6 +62,7 @@ pub fn event_from_ma_text(agent: hearth::AgentId, text: impl Into<String>) -> Ev
     EventBody::AgentMessage {
         agent,
         text: text.into(),
+        parent_tool_call_id: None,
     }
 }
 

@@ -38,6 +38,7 @@ fn main() {
             tool_call_id: "tc-a".into(),
             name: "write".into(),
             input: "path=/a.txt\nbody=hello".into(),
+            parent_tool_call_id: None,
         })
         .unwrap();
     place.apply_write(sid, "path=/a.txt\nbody=hello");
