@@ -16,7 +16,7 @@
 //!    `toolCallId` is unique (copilot-cli #989 reuses ids).
 //! 4. **Finalize-orphaned-toolcalls** — after mid-turn cancel, append Host
 //!    [`hearth::EventBody::ToolCallInterrupted`] (Indeterminate) for each
-//!    unmatched `tool_call_id` via [`hearth::Session::finalize_unmatched_tool_calls`]
+//!    unmatched `tool_call_id` via [`hearth::Session::finalize_unmatched_tool_calls_of`] (this Agent only)
 //!    (shared with crash reclaim / `resume_interrupted_turn`); idempotent
 //!    across a second remint; do not finalize healthy HITL. (2026-10-07)
 //! 5. **Truncated-replay-resync** — producer `truncated:true` → hydrate
@@ -1429,9 +1429,12 @@ impl RemintSession {
             // Finalize-orphaned-toolcalls (09-30 / 10-07): shared Host
             // helper (same as Runtime::resume_interrupted_turn). Keyed by
             // tool_call_id; Indeterminate; idempotent.
+            // Scoped to this Binding's Agent: concurrent per-Binding turns
+            // of other Agents keep their live ToolCalls.
+            let host_agent = g.host_agent;
             tools_finalized = g
                 .host_session
-                .finalize_unmatched_tool_calls()
+                .finalize_unmatched_tool_calls_of(host_agent)
                 .expect("finalize unmatched tool calls");
             g.turn_in_flight = false;
             // NEVER resubmit in-flight prompt after remint.
@@ -2024,6 +2027,39 @@ mod tests {
             .observe()
             .iter()
             .any(|e| e.text.contains("cancelled") || e.text.contains("t1:bash")));
+    }
+
+    /// Concurrent per-Binding turns: another Agent's live ToolCall on the
+    /// same Host Session is not finalized by this Binding's mid-turn remint.
+    #[test]
+    fn mid_turn_remint_does_not_finalize_other_agents_tool_call() {
+        let (s, _, _) = RemintSession::open("sess-1", "agent-1", caps_resume());
+        let other = {
+            let g = s.inner.lock().unwrap();
+            let other = g.host_session.store().create_agent("other", "");
+            g.host_session
+                .append(EventBody::ToolCall {
+                    agent: other.id,
+                    tool_call_id: "a-live".into(),
+                    name: "bash".into(),
+                    input: "{}".into(),
+                })
+                .unwrap();
+            other.id
+        };
+        s.begin_turn("work");
+        s.start_tool("t1", "bash");
+        let out = s.remint_and_attach().unwrap();
+        assert!(out.turn_interrupted);
+        assert_eq!(out.tools_finalized, 1, "only this Agent's t1");
+        assert_eq!(s.interrupted_marker_count("t1"), 1);
+        assert_eq!(s.interrupted_marker_count("a-live"), 0);
+        let events = s.host_events();
+        assert!(!tool_call_is_terminal(&events, "a-live"));
+        assert_eq!(
+            hearth::unmatched_tool_calls(&events),
+            vec![(other, "a-live".to_string(), "bash".to_string())]
+        );
     }
 
     #[test]

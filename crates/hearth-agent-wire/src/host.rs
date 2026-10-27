@@ -591,7 +591,14 @@ impl<A: CodingAgent> HostAttach<A> {
                 self.native_session = Some(session_id.clone());
                 Ok(vec![])
             }
-            AgentEvent::TurnStarted { .. } => Ok(vec![session.turn_start(self.agent)?]),
+            // Per-Binding turn map: the kernel (wake / begin_turn) may have
+            // already opened this Binding's turn; the wire echo is absorbed
+            // rather than minting a second turn id or failing the drain.
+            AgentEvent::TurnStarted { .. } => match session.turn_start(self.agent) {
+                Ok(ev) => Ok(vec![ev]),
+                Err(hearth::Error::Waiting(hearth::WaitReason::TurnOpen)) => Ok(vec![]),
+                Err(e) => Err(e.into()),
+            },
             AgentEvent::TurnCompleted { .. } => Ok(vec![session.turn_end(self.agent)?]),
             AgentEvent::PermissionAsk {
                 rpc_id: Some(rpc_id),
@@ -747,6 +754,36 @@ mod tests {
         assert_eq!(attach2.binding().id, binding_id);
         assert_eq!(session.bindings().unwrap().len(), 1);
         assert_eq!(session.bindings().unwrap()[0].id, binding_id);
+    }
+
+    /// Kernel already opened this Binding's turn (wake / begin_turn): the
+    /// wire `TurnStarted` echo is absorbed — no second `TurnStart`, no new
+    /// turn id, drain does not fail — and events stamp the kernel's turn.
+    #[test]
+    fn wire_turn_started_echo_absorbed_when_turn_open() {
+        let (_store, user, agent, session) = room();
+        let mut attach = HostAttach::loopback(&session, agent.id, AgentKind::Codex).unwrap();
+        attach.open(None).unwrap();
+        attach.drain(&session).unwrap();
+        let turn = session.turn_start(agent.id).unwrap().turn.unwrap();
+
+        attach.user_message(&session, user.id, "hi").unwrap();
+        let drained = attach.drain(&session).unwrap();
+        assert!(!drained
+            .iter()
+            .any(|e| matches!(e.body, EventBody::TurnStart { .. })));
+        let msg = drained
+            .iter()
+            .find(|e| matches!(e.body, EventBody::AgentMessage { .. }))
+            .unwrap();
+        assert_eq!(msg.turn, Some(turn));
+        let starts = session
+            .events()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e.body, EventBody::TurnStart { .. }))
+            .count();
+        assert_eq!(starts, 1);
     }
 
     #[test]

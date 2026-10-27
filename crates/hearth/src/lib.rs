@@ -360,21 +360,46 @@ pub fn surface_of(events: &[Event]) -> Vec<Event> {
         .collect()
 }
 
-/// Last `TurnStart` without a later `TurnEnd`, walking the EventLog in order.
-pub fn open_turn_of(events: &[Event]) -> Option<(u64, AgentId)> {
-    let mut open = None;
+/// Every `TurnStart` without a later `TurnEnd` by the same Agent, in start
+/// order. A `TurnEnd { agent }` closes only that Agent's open turn, so many
+/// Agents may each hold one open turn on the same Session.
+///
+/// The log carries Agent, not Binding, on `TurnStart` / `TurnEnd`, so this
+/// assumes **at most one open turn per Agent** (≤1 live Binding per Agent,
+/// as [`Session::rebind`] enforces). Two `bind_agent` Bindings of the same
+/// Agent may each hold a live turn in the map, but the log replay collapses
+/// them to that Agent's latest `TurnStart`.
+pub fn open_turns_of(events: &[Event]) -> Vec<(u64, AgentId)> {
+    let mut open: Vec<(u64, AgentId)> = Vec::new();
     for e in events {
         match &e.body {
             EventBody::TurnStart { agent } => {
-                open = e.turn.map(|t| (t, *agent));
+                open.retain(|(_, a)| a != agent);
+                if let Some(t) = e.turn {
+                    open.push((t, *agent));
+                }
             }
-            EventBody::TurnEnd { .. } => {
-                open = None;
+            EventBody::TurnEnd { agent } => {
+                open.retain(|(_, a)| a != agent);
             }
             _ => {}
         }
     }
     open
+}
+
+/// Most recently started still-open turn on the EventLog (any Agent).
+/// See [`open_turns_of`] for the per-Agent view.
+pub fn open_turn_of(events: &[Event]) -> Option<(u64, AgentId)> {
+    open_turns_of(events).pop()
+}
+
+/// `agent`'s still-open turn on the EventLog, if any.
+pub fn open_turn_of_agent(events: &[Event], agent: AgentId) -> Option<u64> {
+    open_turns_of(events)
+        .into_iter()
+        .find(|(_, a)| *a == agent)
+        .map(|(t, _)| t)
 }
 
 /// Highest [`EventBody::TurnFenced`] fence on the EventLog (0 if none).
@@ -457,7 +482,20 @@ struct SessionData {
     next_turn_id: u64,
     next_seq_id: u64,
     last_read: Option<u64>,
-    current_turn: Option<u64>,
+    /// Open turns keyed by the owning [`Binding`] (not Agent): a remint
+    /// (`rebind(Some(old), ..)`) moves the entry to the new Binding so an
+    /// open turn is never orphaned. Many Bindings may each hold one open
+    /// turn. An entry may outlive its Binding (unbind mid-turn); it then
+    /// still owns its Agent's events until `turn_end` / a superseding
+    /// `turn_start`.
+    current_turn: HashMap<BindingId, OpenTurn>,
+}
+
+/// One open turn in [`SessionData::current_turn`]. Bookkeeping, not a noun.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OpenTurn {
+    turn: u64,
+    agent: AgentId,
 }
 
 impl SessionData {
@@ -470,20 +508,118 @@ impl SessionData {
             next_turn_id: 1,
             next_seq_id: 1,
             last_read: None,
-            current_turn: None,
+            current_turn: HashMap::new(),
         }
     }
 
+    /// Append with the owner's turn ([`Self::turn_for`]).
     fn push(&mut self, body: EventBody) -> Event {
+        let turn = self.turn_for(&body);
+        self.push_turn(body, turn)
+    }
+
+    fn push_turn(&mut self, body: EventBody, turn: Option<u64>) -> Event {
         let event = Event {
             id: EventId::new(),
             seq: None,
-            turn: self.current_turn,
+            turn,
             ts: now_ts(),
             body,
         };
         self.events.push(event.clone());
         event
+    }
+
+    /// A live Binding of `agent` (lowest id if several, for determinism).
+    fn live_binding_of(&self, agent: AgentId) -> Option<BindingId> {
+        self.bindings
+            .values()
+            .filter(|b| b.agent == Some(agent))
+            .map(|b| b.id)
+            .min_by_key(|id| id.0)
+    }
+
+    /// `agent`'s open turn: prefer an entry on a live Binding, then any
+    /// (released-Binding) entry; lowest turn id among ties.
+    fn turn_of_agent(&self, agent: AgentId) -> Option<(BindingId, u64)> {
+        self.current_turn
+            .iter()
+            .filter(|(_, o)| o.agent == agent)
+            .min_by_key(|(b, o)| (!self.bindings.contains_key(b), o.turn))
+            .map(|(b, o)| (*b, o.turn))
+    }
+
+    /// The one open turn if exactly one is open (owner-less bodies).
+    fn sole_turn(&self) -> Option<u64> {
+        let mut it = self.current_turn.values();
+        match (it.next(), it.next()) {
+            (Some(o), None) => Some(o.turn),
+            _ => None,
+        }
+    }
+
+    /// Which turn stamps `body`: the owner's turn. Agent-bearing bodies use
+    /// that Agent's turn (none → `None`, never another Agent's turn);
+    /// RPC permission bodies use the RPC Binding's turn; step / fence use
+    /// their `turn_id`. Owner-less bodies (user message, wake, config,
+    /// bind, compact) get the sole open turn, or `None` when 0 or ≥2 are
+    /// open.
+    fn turn_for(&self, body: &EventBody) -> Option<u64> {
+        use EventBody as B;
+        match body {
+            B::StepCompleted { turn_id, .. } | B::TurnFenced { turn_id, .. } => Some(*turn_id),
+            B::PermissionAsked {
+                rpc: Some(rpc),
+                agent,
+                ..
+            } => self
+                .current_turn
+                .get(&rpc.binding)
+                .map(|o| o.turn)
+                .or_else(|| self.turn_of_agent(*agent).map(|(_, t)| t)),
+            B::PermissionDecided { rpc: Some(rpc), .. } => {
+                self.current_turn.get(&rpc.binding).map(|o| o.turn)
+            }
+            B::AgentMessage { agent, .. }
+            | B::AgentThink { agent, .. }
+            | B::ToolCall { agent, .. }
+            | B::ToolResult { agent, .. }
+            | B::ToolCallInterrupted { agent, .. }
+            | B::AskUser { agent, .. }
+            | B::PermissionAsked { agent, .. }
+            | B::TurnStart { agent }
+            | B::TurnEnd { agent }
+            | B::MemberJoin {
+                member: Member::Agent(agent),
+            }
+            | B::MemberLeave {
+                member: Member::Agent(agent),
+            } => self.turn_of_agent(*agent).map(|(_, t)| t),
+            _ => self.sole_turn(),
+        }
+    }
+
+    /// Open a turn owned by live `binding`. Refuses a second open turn on
+    /// the same Binding ([`WaitReason::TurnOpen`]). Other Bindings' turns
+    /// are untouched. A released-Binding entry of the same Agent is
+    /// superseded (dropped).
+    fn start_turn(&mut self, binding: BindingId) -> Result<Event> {
+        let agent = self
+            .bindings
+            .get(&binding)
+            .ok_or(Error::UnknownBinding(binding))?
+            .agent
+            .ok_or(Error::UnknownBinding(binding))?;
+        if self.current_turn.contains_key(&binding) {
+            return Err(Error::Waiting(WaitReason::TurnOpen));
+        }
+        let live: HashSet<BindingId> = self.bindings.keys().copied().collect();
+        self.current_turn
+            .retain(|b, o| o.agent != agent || live.contains(b));
+        let turn = self.next_turn_id;
+        self.next_turn_id += 1;
+        self.current_turn.insert(binding, OpenTurn { turn, agent });
+        Ok(self.push_turn(EventBody::TurnStart { agent }, Some(turn)))
     }
 }
 
@@ -945,6 +1081,10 @@ impl Session {
                 binding: binding.id,
             });
             if let Some(old) = expected {
+                // Remint keeps an open turn: it follows the Binding lineage.
+                if let Some(open) = data.current_turn.remove(&old) {
+                    data.current_turn.insert(binding.id, open);
+                }
                 if data.bindings.remove(&old).is_some() {
                     data.push(EventBody::BindingReleased { binding: old });
                 }
@@ -976,10 +1116,15 @@ impl Session {
         if !data.bindings.contains_key(&binding) {
             return Err(Error::UnknownBinding(binding));
         }
-        Ok(data.push(EventBody::UserMessage {
-            user,
-            text: text.into(),
-        }))
+        // Only this Binding's own turn — never another Binding's sole turn.
+        let turn = data.current_turn.get(&binding).map(|o| o.turn);
+        Ok(data.push_turn(
+            EventBody::UserMessage {
+                user,
+                text: text.into(),
+            },
+            turn,
+        ))
     }
 
     /// Release a binding. The session and its log remain.
@@ -1026,20 +1171,46 @@ impl Session {
         crate::place_memory::pre_compact_handoff(self, memory, binding, start, end, working)
     }
 
+    /// Open a turn on `agent`'s live Binding ([`Self::turn_start_on`]).
+    /// No live Binding → [`WaitReason::NoBinding`].
     pub fn turn_start(&self, agent: AgentId) -> Result<Event> {
         self.write(|data| {
-            let turn = data.next_turn_id;
-            data.next_turn_id += 1;
-            data.current_turn = Some(turn);
-            Ok(data.push(EventBody::TurnStart { agent }))
+            let binding = data
+                .live_binding_of(agent)
+                .ok_or(Error::Waiting(WaitReason::NoBinding))?;
+            data.start_turn(binding)
         })
     }
 
+    /// Open a turn owned by `binding` (its `agent` must be set, else
+    /// [`Error::UnknownBinding`]). Allocates `next_turn_id`; the
+    /// `TurnStart` and later events of that Agent carry it. Same Binding
+    /// already in a turn → [`Error::Waiting`]`(`[`WaitReason::TurnOpen`]`)`.
+    /// Other Bindings' open turns do not block (no conflict gate here).
+    pub fn turn_start_on(&self, binding: BindingId) -> Result<Event> {
+        self.write(|data| data.start_turn(binding))
+    }
+
+    /// Close `agent`'s open turn (`TurnEnd` stamped with it). Lenient: with
+    /// no open turn the `TurnEnd` is appended unstamped.
     pub fn turn_end(&self, agent: AgentId) -> Result<Event> {
         self.write(|data| {
-            let event = data.push(EventBody::TurnEnd { agent });
-            data.current_turn = None;
-            Ok(event)
+            let turn = data.turn_of_agent(agent).map(|(b, t)| {
+                data.current_turn.remove(&b);
+                t
+            });
+            Ok(data.push_turn(EventBody::TurnEnd { agent }, turn))
+        })
+    }
+
+    /// Close the turn owned by `binding`. No open turn → [`Error::TurnNotOpen`].
+    pub fn turn_end_on(&self, binding: BindingId) -> Result<Event> {
+        self.write(|data| {
+            let open = data
+                .current_turn
+                .remove(&binding)
+                .ok_or(Error::TurnNotOpen)?;
+            Ok(data.push_turn(EventBody::TurnEnd { agent: open.agent }, Some(open.turn)))
         })
     }
 
@@ -1064,11 +1235,36 @@ impl Session {
         self.read(|data| data.next_seq_id)
     }
 
+    /// Session-level compat view: the oldest (lowest id) open turn of any
+    /// Binding. Prefer [`Self::current_turn_on`] / [`Self::current_turn_of`].
     pub fn current_turn(&self) -> Result<Option<u64>> {
-        self.read(|data| data.current_turn)
+        self.read(|data| data.current_turn.values().map(|o| o.turn).min())
     }
 
-    /// Last `TurnStart` without a later `TurnEnd` on this session's EventLog.
+    /// Open turn owned by `binding`, if any.
+    pub fn current_turn_on(&self, binding: BindingId) -> Result<Option<u64>> {
+        self.read(|data| data.current_turn.get(&binding).map(|o| o.turn))
+    }
+
+    /// `agent`'s open turn (on its live Binding, else a released one).
+    pub fn current_turn_of(&self, agent: AgentId) -> Result<Option<u64>> {
+        self.read(|data| data.turn_of_agent(agent).map(|(_, t)| t))
+    }
+
+    /// Every open turn as `(owner Binding, turn id)`, sorted by turn id.
+    pub fn current_turns(&self) -> Result<Vec<(BindingId, u64)>> {
+        self.read(|data| {
+            let mut v: Vec<_> = data
+                .current_turn
+                .iter()
+                .map(|(b, o)| (*b, o.turn))
+                .collect();
+            v.sort_by_key(|(_, t)| *t);
+            v
+        })
+    }
+
+    /// Most recently started still-open turn on this session's EventLog.
     pub fn open_turn(&self) -> Result<Option<u64>> {
         self.read(|data| open_turn_of(&data.events).map(|(t, _)| t))
     }
@@ -1092,11 +1288,37 @@ impl Session {
         })
     }
 
-    /// Set [`Self::current_turn`] from the EventLog (`TurnStart` without `TurnEnd`).
+    /// Rebuild the per-Binding turn map from the EventLog
+    /// ([`open_turns_of`]). Each open turn keeps its current key if that
+    /// Binding is live, else moves to its Agent's live Binding, else keeps
+    /// a released key; an open turn with neither stays log-only. Returns
+    /// [`open_turn_of`] (most recent open turn).
     pub fn restore_open_turn(&self) -> Result<Option<u64>> {
         self.write(|data| {
-            data.current_turn = open_turn_of(&data.events).map(|(t, _)| t);
-            Ok(data.current_turn)
+            let open = open_turns_of(&data.events);
+            let mut map = HashMap::new();
+            for (turn, agent) in &open {
+                let existing = data
+                    .current_turn
+                    .iter()
+                    .find(|(_, o)| o.turn == *turn)
+                    .map(|(b, _)| *b);
+                let key = match existing {
+                    Some(b) if data.bindings.contains_key(&b) => Some(b),
+                    _ => data.live_binding_of(*agent).or(existing),
+                };
+                if let Some(b) = key {
+                    map.insert(
+                        b,
+                        OpenTurn {
+                            turn: *turn,
+                            agent: *agent,
+                        },
+                    );
+                }
+            }
+            data.current_turn = map;
+            Ok(open.last().map(|(t, _)| *t))
         })
     }
 
@@ -1109,11 +1331,29 @@ impl Session {
     /// remint, [`crate::Runtime::resume_interrupted_turn`], and the open-turn
     /// re-keep adopt path in [`crate::Runtime::begin_turn_with`] — never
     /// Completed-without-output, never Cancelled.
+    ///
+    /// Session-wide sweep (every Agent). Recovery paths (wire remint,
+    /// resume, re-keep adopt) must use [`Self::finalize_unmatched_tool_calls_of`]
+    /// so another Agent's live ToolCall under a concurrent turn is untouched.
     pub fn finalize_unmatched_tool_calls(&self) -> Result<usize> {
+        self.finalize_unmatched(None)
+    }
+
+    /// [`Self::finalize_unmatched_tool_calls`] scoped to `agent`'s own
+    /// unmatched ToolCalls. Per-Binding turns: recovering one Agent never
+    /// interrupts another Agent's in-flight tool.
+    pub fn finalize_unmatched_tool_calls_of(&self, agent: AgentId) -> Result<usize> {
+        self.finalize_unmatched(Some(agent))
+    }
+
+    fn finalize_unmatched(&self, only: Option<AgentId>) -> Result<usize> {
         self.write(|data| {
             let orphans = unmatched_tool_calls(&data.events);
             let mut n = 0usize;
             for (agent, tool_call_id, name) in orphans {
+                if only.is_some_and(|a| a != agent) {
+                    continue;
+                }
                 if tool_call_is_terminal(&data.events, &tool_call_id) {
                     continue;
                 }
@@ -1743,6 +1983,7 @@ mod tests {
         let store = InMemory::new();
         let agent = store.create_agent("cli", "");
         let session = store.create_session();
+        session.bind_agent(agent.id, "cli", None, None).unwrap();
         assert_eq!(session.next_turn_id().unwrap(), 1);
         let start = session.turn_start(agent.id).unwrap();
         assert_eq!(session.next_turn_id().unwrap(), 2);
@@ -1766,6 +2007,259 @@ mod tests {
             .unwrap();
         assert_eq!(later.turn, None);
         assert_eq!(session.next_turn_id().unwrap(), 2);
+    }
+
+    #[test]
+    fn turn_start_without_binding_waits() {
+        let store = InMemory::new();
+        let agent = store.create_agent("cli", "");
+        let session = store.create_session();
+        assert!(matches!(
+            session.turn_start(agent.id),
+            Err(Error::Waiting(WaitReason::NoBinding))
+        ));
+        assert!(session.events().unwrap().is_empty());
+    }
+
+    fn agent_msg(session: &Session, agent: AgentId, text: &str) -> Event {
+        session
+            .append(EventBody::AgentMessage {
+                agent,
+                text: text.into(),
+            })
+            .unwrap()
+    }
+
+    /// Per-Binding turn map: two Agents (two Bindings) hold open turns at
+    /// once; each Agent's events carry its own turn id; ending one leaves
+    /// the other open.
+    #[test]
+    fn two_bindings_hold_concurrent_turns_with_own_stamps() {
+        let store = InMemory::new();
+        let a = store.create_agent("a", "");
+        let b = store.create_agent("b", "");
+        let session = store.create_session();
+        let ba = session.bind_agent(a.id, "cli", None, None).unwrap();
+        let bb = session.bind_agent(b.id, "cli", None, None).unwrap();
+
+        let ta = session.turn_start(a.id).unwrap().turn.unwrap();
+        let tb = session.turn_start_on(bb.id).unwrap().turn.unwrap();
+        assert_ne!(ta, tb);
+        assert_eq!(session.current_turn_on(ba.id).unwrap(), Some(ta));
+        assert_eq!(session.current_turn_on(bb.id).unwrap(), Some(tb));
+        assert_eq!(session.current_turn_of(a.id).unwrap(), Some(ta));
+        assert_eq!(session.current_turn_of(b.id).unwrap(), Some(tb));
+        assert_eq!(
+            session.current_turns().unwrap(),
+            vec![(ba.id, ta), (bb.id, tb)]
+        );
+
+        assert_eq!(agent_msg(&session, a.id, "a1").turn, Some(ta));
+        assert_eq!(agent_msg(&session, b.id, "b1").turn, Some(tb));
+        let tc = session
+            .append(EventBody::ToolCall {
+                agent: b.id,
+                tool_call_id: "t1".into(),
+                name: "edit".into(),
+                input: "{}".into(),
+            })
+            .unwrap();
+        assert_eq!(tc.turn, Some(tb));
+        // Owner-less body with two open turns: not attributed to either.
+        let wake = session
+            .append(EventBody::Wake {
+                source: WakeSource::Timer,
+            })
+            .unwrap();
+        assert_eq!(wake.turn, None);
+
+        let end_a = session.turn_end(a.id).unwrap();
+        assert_eq!(end_a.turn, Some(ta));
+        assert_eq!(session.current_turn_of(a.id).unwrap(), None);
+        assert_eq!(session.current_turn_of(b.id).unwrap(), Some(tb));
+        assert_eq!(agent_msg(&session, a.id, "a2").turn, None);
+        assert_eq!(agent_msg(&session, b.id, "b2").turn, Some(tb));
+        // Sole open turn again: owner-less bodies take it (compat).
+        let w2 = session
+            .append(EventBody::Wake {
+                source: WakeSource::Timer,
+            })
+            .unwrap();
+        assert_eq!(w2.turn, Some(tb));
+        assert_eq!(open_turns_of(&session.events().unwrap()), vec![(tb, b.id)]);
+
+        let end_b = session.turn_end_on(bb.id).unwrap();
+        assert_eq!(end_b.turn, Some(tb));
+        assert!(session.current_turns().unwrap().is_empty());
+        assert!(open_turns_of(&session.events().unwrap()).is_empty());
+        assert!(matches!(
+            session.turn_end_on(bb.id),
+            Err(Error::TurnNotOpen)
+        ));
+    }
+
+    /// Later starter ends first: B starts after A, B ends first; A's turn
+    /// stays open and keeps stamping A's events. Kills the "turn_end closes
+    /// the oldest open turn of any Agent" mutant.
+    #[test]
+    fn later_starter_ends_first_leaves_earlier_turn_open() {
+        let store = InMemory::new();
+        let a = store.create_agent("a", "");
+        let b = store.create_agent("b", "");
+        let session = store.create_session();
+        let ba = session.bind_agent(a.id, "cli", None, None).unwrap();
+        let bb = session.bind_agent(b.id, "cli", None, None).unwrap();
+        let ta = session.turn_start(a.id).unwrap().turn.unwrap();
+        let tb = session.turn_start(b.id).unwrap().turn.unwrap();
+        assert!(tb > ta, "B started later");
+
+        let end_b = session.turn_end(b.id).unwrap();
+        assert_eq!(end_b.turn, Some(tb), "B's TurnEnd stamps B's turn");
+        assert!(matches!(end_b.body, EventBody::TurnEnd { agent } if agent == b.id));
+        assert_eq!(session.current_turn_of(a.id).unwrap(), Some(ta));
+        assert_eq!(session.current_turn_on(ba.id).unwrap(), Some(ta));
+        assert_eq!(session.current_turn_of(b.id).unwrap(), None);
+        assert_eq!(session.current_turn_on(bb.id).unwrap(), None);
+        assert_eq!(session.current_turns().unwrap(), vec![(ba.id, ta)]);
+        assert_eq!(agent_msg(&session, a.id, "a-after").turn, Some(ta));
+        assert_eq!(agent_msg(&session, b.id, "b-after").turn, None);
+        assert_eq!(open_turns_of(&session.events().unwrap()), vec![(ta, a.id)]);
+
+        // B may start again while A is still open; then A ends via its Binding.
+        let tb2 = session.turn_start_on(bb.id).unwrap().turn.unwrap();
+        assert_eq!(session.turn_end_on(ba.id).unwrap().turn, Some(ta));
+        assert_eq!(session.current_turns().unwrap(), vec![(bb.id, tb2)]);
+        assert_eq!(agent_msg(&session, b.id, "b2").turn, Some(tb2));
+        assert_eq!(agent_msg(&session, a.id, "a-done").turn, None);
+    }
+
+    /// `user_message_on(binding)` stamps only that Binding's own turn: an
+    /// idle Binding never borrows another Binding's sole open turn.
+    #[test]
+    fn user_message_on_idle_binding_is_unstamped() {
+        let store = InMemory::new();
+        let user = store.create_user("cheng");
+        let a = store.create_agent("a", "");
+        let b = store.create_agent("b", "");
+        let session = store.create_session();
+        session.join(Member::User(user.id)).unwrap();
+        let ba = session.bind_agent(a.id, "cli", None, None).unwrap();
+        let bb = session.bind_agent(b.id, "cli", None, None).unwrap();
+        let tb = session.turn_start(b.id).unwrap().turn.unwrap();
+        assert_eq!(
+            session
+                .user_message_on(ba.id, user.id, "to a")
+                .unwrap()
+                .turn,
+            None
+        );
+        assert_eq!(
+            session
+                .user_message_on(bb.id, user.id, "to b")
+                .unwrap()
+                .turn,
+            Some(tb)
+        );
+    }
+
+    /// Agent-scoped finalize leaves another Agent's unmatched ToolCall live.
+    #[test]
+    fn finalize_unmatched_tool_calls_of_is_agent_scoped() {
+        let store = InMemory::new();
+        let a = store.create_agent("a", "");
+        let b = store.create_agent("b", "");
+        let session = store.create_session();
+        for (agent, id) in [(a.id, "a-live"), (b.id, "b-open")] {
+            session
+                .append(EventBody::ToolCall {
+                    agent,
+                    tool_call_id: id.into(),
+                    name: "bash".into(),
+                    input: "{}".into(),
+                })
+                .unwrap();
+        }
+        assert_eq!(session.finalize_unmatched_tool_calls_of(b.id).unwrap(), 1);
+        assert_eq!(session.finalize_unmatched_tool_calls_of(b.id).unwrap(), 0);
+        let log = session.events().unwrap();
+        assert!(tool_call_is_terminal(&log, "b-open"));
+        assert!(!tool_call_is_terminal(&log, "a-live"));
+        assert_eq!(
+            unmatched_tool_calls(&log),
+            vec![(a.id, "a-live".to_string(), "bash".to_string())]
+        );
+    }
+
+    /// Same Binding cannot open a second turn while one is open.
+    #[test]
+    fn same_binding_double_turn_start_refuses() {
+        let store = InMemory::new();
+        let a = store.create_agent("a", "");
+        let session = store.create_session();
+        let ba = session.bind_agent(a.id, "cli", None, None).unwrap();
+        let t = session.turn_start(a.id).unwrap().turn.unwrap();
+        let len = session.events().unwrap().len();
+        assert!(matches!(
+            session.turn_start(a.id),
+            Err(Error::Waiting(WaitReason::TurnOpen))
+        ));
+        assert!(matches!(
+            session.turn_start_on(ba.id),
+            Err(Error::Waiting(WaitReason::TurnOpen))
+        ));
+        assert_eq!(session.events().unwrap().len(), len, "no event");
+        assert_eq!(session.next_turn_id().unwrap(), t + 1, "no id burned");
+        assert_eq!(session.current_turn_on(ba.id).unwrap(), Some(t));
+    }
+
+    /// Remint (`rebind(Some(old))`) moves the open turn to the new Binding:
+    /// not orphaned, still stamps, and `turn_end` closes it.
+    #[test]
+    fn rebind_moves_open_turn_to_new_binding() {
+        let store = InMemory::new();
+        let a = store.create_agent("a", "");
+        let session = store.create_session();
+        let old = session.bind_agent(a.id, "cli", None, None).unwrap();
+        let t = session.turn_start(a.id).unwrap().turn.unwrap();
+        let new = session
+            .rebind(Some(old.id), a.id, HostKind::Goose.host(None, None))
+            .unwrap();
+        assert_eq!(session.current_turn_on(old.id).unwrap(), None);
+        assert_eq!(session.current_turn_on(new.id).unwrap(), Some(t));
+        assert_eq!(agent_msg(&session, a.id, "after remint").turn, Some(t));
+        assert!(matches!(
+            session.turn_start_on(new.id),
+            Err(Error::Waiting(WaitReason::TurnOpen))
+        ));
+        assert_eq!(session.turn_end(a.id).unwrap().turn, Some(t));
+        assert!(session.current_turns().unwrap().is_empty());
+    }
+
+    /// `restore_open_turn` rebuilds every Agent's open turn from the log,
+    /// keyed by each Agent's live Binding.
+    #[test]
+    fn restore_open_turn_rebuilds_per_binding_map() {
+        let store = InMemory::new();
+        let a = store.create_agent("a", "");
+        let b = store.create_agent("b", "");
+        let session = store.create_session();
+        let ba = session.bind_agent(a.id, "cli", None, None).unwrap();
+        let bb = session.bind_agent(b.id, "cli", None, None).unwrap();
+        let ta = session.turn_start(a.id).unwrap().turn.unwrap();
+        let tb = session.turn_start(b.id).unwrap().turn.unwrap();
+        session
+            .write(|d| {
+                d.current_turn.clear();
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(session.restore_open_turn().unwrap(), Some(tb));
+        assert_eq!(session.current_turn_on(ba.id).unwrap(), Some(ta));
+        assert_eq!(session.current_turn_on(bb.id).unwrap(), Some(tb));
+        assert_eq!(
+            open_turn_of_agent(&session.events().unwrap(), a.id),
+            Some(ta)
+        );
     }
 
     #[test]
