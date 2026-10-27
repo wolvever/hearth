@@ -1328,7 +1328,7 @@ mod tests {
     use crate::catalog::{lookup_profile, LaunchSpec};
     use crate::transport::{Transport, WireFrame};
     use crate::RpcId;
-    use crate::{AgentEvent, CodingAgent, FramedAgent};
+    use crate::{AgentEvent, CodingAgent, FramedAgent, PermissionOption};
     use remint::{
         flush_and_teardown_old_wire, write_new_wire_attach_resume, LiveCaps, OldWireWrite,
         RemintError, RemintEventKind, RemintSession, RemintWireMethod, WireAction,
@@ -4188,6 +4188,267 @@ mod tests {
         assert!(session.current_turn_of(a).unwrap().is_some());
         assert!(session.current_turn_of(b).unwrap().is_none());
         assert!(new_b.stdin_log().unwrap().is_empty());
+    }
+
+    fn perm_opts() -> Vec<PermissionOption> {
+        vec![
+            PermissionOption {
+                option_id: "allow-once".into(),
+                name: "Allow".into(),
+                kind: "allow_once".into(),
+            },
+            PermissionOption {
+                option_id: "reject-once".into(),
+                name: "Reject".into(),
+                kind: "reject_once".into(),
+            },
+        ]
+    }
+
+    /// Concurrent-wake-remint-proof (#46–#57 lock floor): extend #54 so the
+    /// concurrent path is driven by wake fan-out
+    /// (`wake_each_kept_through_host_wake`), not only manual `begin_turn`.
+    /// Two ParallelSafe Agents; one shared UserMessage → both LiveInTurn
+    /// (first-only mutant fails); both mid-turn with pending asks (B
+    /// subagent-parented); remint A then B resurfaces both with parents;
+    /// raw `turn_lease_of` / `turn_fence_of` pins stay independent; no
+    /// cross-Agent lease / fence / Binding steal.
+    #[test]
+    fn concurrent_wake_remint_through_host_wake_resurfaces_asks_independent_leases_fences() {
+        let (rt, sid, uid, a, b, remint_a, remint_b, place) = shared_runtime_two_agents();
+        for (ag, path) in [(a, "a"), (b, "b")] {
+            rt.set_parallel_safe(sid, ag, Some(hearth::ParallelSafe::paths([path])))
+                .expect("opt in");
+        }
+        let session = rt.store().session(sid).unwrap();
+
+        // Wake fan-out (Host path): both LiveInTurn + one shared UserMessage.
+        let mut old_a = initialized_fake(Vec::new());
+        let mut new_a = new_wire_fake();
+        let mut old_b = initialized_fake(Vec::new());
+        let mut new_b = new_wire_fake();
+        let r = run_each_kept(
+            &rt,
+            sid,
+            hearth::Wake::UserQuery {
+                user: uid,
+                text: "hi-both".into(),
+            },
+            &remint_a,
+            &remint_b,
+            &place,
+            OldWire::LiveIdle,
+            OldWire::LiveIdle,
+            &mut old_a,
+            &mut new_a,
+            &mut old_b,
+            &mut new_b,
+        )
+        .expect("host wake each kept");
+        let WakeEachKeptThroughHost::Woke { hosts, woke } = r else {
+            panic!("expected Woke, got {r:?}");
+        };
+        assert_eq!(
+            hosts.iter().map(|(ag, _)| *ag).collect::<Vec<_>>(),
+            vec![a, b],
+            "host_wake keep order; first-only mutant fails"
+        );
+        assert!(hosts.iter().all(|(_, h)| *h == HostWake::ReuseLive));
+        let who: Vec<_> = woke.iter().map(|(ag, _)| *ag).collect();
+        assert_eq!(
+            who,
+            vec![a, b],
+            "both Agents TurnStart via wake fan-out; first-only fails"
+        );
+        assert_eq!(rt.classify(sid, a).unwrap(), hearth::Liveness::LiveInTurn);
+        assert_eq!(rt.classify(sid, b).unwrap(), hearth::Liveness::LiveInTurn);
+        let log = session.events().unwrap();
+        let ums: Vec<_> = log
+            .iter()
+            .filter(|e| matches!(e.body, hearth::EventBody::UserMessage { .. }))
+            .collect();
+        assert_eq!(ums.len(), 1, "one shared UserMessage");
+        assert!(matches!(
+            &ums[0].body,
+            hearth::EventBody::UserMessage { text, .. } if text == "hi-both"
+        ));
+        let turn_starts: Vec<_> = log
+            .iter()
+            .filter_map(|e| match &e.body {
+                hearth::EventBody::TurnStart { agent } => Some(*agent),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            turn_starts,
+            vec![a, b],
+            "both TurnStart; first-only wake mutant fails"
+        );
+
+        // Attach per-Agent leases onto the wake-opened turns (begin_turn after
+        // wake — same compose as Runtime begin_turn_after_wake_attaches_lease).
+        let (ta, fa, _) = rt
+            .begin_turn(sid, a, hearth::HolderId::new("ha"))
+            .expect("lease A");
+        let (tb, fb, _) = rt
+            .begin_turn(sid, b, hearth::HolderId::new("hb"))
+            .expect("lease B");
+        assert_ne!(ta, tb);
+        assert_eq!(session.turn_fence_of(a).unwrap(), fa);
+        assert_eq!(session.turn_fence_of(b).unwrap(), fb);
+        let pin_lease = |agent, holder: &str, turn, fence| {
+            let lease = rt.turn_lease_of(sid, agent).unwrap().expect("live lease");
+            assert_eq!(
+                (lease.agent, lease.holder, lease.turn_id, lease.fence),
+                (agent, hearth::HolderId::new(holder), turn, fence),
+                "raw turn_lease_of pin (not is_none)"
+            );
+        };
+        pin_lease(a, "ha", ta, fa);
+        pin_lease(b, "hb", tb, fb);
+
+        // Mid-turn pending asks: A controller; B subagent-parented (#49/#50).
+        remint_a.begin_turn("work-a");
+        remint_b.begin_turn("work-b");
+        let ask_a = remint_a
+            .request_permission(RpcId::Num(1), Some("call_a"), "git log", perm_opts())
+            .unwrap();
+        let ask_b = remint_b
+            .request_permission_under(
+                RpcId::Num(1),
+                Some("toolu_sub"),
+                Some("toolu_task"),
+                "npm test",
+                perm_opts(),
+            )
+            .unwrap();
+        assert_eq!(ask_a.parent_tool_call_id, None);
+        assert_eq!(ask_b.parent_tool_call_id.as_deref(), Some("toolu_task"));
+        assert_eq!(remint_a.pending_permissions().len(), 1);
+        assert_eq!(remint_b.pending_permissions().len(), 1);
+
+        // Remint A first: A's ask resurfaces; B's lease + fence untouched.
+        let oa = remint_a.remint_and_attach().unwrap();
+        assert!(oa.permission_resurfaced && !oa.turn_interrupted);
+        assert!(oa.wire_actions.contains(&WireAction::AttachResume));
+        assert_eq!(
+            remint_a
+                .resurfaced_permissions()
+                .iter()
+                .map(|p| p.as_ref())
+                .collect::<Vec<_>>(),
+            std::slice::from_ref(&ask_a)
+        );
+        assert!(remint_a.observe().iter().any(|e| matches!(
+            &e.kind,
+            RemintEventKind::PermissionResurface(r)
+                if r == &ask_a && r.parent_tool_call_id.is_none()
+        )));
+        assert_eq!(remint_b.pending_permissions().len(), 1);
+        assert!(remint_b.resurfaced_permissions().is_empty());
+        pin_lease(a, "ha", ta, fa);
+        pin_lease(b, "hb", tb, fb);
+        assert_eq!(session.turn_fence_of(a).unwrap(), fa);
+        assert_eq!(
+            session.turn_fence_of(b).unwrap(),
+            fb,
+            "A's remint must not move B's fence"
+        );
+
+        // Remint B: B's ask resurfaces with parent; A's resurfaced ask +
+        // lease/fence stay; Host Bindings stay independent.
+        let ob = remint_b.remint_and_attach().unwrap();
+        assert!(ob.permission_resurfaced && !ob.turn_interrupted);
+        assert!(ob.wire_actions.contains(&WireAction::AttachResume));
+        let host_a = remint_a
+            .host_binding_of(&oa.binding_id)
+            .expect("A host bind");
+        let host_b = remint_b
+            .host_binding_of(&ob.binding_id)
+            .expect("B host bind");
+        assert_ne!(host_a, host_b, "no cross-Agent Host Binding steal");
+        assert_eq!(
+            remint_b
+                .resurfaced_permissions()
+                .iter()
+                .map(|p| p.as_ref())
+                .collect::<Vec<_>>(),
+            std::slice::from_ref(&ask_b)
+        );
+        assert!(remint_b.observe().iter().any(|e| matches!(
+            &e.kind,
+            RemintEventKind::PermissionResurface(r)
+                if r == &ask_b
+                    && r.parent_tool_call_id.as_deref() == Some("toolu_task")
+        )));
+        assert_eq!(
+            remint_a
+                .resurfaced_permissions()
+                .iter()
+                .map(|p| p.as_ref())
+                .collect::<Vec<_>>(),
+            std::slice::from_ref(&ask_a),
+            "A's resurfaced ask survives B's remint"
+        );
+        pin_lease(a, "ha", ta, fa);
+        pin_lease(b, "hb", tb, fb);
+        assert_eq!(session.turn_fence_of(a).unwrap(), fa);
+        assert_eq!(session.turn_fence_of(b).unwrap(), fb);
+
+        // Dead Binding refuse stays per-Agent (no cross answer).
+        assert_eq!(
+            remint_a.resolve_permission(&ask_a.binding, &ask_a.rpc_id, "allow-once"),
+            Err(RemintError::DeadBinding)
+        );
+        assert_eq!(
+            remint_b.resolve_permission(&ask_b.binding, &ask_b.rpc_id, "allow-once"),
+            Err(RemintError::DeadBinding)
+        );
+
+        // Soft Should (#53): pin turn_lease_of(B).fence after A's raise.
+        rt.end_turn(sid, "ha".into(), fa, true).unwrap();
+        let (ta2, fa2, _) = rt.resume_interrupted_turn(sid, a, "ha2".into()).unwrap();
+        assert_eq!(ta2, ta);
+        assert!(fa2 > fa, "A's own fence must rise on resume");
+        let lease_b = rt.turn_lease_of(sid, b).unwrap().expect("B live");
+        assert_eq!(
+            (
+                lease_b.agent,
+                lease_b.holder,
+                lease_b.turn_id,
+                lease_b.fence
+            ),
+            (b, hearth::HolderId::new("hb"), tb, fb),
+            "turn_lease_of(B).fence pinned after A's raise — no steal"
+        );
+        assert_eq!(session.turn_fence_of(b).unwrap(), fb);
+        rt.durable_step(sid, "hb".into(), fb, tb, "b-ok", || Ok("b".into()))
+            .unwrap();
+        assert!(matches!(
+            rt.durable_step(sid, "ha2".into(), fa, ta, "zombie", || {
+                panic!("zombie must not run")
+            }),
+            Err(hearth::Error::TurnLeaseLost)
+        ));
+        rt.durable_step(sid, "ha2".into(), fa2, ta, "a-ok", || Ok("a".into()))
+            .unwrap();
+
+        assert_eq!(
+            remint_a
+                .resurfaced_permissions()
+                .iter()
+                .map(|p| p.parent_tool_call_id.as_deref())
+                .collect::<Vec<_>>(),
+            [None]
+        );
+        assert_eq!(
+            remint_b
+                .resurfaced_permissions()
+                .iter()
+                .map(|p| p.parent_tool_call_id.as_deref())
+                .collect::<Vec<_>>(),
+            [Some("toolu_task")]
+        );
     }
 
     /// tick_through_host_wake addresses each due (Session, Agent): A with a
