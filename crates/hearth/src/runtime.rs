@@ -26,13 +26,14 @@
 //!
 //! Intra-turn durable steps: [`Runtime::begin_turn`] / [`Runtime::end_turn`] hold a
 //! [`SessionTurnLease`] (holder + fence) **per kept Agent** on the Session. The
-//! fence stays shared on the Session ([`crate::EventBody::TurnFenced`],
-//! [`Session::turn_fence`]), not in the kept map, so re-keep / a later Agent's
-//! lease install raises it above every earlier one and an old-fence write is
-//! [`Error::TurnLeaseLost`]. [`Runtime::durable_step`] memoizes via
-//! [`crate::EventBody::StepCompleted`]. [`Runtime::resume_interrupted_turn`]
-//! and the open-turn re-keep adopt path in [`Runtime::begin_turn_with`] both
-//! finalize unmatched tool calls as
+//! fence is also keyed per Agent ([`crate::EventBody::TurnFenced`] with `agent`,
+//! [`Session::turn_fence_of`]): raising one Agent's fence does not
+//! [`Error::TurnLeaseLost`] another Agent's live lease under concurrent
+//! ParallelSafe turns. Same-Agent re-keep / resume still raises that Agent's
+//! fence and an old-fence write is [`Error::TurnLeaseLost`].
+//! [`Runtime::durable_step`] memoizes via [`crate::EventBody::StepCompleted`].
+//! [`Runtime::resume_interrupted_turn`] and the open-turn re-keep adopt path in
+//! [`Runtime::begin_turn_with`] both finalize unmatched tool calls as
 //! [`crate::EventBody::ToolCallInterrupted`] (Indeterminate) via the same
 //! helper as wire remint; resume does **not** remint Binding. Both are
 //! Agent-scoped: they adopt only the kept Agent's own turn / interrupted
@@ -180,14 +181,15 @@ struct KeptAgent {
 }
 
 /// Internal keep record for one Session: every kept Agent's recipe (keep
-/// order) plus a **per-Agent** turn lease map. The fence stays shared on the
-/// Session ([`Session::turn_fence`]); Soft residual: a later Agent's lease
-/// install raises it and can `TurnLeaseLost` an earlier live holder.
+/// order) plus a **per-Agent** turn lease map. The fence is also keyed per
+/// Agent on the Session EventLog ([`Session::turn_fence_of`]): raising one
+/// Agent's fence does not `TurnLeaseLost` another Agent's live lease.
 struct Kept {
     agents: Vec<KeptAgent>,
     /// Live or interrupted turn lease **per Agent**. `holder: None` after a
     /// crash. Keyed by Agent so two ParallelSafe Agents can both hold leases.
-    /// The fence is not here: it is stored on the Session ([`Session::turn_fence`]).
+    /// The fence lives on the Session EventLog keyed by Agent
+    /// ([`Session::turn_fence_of`]), not in this map.
     leases: HashMap<AgentId, TurnLease>,
 }
 
@@ -608,7 +610,7 @@ impl Runtime {
         let agent = lease.agent;
         let turn_id = lease.turn_id;
         drop(g);
-        let fence = self.store.session(session)?.turn_fence()?;
+        let fence = self.store.session(session)?.turn_fence_of(agent)?;
         Ok(Some(SessionTurnLease {
             holder,
             agent,
@@ -633,7 +635,7 @@ impl Runtime {
         };
         let turn_id = lease.turn_id;
         drop(g);
-        let fence = self.store.session(session)?.turn_fence()?;
+        let fence = self.store.session(session)?.turn_fence_of(agent)?;
         Ok(Some(SessionTurnLease {
             holder,
             agent,
@@ -657,12 +659,13 @@ impl Runtime {
     /// An interrupted turn (lease holder dropped while still kept) must use
     /// [`Self::resume_interrupted_turn`].
     ///
-    /// The lease is **per Agent** (within the Session); the fence stays shared
-    /// on the Session. An Agent's `begin_turn` only refuses on **its own**
-    /// lease slot ([`Error::LiveTurnOpen`] live holder, `Waiting(TurnOpen)`
-    /// interrupted). Another Agent's lease does not block at this layer —
-    /// the ParallelSafe conflict gate still serializes undeclared / overlapping
-    /// turns. Un-leased turns via [`Self::wake`] are per Agent.
+    /// The lease and fence are **per Agent** (within the Session). An Agent's
+    /// `begin_turn` only refuses on **its own** lease slot
+    /// ([`Error::LiveTurnOpen`] live holder, `Waiting(TurnOpen)` interrupted).
+    /// Another Agent's lease / fence raise does not block or invalidate at
+    /// this layer — the ParallelSafe conflict gate still serializes
+    /// undeclared / overlapping turns. Un-leased turns via [`Self::wake`]
+    /// are per Agent.
     ///
     /// Kernel default ([`ClaimBinding`]) for tests without a wire. Production
     /// wire Host: route through `begin_turn_through_host_wake`
@@ -861,8 +864,9 @@ impl Runtime {
     }
 
     /// Every new lease (fresh turn, adopted open turn, crash resume) raises
-    /// the shared Session fence and writes **this Agent's** lease slot only.
-    /// Other Agents' slots are untouched (no cross-Agent steal).
+    /// **this Agent's** fence and writes **this Agent's** lease slot only.
+    /// Other Agents' slots and fences are untouched (no cross-Agent steal /
+    /// no cross-Agent `TurnLeaseLost`).
     fn install_lease(
         &self,
         sess: &Session,
@@ -872,7 +876,7 @@ impl Runtime {
     ) -> Result<u64> {
         let mut g = self.lock_kept()?;
         let kept = g.get_mut(&sess.id()).ok_or(Error::NotKept(sess.id()))?;
-        let fence = sess.raise_turn_fence(turn_id)?;
+        let fence = sess.raise_turn_fence(agent, turn_id)?;
         kept.leases.insert(
             agent,
             TurnLease {
@@ -892,11 +896,14 @@ impl Runtime {
     ) -> Result<()> {
         let g = self.lock_kept()?;
         let kept = g.get(&session).ok_or(Error::NotKept(session))?;
-        kept.leases
+        let lease = kept
+            .leases
             .values()
             .find(|l| l.holder.as_ref() == Some(holder))
             .ok_or(Error::SessionNotOwned)?;
-        if self.store.session(session)?.turn_fence()? != fence {
+        let agent = lease.agent;
+        drop(g);
+        if self.store.session(session)?.turn_fence_of(agent)? != fence {
             return Err(Error::TurnLeaseLost);
         }
         Ok(())
@@ -2200,8 +2207,9 @@ mod tests {
     }
 
     /// Dong's probe (2026-10-24): host restart modeled as release + keep.
-    /// The fence is stored on the Session, so adopting the open turn after
-    /// re-keep raises it and a zombie write with the old fence is refused.
+    /// The fence is stored per Agent on the Session EventLog, so adopting
+    /// the open turn after re-keep raises **that Agent's** fence and a
+    /// zombie write with the old fence is refused.
     #[test]
     fn rekeep_adopt_raises_stored_fence_old_fence_is_turn_lease_lost() {
         let rt = Runtime::new();
@@ -2220,7 +2228,7 @@ mod tests {
             fence2 > fence,
             "re-keep must raise fence: {fence} -> {fence2}"
         );
-        assert_eq!(session.turn_fence().unwrap(), fence2);
+        assert_eq!(session.turn_fence_of(agent.id).unwrap(), fence2);
         // Zombie write / end with the OLD fence.
         let zombie = rt.durable_step(session.id(), h.clone(), fence, turn, "zombie", || {
             panic!("zombie step must not run")
@@ -2535,10 +2543,10 @@ mod tests {
         ));
     }
 
-    /// Per-Agent-lease: two ParallelSafe Agents both `begin_turn` and each
-    /// holds its own lease slot. The Session fence stays shared (B's install
-    /// raises it; A's prior fence is then `TurnLeaseLost` — Soft residual).
-    /// Durable steps / end_turn address the holder's Agent slot.
+    /// Fence-by-Agent + Per-Agent-lease: two ParallelSafe Agents both
+    /// `begin_turn` and each holds its own lease + fence. Raising B's fence
+    /// must NOT `TurnLeaseLost` A (closes #52 Soft). Durable steps / end_turn
+    /// address the holder's Agent slot and that Agent's fence.
     #[test]
     fn begin_turn_lease_per_agent_both_parallel_safe() {
         let rt = Runtime::new();
@@ -2555,13 +2563,22 @@ mod tests {
             (lease_a.agent, lease_a.turn_id, lease_a.fence),
             (a.id, ta, fa)
         );
+        assert_eq!(session.turn_fence_of(a.id).unwrap(), fa);
 
         // B leases concurrently — no LiveTurnOpen / Waiting from A's slot.
         let (tb, fb, bb) = rt.begin_turn(sid, b.id, "hb".into()).unwrap();
         assert_ne!(ba, bb);
-        assert!(fb > fa, "shared fence raised on B's install");
+        assert_eq!(session.turn_fence_of(b.id).unwrap(), fb);
+        assert_eq!(
+            session.turn_fence_of(a.id).unwrap(),
+            fa,
+            "B's fence raise must not move A's fence"
+        );
         let lease_b = rt.turn_lease_of(sid, b.id).unwrap().unwrap();
-        assert_eq!((lease_b.agent, lease_b.turn_id), (b.id, tb));
+        assert_eq!(
+            (lease_b.agent, lease_b.turn_id, lease_b.fence),
+            (b.id, tb, fb)
+        );
         assert_eq!(
             lease_slot_of(&rt, sid, a.id),
             Some((a.id, Some(HolderId::new("ha")), ta)),
@@ -2573,24 +2590,66 @@ mod tests {
             "B's live lease in B's slot"
         );
 
-        // Soft shared-fence: A's prior fence is stale after B raised it.
-        assert!(matches!(
-            rt.durable_step(sid, "ha".into(), fa, ta, "s", || Ok("a".into())),
-            Err(Error::TurnLeaseLost)
-        ));
-        // B's fence is current.
+        // Fence-by-Agent: A's prior fence still gates A's lease after B raised.
+        rt.durable_step(sid, "ha".into(), fa, ta, "s", || Ok("a".into()))
+            .unwrap();
         rt.durable_step(sid, "hb".into(), fb, tb, "s", || Ok("b".into()))
             .unwrap();
         rt.end_turn(sid, "hb".into(), fb, false).unwrap();
         assert!(rt.turn_lease_of(sid, b.id).unwrap().is_none());
-        // A's slot still live (stale fence); release_agent drops only A's slot.
+        // A's slot still live and still valid under fa.
         assert_eq!(
             lease_slot_of(&rt, sid, a.id),
             Some((a.id, Some(HolderId::new("ha")), ta))
         );
-        rt.release_agent(sid, a.id).unwrap();
+        rt.end_turn(sid, "ha".into(), fa, false).unwrap();
         assert_eq!(lease_slot_of(&rt, sid, a.id), None);
+        assert!(session.current_turn_of(a.id).unwrap().is_none());
         assert!(session.current_turn_of(b.id).unwrap().is_none());
+    }
+
+    /// Mutant-kill: under ParallelSafe, B's live lease / fence survives A's
+    /// fence raise (install). A mutant that still checks a Session-wide
+    /// fence fails B's durable_step. A's own fence still gates A: a zombie
+    /// old-fence write after A's own raise is `TurnLeaseLost`.
+    #[test]
+    fn parallel_safe_fence_raise_does_not_turn_lease_lost_other_agent() {
+        let rt = Runtime::new();
+        let a = rt.store().create_agent("a", "");
+        let b = rt.store().create_agent("b", "");
+        let session = rt.create_session();
+        let sid = session.id();
+        rt.keep(sid, a.id, goose()).unwrap();
+        rt.keep(sid, b.id, codex()).unwrap();
+        opt_in(&rt, sid, &[a.id, b.id]);
+        let (ta, fa, _) = rt.begin_turn(sid, a.id, "ha".into()).unwrap();
+        let (tb, fb, _) = rt.begin_turn(sid, b.id, "hb".into()).unwrap();
+
+        // Pin: B survives A's later fence raise (resume / re-install path
+        // modeled as end interrupted + resume, which raises A's fence).
+        rt.end_turn(sid, "ha".into(), fa, true).unwrap();
+        let (ta2, fa2, _) = rt.resume_interrupted_turn(sid, a.id, "ha2".into()).unwrap();
+        assert_eq!(ta2, ta);
+        assert!(fa2 > fa, "A's own fence must rise on resume");
+        assert_eq!(
+            session.turn_fence_of(b.id).unwrap(),
+            fb,
+            "A's raise must not move B's fence"
+        );
+        // B's lease still live under fb.
+        rt.durable_step(sid, "hb".into(), fb, tb, "b-ok", || Ok("b".into()))
+            .unwrap();
+        // A's old fence is dead; new fence works.
+        assert!(matches!(
+            rt.durable_step(sid, "ha2".into(), fa, ta, "zombie", || {
+                panic!("zombie must not run")
+            }),
+            Err(Error::TurnLeaseLost)
+        ));
+        rt.durable_step(sid, "ha2".into(), fa2, ta, "a-ok", || Ok("a".into()))
+            .unwrap();
+        rt.end_turn(sid, "hb".into(), fb, false).unwrap();
+        rt.end_turn(sid, "ha2".into(), fa2, false).unwrap();
     }
 
     /// Without ParallelSafe opt-in, the conflict gate still serializes:
@@ -2719,14 +2778,20 @@ mod tests {
     fn resume_leaves_other_agents_interrupted_lease_in_its_slot() {
         let (rt, session, a, b, ta, tb, fb) = b_interrupted_lease_a_concurrent();
         let sid = session.id();
-        let fence_before = session.turn_fence().unwrap();
+        let a_fence_before = session.turn_fence_of(a.id).unwrap();
+        let b_fence_before = session.turn_fence_of(b.id).unwrap();
         let turns_before = session.current_turns().unwrap();
 
         // A adopts its own open turn into A's slot — B's interrupted lease
         // stays in B's slot (no cross-Agent steal).
         let (t, fa, _) = rt.resume_interrupted_turn(sid, a.id, "ha".into()).unwrap();
         assert_eq!(t, ta);
-        assert!(fa > fence_before);
+        assert!(fa > a_fence_before);
+        assert_eq!(
+            session.turn_fence_of(b.id).unwrap(),
+            b_fence_before,
+            "A's fence raise must not move B's fence"
+        );
         assert_eq!(
             lease_slot_of(&rt, sid, b.id),
             Some((b.id, None, tb)),
@@ -2741,26 +2806,31 @@ mod tests {
         assert_eq!(interrupted_count(&session, "b-open"), 0);
         assert_eq!(session.current_turns().unwrap().len(), turns_before.len());
 
-        // B's own resume still works; A's slot untouched.
+        // B's own resume still works; A's slot + fence untouched.
         let (t, f2, _) = rt.resume_interrupted_turn(sid, b.id, "hb2".into()).unwrap();
         assert_eq!(t, tb);
-        assert!(f2 > fa);
         assert!(f2 > fb);
+        assert!(f2 > b_fence_before);
+        assert_eq!(
+            session.turn_fence_of(a.id).unwrap(),
+            fa,
+            "B's fence raise must not move A's fence"
+        );
         assert_eq!(
             lease_slot_of(&rt, sid, a.id),
             Some((a.id, Some(HolderId::new("ha")), ta)),
             "A's slot intact across B resume"
         );
         assert_eq!(interrupted_count(&session, "b-open"), 1);
-        // Soft shared-fence: A's prior fence is stale after B raised it.
-        assert!(matches!(
-            rt.durable_step(sid, "ha".into(), fa, ta, "s", || Ok("a".into())),
-            Err(Error::TurnLeaseLost)
-        ));
+        // Fence-by-Agent: A's prior fence still valid after B raised.
+        rt.durable_step(sid, "ha".into(), fa, ta, "s", || Ok("a".into()))
+            .unwrap();
         rt.durable_step(sid, "hb2".into(), f2, tb, "s", || Ok("b".into()))
             .unwrap();
         rt.end_turn(sid, "hb2".into(), f2, false).unwrap();
         assert_eq!(lease_slot_of(&rt, sid, b.id), None);
+        rt.end_turn(sid, "ha".into(), fa, false).unwrap();
+        assert_eq!(lease_slot_of(&rt, sid, a.id), None);
     }
 
     /// Per-Agent-lease, adopt path: A's `begin_turn` adopts A's own open

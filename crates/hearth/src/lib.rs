@@ -237,14 +237,17 @@ pub enum EventBody {
         step_id: String,
         result: String,
     },
-    /// Turn lease fence raised for `turn_id`. The Session's fence is the max
-    /// on its EventLog, so it only goes up and survives re-keep against the
-    /// same store/session. [`crate::Runtime::new`] always builds a fresh
+    /// Turn lease fence raised for `turn_id` of `agent`. Each Agent's fence is
+    /// the max of its own [`EventBody::TurnFenced`] on the EventLog (independent
+    /// counters), so it only goes up for that Agent and survives re-keep against
+    /// the same store/session. Raising one Agent's fence does not invalidate
+    /// another Agent's lease. [`crate::Runtime::new`] always builds a fresh
     /// [`InMemory`], so a brand-new Runtime does not preserve it; a shared-
     /// store ctor would be needed when a durable store lands. Not model-visible.
     TurnFenced {
         turn_id: u64,
         fence: u64,
+        agent: AgentId,
     },
     /// `agent` is the Binding's owning Agent (`None` for agentless binds),
     /// so Runtime can classify each kept Agent from the log alone.
@@ -496,12 +499,27 @@ pub fn open_turn_of_agent(events: &[Event], agent: AgentId) -> Option<u64> {
         .map(|(t, _)| t)
 }
 
-/// Highest [`EventBody::TurnFenced`] fence on the EventLog (0 if none).
+/// Highest [`EventBody::TurnFenced`] fence on the EventLog across every Agent
+/// (0 if none). Prefer [`turn_fence_of_agent`] when checking a lease.
 pub fn turn_fence_of(events: &[Event]) -> u64 {
     events
         .iter()
         .filter_map(|e| match e.body {
             EventBody::TurnFenced { fence, .. } => Some(fence),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// Highest [`EventBody::TurnFenced`] fence for one Agent on the EventLog (0 if none).
+pub fn turn_fence_of_agent(events: &[Event], agent: AgentId) -> u64 {
+    events
+        .iter()
+        .filter_map(|e| match e.body {
+            EventBody::TurnFenced {
+                fence, agent: a, ..
+            } if a == agent => Some(fence),
             _ => None,
         })
         .max()
@@ -1432,21 +1450,33 @@ impl Session {
         self.read(|data| open_turn_of(&data.events).map(|(t, _)| t))
     }
 
-    /// Current turn lease fence, restored from the EventLog
-    /// ([`turn_fence_of`]). 0 before any lease.
+    /// Highest turn lease fence on this Session across every Agent
+    /// ([`turn_fence_of`]). 0 before any lease. Prefer [`Self::turn_fence_of`]
+    /// when checking one Agent's lease.
     pub fn turn_fence(&self) -> Result<u64> {
         self.read(|data| turn_fence_of(&data.events))
     }
 
-    /// Raise the turn lease fence above every earlier one and record it as
-    /// [`EventBody::TurnFenced`] for `turn_id`. Returns the new fence.
-    /// Fail-closed on `u64` overflow ([`Error::TurnLeaseLost`]).
-    pub(crate) fn raise_turn_fence(&self, turn_id: u64) -> Result<u64> {
+    /// Current turn lease fence for one Agent, restored from the EventLog
+    /// ([`turn_fence_of_agent`]). 0 before any lease for that Agent.
+    pub fn turn_fence_of(&self, agent: AgentId) -> Result<u64> {
+        self.read(|data| turn_fence_of_agent(&data.events, agent))
+    }
+
+    /// Raise **this Agent's** turn lease fence above its earlier ones and
+    /// record it as [`EventBody::TurnFenced`] for `turn_id`. Other Agents'
+    /// fences are untouched. Returns the new fence. Fail-closed on `u64`
+    /// overflow ([`Error::TurnLeaseLost`]).
+    pub(crate) fn raise_turn_fence(&self, agent: AgentId, turn_id: u64) -> Result<u64> {
         self.write(|data| {
-            let fence = turn_fence_of(&data.events)
+            let fence = turn_fence_of_agent(&data.events, agent)
                 .checked_add(1)
                 .ok_or(Error::TurnLeaseLost)?;
-            data.push(EventBody::TurnFenced { turn_id, fence });
+            data.push(EventBody::TurnFenced {
+                turn_id,
+                fence,
+                agent,
+            });
             Ok(fence)
         })
     }
@@ -2086,35 +2116,47 @@ mod tests {
         assert!(unmatched_tool_calls(&session.events().unwrap()).is_empty());
     }
 
-    /// Pep #44 Overflow-test: forge TurnFenced { fence: u64::MAX } then
-    /// raise_turn_fence → TurnLeaseLost; stored fence unchanged.
+    /// Pep #44 Overflow-test: forge TurnFenced { fence: u64::MAX } for an
+    /// Agent then raise_turn_fence → TurnLeaseLost; that Agent's stored
+    /// fence unchanged. Another Agent's fence is independent.
     #[test]
     fn raise_turn_fence_at_u64_max_is_turn_lease_lost() {
         let store = InMemory::new();
         let session = store.create_session();
+        let agent = store.create_agent("scribe", "");
+        let other = store.create_agent("other", "");
         session
             .append(EventBody::TurnFenced {
                 turn_id: 1,
                 fence: u64::MAX,
+                agent: agent.id,
             })
             .unwrap();
+        assert_eq!(session.turn_fence_of(agent.id).unwrap(), u64::MAX);
         assert_eq!(session.turn_fence().unwrap(), u64::MAX);
         assert!(matches!(
-            session.raise_turn_fence(1),
+            session.raise_turn_fence(agent.id, 1),
             Err(Error::TurnLeaseLost)
         ));
         assert_eq!(
-            session.turn_fence().unwrap(),
+            session.turn_fence_of(agent.id).unwrap(),
             u64::MAX,
             "overflow must leave fence unchanged"
         );
+        // Other Agent can still raise its own (independent) fence.
+        assert_eq!(session.raise_turn_fence(other.id, 1).unwrap(), 1);
+        assert_eq!(session.turn_fence_of(agent.id).unwrap(), u64::MAX);
+        assert_eq!(session.turn_fence_of(other.id).unwrap(), 1);
         let fenced = session
             .events()
             .unwrap()
             .iter()
             .filter(|e| matches!(e.body, EventBody::TurnFenced { .. }))
             .count();
-        assert_eq!(fenced, 1, "no TurnFenced appended on overflow");
+        assert_eq!(
+            fenced, 2,
+            "no TurnFenced appended on overflow; other Agent ok"
+        );
     }
 
     #[test]
