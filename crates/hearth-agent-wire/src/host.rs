@@ -146,8 +146,9 @@ pub fn host_for(
 /// A wire `parent` (subagent nesting, e.g. ACP
 /// `_meta.claudeCode.parentToolUseId`) lands as `parent_tool_call_id` on
 /// [`EventBody::ToolCall`] / [`EventBody::AgentMessage`] /
-/// [`EventBody::PermissionAsked`] (outside [`PermissionRpc`]) — an Event field,
-/// never a child Session or Binding — **only when** `caps.subagent` is true
+/// [`EventBody::AgentThink`] / [`EventBody::PermissionAsked`] (outside
+/// [`PermissionRpc`]) — an Event field, never a child Session or Binding —
+/// **only when** `caps.subagent` is true
 /// ([`CapabilityFlags`] from [`crate::catalog::CatalogProfile::caps`] /
 /// [`HostAttach::with_agent_caps`], default [`CapabilityFlags::for_agent`]).
 /// When `caps.subagent` is false (generic ACP / Copilot / Cursor), parent is
@@ -179,14 +180,16 @@ pub fn event_bodies(
                 parent_tool_call_id: parent_id(parent),
             }]
         }
-        AgentEvent::Thinking { text, .. } => vec![EventBody::AgentThink {
+        AgentEvent::Thinking { text, parent, .. } => vec![EventBody::AgentThink {
             agent,
             text: text.clone(),
+            parent_tool_call_id: parent_id(parent),
         }],
-        AgentEvent::ThinkingDelta { delta, .. } if !delta.is_empty() => {
+        AgentEvent::ThinkingDelta { delta, parent, .. } if !delta.is_empty() => {
             vec![EventBody::AgentThink {
                 agent,
                 text: delta.clone(),
+                parent_tool_call_id: parent_id(parent),
             }]
         }
         AgentEvent::ToolCall {
@@ -1204,6 +1207,60 @@ mod tests {
         }
     }
 
+    /// Pin Thinking / ThinkingDelta → AgentThink parent copy (kills
+    /// always-None / ignore-parent mutants). Retain needs `caps.subagent`.
+    #[test]
+    fn event_bodies_copies_thinking_parent_onto_agent_think() {
+        let agent = AgentId::new();
+        let think = |parent: Option<&str>| AgentEvent::Thinking {
+            session_id: "s".into(),
+            item_id: "t1".into(),
+            text: "hmm".into(),
+            parent: parent.map(Into::into),
+        };
+        let delta = |parent: Option<&str>| AgentEvent::ThinkingDelta {
+            session_id: "s".into(),
+            item_id: "t1".into(),
+            delta: "hmm".into(),
+            parent: parent.map(Into::into),
+        };
+        for (ev, want) in [
+            (think(Some("toolu_task")), Some("toolu_task")),
+            (think(None), None),
+            (delta(Some("toolu_task")), Some("toolu_task")),
+            (delta(None), None),
+        ] {
+            let bodies = event_bodies(BindingId::new(), agent, &ev, CapabilityFlags::CLAUDE_ACP);
+            assert_eq!(bodies.len(), 1);
+            match &bodies[0] {
+                EventBody::AgentThink {
+                    agent: a,
+                    text,
+                    parent_tool_call_id,
+                } => {
+                    assert_eq!(*a, agent);
+                    assert_eq!(text, "hmm");
+                    assert_eq!(parent_tool_call_id.as_deref(), want);
+                }
+                other => panic!("want AgentThink, got {other:?}"),
+            }
+        }
+        // Pi AgentKind row also retains.
+        let bodies = event_bodies(
+            BindingId::new(),
+            agent,
+            &think(Some("toolu_task")),
+            CapabilityFlags::for_agent(AgentKind::Pi),
+        );
+        match &bodies[0] {
+            EventBody::AgentThink {
+                parent_tool_call_id,
+                ..
+            } => assert_eq!(parent_tool_call_id.as_deref(), Some("toolu_task")),
+            other => panic!("want AgentThink, got {other:?}"),
+        }
+    }
+
     /// Must floor: `caps.subagent == false` strips wire parent even when
     /// `_meta` / AgentEvent carries one (kills always-retain / advertise-only
     /// mutants). Generic ACP, Copilot, Cursor, Codex, OpenCode, GrokBuild.
@@ -1237,6 +1294,18 @@ mod tests {
             rpc_id: Some(crate::RpcId::Num(1)),
             parent: Some("toolu_task".into()),
         };
+        let think = AgentEvent::Thinking {
+            session_id: "s".into(),
+            item_id: "t1".into(),
+            text: "hmm".into(),
+            parent: Some("toolu_task".into()),
+        };
+        let think_delta = AgentEvent::ThinkingDelta {
+            session_id: "s".into(),
+            item_id: "t1".into(),
+            delta: "hmm".into(),
+            parent: Some("toolu_task".into()),
+        };
         for caps in [
             CapabilityFlags::ACP,
             CapabilityFlags::GROK_BUILD,
@@ -1247,7 +1316,7 @@ mod tests {
             lookup_profile("cursor").unwrap().caps(),
         ] {
             assert!(!caps.subagent, "{caps:?}");
-            for ev in [&msg, &tool, &ask] {
+            for ev in [&msg, &tool, &ask, &think, &think_delta] {
                 for body in event_bodies(binding, agent, ev, caps) {
                     let parent = match &body {
                         EventBody::AgentMessage {
@@ -1259,6 +1328,10 @@ mod tests {
                             ..
                         }
                         | EventBody::PermissionAsked {
+                            parent_tool_call_id,
+                            ..
+                        }
+                        | EventBody::AgentThink {
                             parent_tool_call_id,
                             ..
                         } => parent_tool_call_id,
@@ -1405,6 +1478,11 @@ mod tests {
                         parent_tool_call_id: Some(p),
                         ..
                     } => Some(format!("PermissionAsked parent={p}")),
+                    EventBody::AgentThink {
+                        text,
+                        parent_tool_call_id: Some(p),
+                        ..
+                    } => Some(format!("AgentThink {text:?} parent={p}")),
                     _ => None,
                 })
                 .collect();
@@ -1484,6 +1562,96 @@ mod tests {
                 ..
             } if tool_call_id == "toolu_sub" && p == "toolu_task"
         )));
+    }
+
+    /// Must floor (Host path): ACP `agent_thought_chunk` with parent under
+    /// CLAUDE_ACP / Pi retains `AgentThink.parent_tool_call_id`; generic ACP
+    /// strips even when wire `_meta` is present.
+    #[test]
+    fn host_drain_retains_thought_parent_when_subagent_cap_true() {
+        use crate::adapters::acp::AcpCodec;
+        use crate::{FramedAgent, JsonlRpcTransport};
+
+        let thought = serde_json::json!({"jsonrpc": "2.0", "method": "session/update",
+            "params": {"sessionId": "s1", "update": {
+                "sessionUpdate": "agent_thought_chunk",
+                "content": {"type": "text", "text": "nested think"},
+                "_meta": {"claudeCode": {"parentToolUseId": "toolu_task"}}}}});
+
+        // CLAUDE_ACP retain.
+        let (_store, _user, agent, session) = room();
+        let binding = session
+            .bind_host(Some(agent.id), host_for(AgentKind::Acp, None, None))
+            .unwrap();
+        let mut io = FramedAgent::new(JsonlRpcTransport::without_rpc_chunks(), AcpCodec);
+        io.transport_mut().push_decoded(thought.clone());
+        let mut attach =
+            HostAttach::attach(binding, agent.id, io).with_agent_caps(CapabilityFlags::CLAUDE_ACP);
+        assert!(attach.agent_caps().subagent);
+        attach.drain(&session).unwrap();
+        assert!(session.events().unwrap().iter().any(|e| matches!(
+            &e.body,
+            EventBody::AgentThink {
+                text,
+                parent_tool_call_id: Some(p),
+                ..
+            } if text == "nested think" && p == "toolu_task"
+        )));
+
+        // Pi AgentKind default retains (toy framed ACP + Pi caps pin).
+        let (_s2, _u2, agent2, session2) = room();
+        let binding2 = session2
+            .bind_host(Some(agent2.id), host_for(AgentKind::Pi, None, None))
+            .unwrap();
+        let mut io = FramedAgent::new(JsonlRpcTransport::without_rpc_chunks(), AcpCodec);
+        io.transport_mut().push_decoded(thought.clone());
+        let mut attach = HostAttach::attach(binding2, agent2.id, io)
+            .with_agent_caps(CapabilityFlags::for_agent(AgentKind::Pi));
+        assert!(attach.agent_caps().subagent);
+        attach.drain(&session2).unwrap();
+        assert!(session2.events().unwrap().iter().any(|e| matches!(
+            &e.body,
+            EventBody::AgentThink {
+                text,
+                parent_tool_call_id: Some(p),
+                ..
+            } if text == "nested think" && p == "toolu_task"
+        )));
+
+        // Generic ACP strips.
+        for (label, caps) in [
+            ("acp-default", CapabilityFlags::ACP),
+            ("copilot", lookup_profile("copilot").unwrap().caps()),
+            ("cursor", lookup_profile("cursor").unwrap().caps()),
+        ] {
+            assert!(!caps.subagent, "{label}");
+            let (_s, _u, agent, session) = room();
+            let binding = session
+                .bind_host(Some(agent.id), host_for(AgentKind::Acp, None, None))
+                .unwrap();
+            let mut io = FramedAgent::new(JsonlRpcTransport::without_rpc_chunks(), AcpCodec);
+            io.transport_mut().push_decoded(thought.clone());
+            let mut attach = HostAttach::attach(binding, agent.id, io).with_agent_caps(caps);
+            attach.drain(&session).unwrap();
+            let thinks: Vec<_> = session
+                .events()
+                .unwrap()
+                .into_iter()
+                .filter_map(|e| match e.body {
+                    EventBody::AgentThink {
+                        text,
+                        parent_tool_call_id,
+                        ..
+                    } => Some((text, parent_tool_call_id)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                thinks,
+                [("nested think".into(), None)],
+                "{label}: must strip thought parent"
+            );
+        }
     }
 
     #[test]

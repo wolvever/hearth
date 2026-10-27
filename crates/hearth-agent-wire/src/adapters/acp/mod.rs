@@ -133,16 +133,20 @@ pub fn map_session_update(params: &Value, agent: AgentKind) -> Result<AgentEvent
                 })
                 .unwrap_or_default(),
         }),
-        "agent_thought_chunk" => Ok(AgentEvent::ThinkingDelta {
-            session_id,
-            item_id: "think".into(),
-            delta: update
-                .get("content")
-                .and_then(|c| c.get("text"))
-                .and_then(|t| t.as_str())
-                .unwrap_or("")
-                .to_string(),
-        }),
+        "agent_thought_chunk" => {
+            let item_id = "think".to_string();
+            Ok(AgentEvent::ThinkingDelta {
+                session_id,
+                parent: claude_parent(&update, Some(&item_id)),
+                item_id,
+                delta: update
+                    .get("content")
+                    .and_then(|c| c.get("text"))
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            })
+        }
         other => Ok(AgentEvent::Native {
             agent,
             method: format!("session/update:{other}"),
@@ -830,6 +834,67 @@ mod map_tests {
         ));
     }
 
+    /// Must floor: `agent_thought_chunk` decodes `_meta.claudeCode.parentToolUseId`
+    /// onto `ThinkingDelta.parent` with the same fail-closed rule as message /
+    /// tool frames (kills always-None / ignore-meta mutants).
+    #[test]
+    fn agent_thought_chunk_decodes_parent_fail_closed() {
+        let thought = |meta: Option<serde_json::Value>| {
+            let mut update = serde_json::json!({
+                "sessionUpdate": "agent_thought_chunk",
+                "content": {"type": "text", "text": "hmm"}
+            });
+            if let Some(m) = meta {
+                update["_meta"] = m;
+            }
+            let msg = serde_json::json!({"jsonrpc": "2.0", "method": "session/update",
+                "params": {"sessionId": "s", "update": update}});
+            match map_notification(&msg, AgentKind::Acp).unwrap() {
+                AgentEvent::ThinkingDelta { delta, parent, .. } => {
+                    assert_eq!(delta, "hmm");
+                    parent
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        };
+        assert_eq!(
+            thought(Some(
+                serde_json::json!({"claudeCode": {"parentToolUseId": "toolu_task"}})
+            )),
+            Some("toolu_task".into())
+        );
+        assert_eq!(thought(None), None);
+        assert_eq!(thought(Some(serde_json::json!({"other": {}}))), None);
+        assert_eq!(thought(Some(serde_json::json!({"claudeCode": "x"}))), None);
+        for bad in [
+            serde_json::json!(null),
+            serde_json::json!(7),
+            serde_json::json!(""),
+            serde_json::json!({"id": "p"}),
+            serde_json::json!("think"), // self-parent vs default item_id
+        ] {
+            assert_eq!(
+                thought(Some(
+                    serde_json::json!({"claudeCode": {"parentToolUseId": bad}})
+                )),
+                None,
+                "{bad}"
+            );
+        }
+        // Vendor key is exact.
+        assert_eq!(
+            thought(Some(serde_json::json!({"codex": {"parentToolUseId": "p"}}))),
+            None
+        );
+        // Meta present but no parentToolUseId.
+        assert_eq!(
+            thought(Some(
+                serde_json::json!({"claudeCode": {"toolName": "Think"}})
+            )),
+            None
+        );
+    }
+
     /// Absent fields keep the old serde shape (back-compat both ways).
     #[test]
     fn parent_fields_are_additive_on_serde() {
@@ -854,6 +919,21 @@ mod map_tests {
         let v = serde_json::to_value(&nested).unwrap();
         assert_eq!(v["parent"], "toolu_task");
         assert_eq!(serde_json::from_value::<AgentEvent>(v).unwrap(), nested);
+        // Thinking / ThinkingDelta are additive too.
+        let old_think = serde_json::json!({"event": "thinking_delta", "session_id": "s",
+            "item_id": "t", "delta": "hmm"});
+        let ev: AgentEvent = serde_json::from_value(old_think.clone()).unwrap();
+        assert!(matches!(ev, AgentEvent::ThinkingDelta { parent: None, .. }));
+        assert_eq!(serde_json::to_value(&ev).unwrap(), old_think);
+        let think = AgentEvent::Thinking {
+            session_id: "s".into(),
+            item_id: "t".into(),
+            text: "hmm".into(),
+            parent: Some("toolu_task".into()),
+        };
+        let v = serde_json::to_value(&think).unwrap();
+        assert_eq!(v["parent"], "toolu_task");
+        assert_eq!(serde_json::from_value::<AgentEvent>(v).unwrap(), think);
     }
 
     #[test]

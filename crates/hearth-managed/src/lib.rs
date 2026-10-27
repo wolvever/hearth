@@ -179,6 +179,7 @@ mod tests {
         room.append(EventBody::AgentThink {
             agent: agent.id,
             text: "thinking".into(),
+            parent_tool_call_id: None,
         })
         .unwrap();
         room.append(event_from_ma_text(agent.id, "hi")).unwrap();

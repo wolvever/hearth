@@ -258,11 +258,23 @@ pub enum AgentEvent {
         session_id: SessionId,
         item_id: ItemId,
         text: String,
+        /// Tool call this item ran under (Claude Code
+        /// `_meta.claudeCode.parentToolUseId`): the subagent launch it nests
+        /// under. `None` = top level or unknown. Correlation only — never a
+        /// child Session or Binding.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent: Option<ItemId>,
     },
     ThinkingDelta {
         session_id: SessionId,
         item_id: ItemId,
         delta: String,
+        /// Tool call this item ran under (Claude Code
+        /// `_meta.claudeCode.parentToolUseId`): the subagent launch it nests
+        /// under. `None` = top level or unknown. Correlation only — never a
+        /// child Session or Binding.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent: Option<ItemId>,
     },
     ToolCall {
         session_id: SessionId,

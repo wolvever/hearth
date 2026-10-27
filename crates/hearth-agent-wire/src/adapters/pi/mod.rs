@@ -216,6 +216,7 @@ fn map_message_update(msg: &Value, session_id: String) -> Result<AgentEvent, Bus
             session_id,
             item_id,
             delta,
+            parent: None,
         }),
         _ => Ok(AgentEvent::MessageDelta {
             session_id,

@@ -59,6 +59,7 @@ pub fn map_event(msg: &Value) -> Result<AgentEvent, BusError> {
                     session_id,
                     item_id,
                     delta: text,
+                    parent: None,
                 }),
                 "tool" => Ok(AgentEvent::ToolCall {
                     session_id,
