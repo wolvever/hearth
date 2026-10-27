@@ -1114,6 +1114,36 @@ mod tests {
         }
     }
 
+    /// Pin the whole-item `Message` → `AgentMessage` parent copy directly:
+    /// the nest fixtures only exercise `ToolCall` / `MessageDelta`.
+    #[test]
+    fn event_bodies_copies_message_parent_onto_agent_message() {
+        let agent = AgentId::new();
+        let msg = |parent: Option<&str>| AgentEvent::Message {
+            session_id: "s".into(),
+            item_id: "m1".into(),
+            role: "assistant".into(),
+            text: "child says".into(),
+            parent: parent.map(Into::into),
+        };
+        for (parent, want) in [(Some("toolu_task"), Some("toolu_task")), (None, None)] {
+            let bodies = event_bodies(BindingId::new(), agent, &msg(parent));
+            assert_eq!(bodies.len(), 1);
+            match &bodies[0] {
+                EventBody::AgentMessage {
+                    agent: a,
+                    text,
+                    parent_tool_call_id,
+                } => {
+                    assert_eq!(*a, agent);
+                    assert_eq!(text, "child says");
+                    assert_eq!(parent_tool_call_id.as_deref(), want);
+                }
+                other => panic!("want AgentMessage, got {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn framed_agent_jsonl_pi_rpc_appends_tool_call() {
         use crate::adapters::pi::PiCodec;
