@@ -7,6 +7,7 @@ license = "MIT"
 
 [dependencies]
 hearth = { path = "../hearth" }
+hearth-agent-wire = { path = "../hearth-agent-wire" }
 axum = { version = "0.8", features = ["ws"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
