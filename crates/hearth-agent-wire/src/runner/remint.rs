@@ -3015,7 +3015,7 @@ mod tests {
         let mut attached_once = false;
         for e in s.host_events() {
             match e.body {
-                EventBody::BindingAttached { binding } => {
+                EventBody::BindingAttached { binding, .. } => {
                     live.insert(binding);
                     attached_once = true;
                 }

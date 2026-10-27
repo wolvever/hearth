@@ -1,7 +1,11 @@
 //! Long-lived keeper of Sessions. Same class as [`crate::Store`] / [`crate::Provisioner`]
 //! / [`crate::Host`] / [`crate::FakeSandbox`] — not a seventh product name.
 //!
-//! [`Runtime::keep`] stores a [`Host`] recipe and occupancy. [`Runtime::wake`] is
+//! [`Runtime::keep`] stores a [`Host`] recipe and occupancy per `(Session, Agent)`:
+//! many Agents may be kept on one Session, each with its own recipe and
+//! timer. [`Runtime::wake`] / [`Runtime::remint`] / [`Runtime::begin_turn`] /
+//! [`Runtime::classify`] take the Agent; [`Runtime::tick`] iterates each due
+//! `(Session, Agent)`. [`Runtime::wake`] is
 //! find_server: classify the agent's Binding, remint only when none is live
 //! (`NeverBound` / `PositivelyDead`), link a prompt to a live idle Binding, or
 //! wait. A live Binding in an open turn does **not** remint and does **not**
@@ -133,6 +137,8 @@ impl From<String> for HolderId {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionTurnLease {
     pub holder: HolderId,
+    /// Kept Agent whose turn the lease drives.
+    pub agent: AgentId,
     pub fence: u64,
     pub turn_id: u64,
 }
@@ -156,21 +162,40 @@ impl StepOutcome {
     }
 }
 
-/// Internal keep record: recipe plus optional timer and turn lease.
-struct Kept {
+/// One kept Agent's recipe on a Session: Host plus optional timer.
+struct KeptAgent {
     agent: AgentId,
     host: Host,
-    /// If Some, [`Runtime::tick`] wakes when `now >= next_due_ms` (ms since epoch,
-    /// same clock as [`crate::Event::ts`]).
+    /// If Some, [`Runtime::tick`] wakes this Agent when `now >= next_due_ms`
+    /// (ms since epoch, same clock as [`crate::Event::ts`]).
     timer_every_ms: Option<u64>,
     next_due_ms: Option<u64>,
+}
+
+/// Internal keep record for one Session: every kept Agent's recipe (keep
+/// order) plus the Session's one turn lease. The lease stays per Session
+/// because the fence is per Session ([`Session::turn_fence`]).
+struct Kept {
+    agents: Vec<KeptAgent>,
     /// Live or interrupted session-turn lease. `holder: None` after a crash.
     /// The fence is not here: it is stored on the Session ([`Session::turn_fence`]).
     lease: Option<TurnLease>,
 }
 
+impl Kept {
+    fn agent(&self, agent: AgentId) -> Option<&KeptAgent> {
+        self.agents.iter().find(|k| k.agent == agent)
+    }
+
+    fn agent_mut(&mut self, agent: AgentId) -> Option<&mut KeptAgent> {
+        self.agents.iter_mut().find(|k| k.agent == agent)
+    }
+}
+
 struct TurnLease {
     holder: Option<HolderId>,
+    /// Kept Agent whose turn this lease drives.
+    agent: AgentId,
     turn_id: u64,
 }
 
@@ -216,49 +241,80 @@ impl Runtime {
         self.durable.lock().map_err(|_| Error::Poisoned)
     }
 
-    fn kept_recipe(&self, session: SessionId) -> Result<(AgentId, Host)> {
+    /// `agent`'s Host recipe on `session`. [`Error::NotKept`] if the Session
+    /// keeps no Agent; [`Error::AgentNotKept`] if it keeps others but not this one.
+    fn kept_host(&self, session: SessionId, agent: AgentId) -> Result<Host> {
         let g = self.lock_kept()?;
         let kept = g.get(&session).ok_or(Error::NotKept(session))?;
-        Ok((kept.agent, kept.host.clone()))
+        kept.agent(agent)
+            .map(|k| k.host.clone())
+            .ok_or(Error::AgentNotKept(session, agent))
     }
 
-    /// Record a Host recipe for this session. Session and Agent must exist.
-    /// Joins `Member::Agent` if needed (occupancy so later turns are legal).
-    /// Does **not** bind. Overwriting keep on the same session updates the recipe.
+    /// Agent driving the Session's current lease (live or interrupted).
+    fn lease_agent(&self, session: SessionId) -> Result<AgentId> {
+        let g = self.lock_kept()?;
+        let kept = g.get(&session).ok_or(Error::NotKept(session))?;
+        kept.lease
+            .as_ref()
+            .map(|l| l.agent)
+            .ok_or(Error::SessionNotOwned)
+    }
+
+    /// Record a Host recipe for `(session, agent)`. Session and Agent must
+    /// exist. Joins `Member::Agent` if needed (occupancy so later turns are
+    /// legal). Does **not** bind. Many Agents may be kept on one Session;
+    /// overwriting keep for the same `(session, agent)` updates only that
+    /// Agent's recipe (other Agents' recipes, timers, and the lease stay).
     pub fn keep(&self, session: SessionId, agent: AgentId, host: Host) -> Result<()> {
         let spec = KeepSpec { agent, host };
         let sess = self.store.session(session)?;
         let _ = self.store.agent(spec.agent)?;
         ensure_agent_member(&sess, spec.agent)?;
         let mut g = self.lock_kept()?;
-        match g.get_mut(&session) {
-            Some(existing) => {
-                existing.agent = spec.agent;
-                existing.host = spec.host;
-            }
-            None => {
-                g.insert(
-                    session,
-                    Kept {
-                        agent: spec.agent,
-                        host: spec.host,
-                        timer_every_ms: None,
-                        next_due_ms: None,
-                        lease: None,
-                    },
-                );
-            }
+        let kept = g.entry(session).or_insert_with(|| Kept {
+            agents: Vec::new(),
+            lease: None,
+        });
+        match kept.agent_mut(spec.agent) {
+            Some(existing) => existing.host = spec.host,
+            None => kept.agents.push(KeptAgent {
+                agent: spec.agent,
+                host: spec.host,
+                timer_every_ms: None,
+                next_due_ms: None,
+            }),
         }
         Ok(())
     }
 
-    /// Stop keeping. Does **not** delete Session, log, Places, or Bindings.
+    /// Stop keeping every Agent on `session` (and drop its lease). Does
+    /// **not** delete Session, log, Places, or Bindings.
     pub fn release(&self, session: SessionId) -> Result<()> {
         let mut g = self.lock_kept()?;
         g.remove(&session);
         Ok(())
     }
 
+    /// Stop keeping one Agent on `session`. Drops the Session's lease only
+    /// if that Agent drives it. Releasing the last kept Agent un-keeps the
+    /// Session. Not kept is a no-op (like [`Self::release`]).
+    pub fn release_agent(&self, session: SessionId, agent: AgentId) -> Result<()> {
+        let mut g = self.lock_kept()?;
+        let Some(kept) = g.get_mut(&session) else {
+            return Ok(());
+        };
+        kept.agents.retain(|k| k.agent != agent);
+        if kept.lease.as_ref().is_some_and(|l| l.agent == agent) {
+            kept.lease = None;
+        }
+        if kept.agents.is_empty() {
+            g.remove(&session);
+        }
+        Ok(())
+    }
+
+    /// Sessions with at least one kept Agent.
     pub fn kept(&self) -> Vec<SessionId> {
         let Ok(g) = self.lock_kept() else {
             return Vec::new();
@@ -268,21 +324,37 @@ impl Runtime {
         ids
     }
 
-    /// Session must be kept. Sets `timer_every_ms` and `next_due_ms = now + every_ms`.
-    pub fn schedule(&self, session: SessionId, every_ms: u64) -> Result<()> {
+    /// Agents kept on `session`, in keep order. Empty if not kept.
+    pub fn kept_agents(&self, session: SessionId) -> Vec<AgentId> {
+        let Ok(g) = self.lock_kept() else {
+            return Vec::new();
+        };
+        g.get(&session)
+            .map(|k| k.agents.iter().map(|a| a.agent).collect())
+            .unwrap_or_default()
+    }
+
+    /// `(session, agent)` must be kept. Sets that Agent's `timer_every_ms`
+    /// and `next_due_ms = now + every_ms`. Other Agents' timers are untouched.
+    pub fn schedule(&self, session: SessionId, agent: AgentId, every_ms: u64) -> Result<()> {
         let mut g = self.lock_kept()?;
         let kept = g.get_mut(&session).ok_or(Error::NotKept(session))?;
-        kept.timer_every_ms = Some(every_ms);
-        kept.next_due_ms = Some(now_ts().saturating_add(every_ms));
+        let ka = kept
+            .agent_mut(agent)
+            .ok_or(Error::AgentNotKept(session, agent))?;
+        ka.timer_every_ms = Some(every_ms);
+        ka.next_due_ms = Some(now_ts().saturating_add(every_ms));
         Ok(())
     }
 
-    /// Classify the kept agent's Binding lease. Absence of a heartbeat is
+    /// Classify a kept Agent's Binding lease. Absence of a heartbeat is
     /// [`Liveness::Unknown`], not death. No descriptor store yet: a live
     /// Binding is idle or in-turn; no live Binding plus `BindingReleased` is
-    /// positively dead; never attached is [`Liveness::NeverBound`].
-    pub fn classify(&self, session: SessionId) -> Result<Liveness> {
-        let (agent, _) = self.kept_recipe(session)?;
+    /// positively dead; never attached is [`Liveness::NeverBound`]. Only
+    /// this Agent's Bindings (and legacy agentless ones) count: another
+    /// kept Agent's Binding never makes it `Unknown` or `PositivelyDead`.
+    pub fn classify(&self, session: SessionId, agent: AgentId) -> Result<Liveness> {
+        let _ = self.kept_host(session, agent)?;
         classify_session(&self.store.session(session)?, agent)
     }
 
@@ -292,31 +364,33 @@ impl Runtime {
         binding_for_agent(&self.store.session(session)?, agent)
     }
 
-    /// Idle remint. Refused if a Binding is live or liveness is unknown.
+    /// Idle remint of one kept Agent with its own recipe. Refused if that
+    /// Agent's Binding is live or its liveness is unknown.
     ///
     /// Kernel default ([`ClaimBinding`]) for tests without a wire. Production
     /// wire Host: route through `remint_through_host_wake`, which mints in
     /// `host_wake` and reads the Binding via [`Self::binding_for`] — it does
     /// not call this or [`Self::remint_with`].
-    pub fn remint(&self, session: SessionId) -> Result<crate::BindingId> {
-        self.remint_with(session, &mut ClaimBinding)
+    pub fn remint(&self, session: SessionId, agent: AgentId) -> Result<crate::BindingId> {
+        self.remint_with(session, agent, &mut ClaimBinding)
     }
 
     /// Idle remint with a pluggable Binding ensure step.
     ///
     /// Same classify as [`Self::remint`], but `NeverBound` / `PositivelyDead`
     /// call `claim.claim` instead of the hard-wired kernel remint.
-    /// [`AlreadyBound`] never mints, but after `host_wake` the session is
+    /// [`AlreadyBound`] never mints, but after `host_wake` the Agent is
     /// already `LiveIdle`, which this refuses as `AlreadyLive` — so the wire
     /// path does not use it (see [`Self::remint`]).
     pub fn remint_with<C: WakeClaim>(
         &self,
         session: SessionId,
+        agent: AgentId,
         claim: &mut C,
     ) -> Result<crate::BindingId> {
         // Lock order (all rebind paths): durable gate -> kept -> store.
         let _gate = self.lock_durable()?;
-        let (agent, host) = self.kept_recipe(session)?;
+        let host = self.kept_host(session, agent)?;
         let sess = self.store.session(session)?;
         ensure_agent_member(&sess, agent)?;
         match classify_session(&sess, agent)? {
@@ -331,19 +405,20 @@ impl Runtime {
         }
     }
 
-    /// Wake a kept session: find_server on the agent's Binding.
+    /// Wake one kept Agent on a Session: find_server on that Agent's Binding,
+    /// remint (if needed) with that Agent's own recipe.
     ///
     /// Prompt path never remints a live Binding. `NeverBound` / `PositivelyDead`
     /// remint first via [`ClaimBinding`] (idle launch / empty pool), then link.
-    /// `LiveInTurn` / `Unknown` wait.
+    /// `LiveInTurn` / `Unknown` wait. Another Agent's open turn does not.
     /// Does **not** call [`Session::turn_end`] — the host runner would end the turn later.
     /// Does **not** spawn a real CLI or invent `AgentMessage`.
     ///
     /// Production wire Host: prefer `wake_through_host_wake` then
     /// [`Self::wake_with`] [`AlreadyBound`] — never this default claim on the
     /// same wake as `host_wake`.
-    pub fn wake(&self, session: SessionId, wake: Wake) -> Result<Vec<Event>> {
-        self.wake_with(session, wake, &mut ClaimBinding)
+    pub fn wake(&self, session: SessionId, agent: AgentId, wake: Wake) -> Result<Vec<Event>> {
+        self.wake_with(session, agent, wake, &mut ClaimBinding)
     }
 
     /// Wake with a pluggable Binding ensure step.
@@ -355,11 +430,12 @@ impl Runtime {
     pub fn wake_with<C: WakeClaim>(
         &self,
         session: SessionId,
+        agent: AgentId,
         wake: Wake,
         claim: &mut C,
     ) -> Result<Vec<Event>> {
         let _gate = self.lock_durable()?;
-        let (agent, host) = self.kept_recipe(session)?;
+        let host = self.kept_host(session, agent)?;
         let sess = self.store.session(session)?;
         let start_len = sess.events()?.len();
         ensure_agent_member(&sess, agent)?;
@@ -379,65 +455,79 @@ impl Runtime {
         Ok(events[start_len..].to_vec())
     }
 
-    /// For each kept session with a due timer (`next_due_ms <= now`), `wake(Timer)`,
-    /// then set `next_due_ms = now + every_ms`. A Session that answers
-    /// [`Error::Waiting`] (turn open, liveness unknown) is skipped for this tick
-    /// with `next_due_ms` unchanged; any other error aborts the tick.
+    /// For each kept `(session, agent)` with a due timer (`next_due_ms <= now`),
+    /// `wake(session, agent, Timer)`, then set that Agent's
+    /// `next_due_ms = now + every_ms`. An Agent that answers
+    /// [`Error::Waiting`] (its turn open, liveness unknown) is skipped for
+    /// this tick with its `next_due_ms` unchanged; other Agents on the same
+    /// Session still fire. Any other error aborts the tick.
+    /// Order: Sessions by id, then Agents in keep order.
     /// Pass `now` for a deterministic clock
     /// (same epoch-ms as [`crate::Event::ts`]); `None` uses the wall clock.
     /// This is how tests drive the infinite loop without sleeping.
     ///
     /// Kernel default ([`ClaimBinding`]) for tests without a wire. Production
     /// wire Host: route through `tick_through_host_wake` ([`Self::tick_with`]).
-    pub fn tick(&self, now_ms: Option<u64>) -> Result<Vec<(SessionId, Vec<Event>)>> {
-        self.tick_with(now_ms, |sid, wake| match self.wake(sid, wake) {
-            Ok(ev) => Ok(Some(ev)),
-            Err(Error::Waiting(_)) => Ok(None),
-            Err(e) => Err(e),
+    pub fn tick(&self, now_ms: Option<u64>) -> Result<Vec<(SessionId, AgentId, Vec<Event>)>> {
+        self.tick_with(now_ms, |sid, agent, wake| {
+            match self.wake(sid, agent, wake) {
+                Ok(ev) => Ok(Some(ev)),
+                Err(Error::Waiting(_)) => Ok(None),
+                Err(e) => Err(e),
+            }
         })
     }
 
-    /// [`Self::tick`] with a pluggable per-Session timer wake (mirrors
-    /// [`Self::wake_with`]). `wake` returns `Ok(None)` for Waiting: that
-    /// Session is skipped this tick, nothing written, `next_due_ms`
-    /// unchanged. `Ok(Some(_))` advances `next_due_ms`; `Err` aborts the tick.
-    /// Production wire Host passes `wake_through_host_wake` so a timer never
-    /// mints via `claim_binding`.
+    /// [`Self::tick`] with a pluggable per-`(Session, Agent)` timer wake
+    /// (mirrors [`Self::wake_with`]). `wake` returns `Ok(None)` for Waiting:
+    /// that Agent is skipped this tick, nothing written, `next_due_ms`
+    /// unchanged. `Ok(Some(_))` advances that Agent's `next_due_ms`; `Err`
+    /// aborts the tick. Production wire Host passes `wake_through_host_wake`
+    /// so a timer never mints via `claim_binding`.
     pub fn tick_with<T, E, F>(
         &self,
         now_ms: Option<u64>,
         mut wake: F,
-    ) -> std::result::Result<Vec<(SessionId, T)>, E>
+    ) -> std::result::Result<Vec<(SessionId, AgentId, T)>, E>
     where
         E: From<Error>,
-        F: FnMut(SessionId, Wake) -> std::result::Result<Option<T>, E>,
+        F: FnMut(SessionId, AgentId, Wake) -> std::result::Result<Option<T>, E>,
     {
         let now = now_ms.unwrap_or_else(now_ts);
-        let mut due: Vec<SessionId> = {
+        let mut due: Vec<(SessionId, Vec<AgentId>)> = {
             let g = self.lock_kept()?;
             g.iter()
-                .filter(|(_, k)| k.next_due_ms.map(|due| due <= now).unwrap_or(false))
-                .map(|(id, _)| *id)
+                .filter_map(|(id, k)| {
+                    let agents: Vec<AgentId> = k
+                        .agents
+                        .iter()
+                        .filter(|a| a.next_due_ms.map(|due| due <= now).unwrap_or(false))
+                        .map(|a| a.agent)
+                        .collect();
+                    (!agents.is_empty()).then_some((*id, agents))
+                })
                 .collect()
         };
-        due.sort_by_key(|id| id.0);
+        due.sort_by_key(|(id, _)| id.0);
 
         let mut out = Vec::new();
-        for sid in due {
-            // Busy or liveness-unknown: skip this Session this tick, write
-            // nothing, keep it due so it fires on a later tick.
-            let Some(woke) = wake(sid, Wake::Timer)? else {
-                continue;
-            };
-            {
-                let mut g = self.lock_kept()?;
-                if let Some(k) = g.get_mut(&sid) {
-                    if let Some(every) = k.timer_every_ms {
-                        k.next_due_ms = Some(now.saturating_add(every));
+        for (sid, agents) in due {
+            for agent in agents {
+                // Busy or liveness-unknown: skip this Agent this tick, write
+                // nothing, keep it due so it fires on a later tick.
+                let Some(woke) = wake(sid, agent, Wake::Timer)? else {
+                    continue;
+                };
+                {
+                    let mut g = self.lock_kept()?;
+                    if let Some(k) = g.get_mut(&sid).and_then(|k| k.agent_mut(agent)) {
+                        if let Some(every) = k.timer_every_ms {
+                            k.next_due_ms = Some(now.saturating_add(every));
+                        }
                     }
                 }
+                out.push((sid, agent, woke));
             }
-            out.push((sid, woke));
         }
         Ok(out)
     }
@@ -446,34 +536,41 @@ impl Runtime {
     pub fn turn_lease(&self, session: SessionId) -> Result<Option<SessionTurnLease>> {
         let g = self.lock_kept()?;
         let kept = g.get(&session).ok_or(Error::NotKept(session))?;
-        let Some((holder, turn_id)) = kept
+        let Some((holder, agent, turn_id)) = kept
             .lease
             .as_ref()
-            .and_then(|l| l.holder.clone().map(|h| (h, l.turn_id)))
+            .and_then(|l| l.holder.clone().map(|h| (h, l.agent, l.turn_id)))
         else {
             return Ok(None);
         };
         let fence = self.store.session(session)?.turn_fence()?;
         Ok(Some(SessionTurnLease {
             holder,
+            agent,
             fence,
             turn_id,
         }))
     }
 
-    /// Open a turn under a live [`SessionTurnLease`].
+    /// Open a turn for one kept Agent under a live [`SessionTurnLease`].
     ///
-    /// Remints Binding only when `NeverBound` / `PositivelyDead` (same as wake).
+    /// Remints that Agent's Binding (its own recipe) only when `NeverBound` /
+    /// `PositivelyDead` (same as wake).
     /// If `wake` already opened a turn (or a re-keep finds one on the EventLog)
     /// and no lease exists, restores that turn, finalizes unmatched tool
     /// calls as [`crate::EventBody::ToolCallInterrupted`]
     /// ([`crate::ToolInterruptStatus::Indeterminate`]) via
-    /// [`Session::finalize_unmatched_tool_calls_of`] (kept Agent only) (same helper as
+    /// [`Session::finalize_unmatched_tool_calls_of`] (this Agent only) (same helper as
     /// [`Self::resume_interrupted_turn`] / wire remint), then attaches a
     /// lease under a raised stored fence. After re-keep **any** [`HolderId`]
     /// may adopt (fenced takeover); [`Error::LiveTurnOpen`] is per-Runtime.
     /// An interrupted turn (lease holder dropped while still kept) must use
     /// [`Self::resume_interrupted_turn`].
+    ///
+    /// The lease (and fence) is per Session: while any Agent's lease is held,
+    /// another Agent's `begin_turn` is [`Error::LiveTurnOpen`] (live holder)
+    /// or `Waiting(TurnOpen)` (interrupted). Un-leased turns via [`Self::wake`]
+    /// are per Agent.
     ///
     /// Kernel default ([`ClaimBinding`]) for tests without a wire. Production
     /// wire Host: route through `begin_turn_through_host_wake`
@@ -481,9 +578,10 @@ impl Runtime {
     pub fn begin_turn(
         &self,
         session: SessionId,
+        agent: AgentId,
         holder: HolderId,
     ) -> Result<(u64, u64, BindingId)> {
-        self.begin_turn_with(session, holder, &mut ClaimBinding)
+        self.begin_turn_with(session, agent, holder, &mut ClaimBinding)
     }
 
     /// [`Self::begin_turn`] with a pluggable Binding ensure step.
@@ -497,11 +595,12 @@ impl Runtime {
     pub fn begin_turn_with<C: WakeClaim>(
         &self,
         session: SessionId,
+        agent: AgentId,
         holder: HolderId,
         claim: &mut C,
     ) -> Result<(u64, u64, BindingId)> {
         let _gate = self.lock_durable()?;
-        let (agent, host) = self.kept_recipe(session)?;
+        let host = self.kept_host(session, agent)?;
         let sess = self.store.session(session)?;
         ensure_agent_member(&sess, agent)?;
 
@@ -522,11 +621,11 @@ impl Runtime {
             // keep + begin_turn). Same Indeterminate finalize as
             // resume_interrupted_turn / wire remint — never leave ToolCalls
             // looking live across the rebuild.
-            // Scoped to the kept Agent: another Agent's live ToolCall
+            // Scoped to this Agent: another Agent's live ToolCall
             // under a concurrent turn is not this recovery's to finalize.
             sess.finalize_unmatched_tool_calls_of(agent)?;
             let binding = binding_for_agent(&sess, agent)?;
-            let fence = self.install_lease(&sess, holder, turn_id)?;
+            let fence = self.install_lease(&sess, agent, holder, turn_id)?;
             return Ok((turn_id, fence, binding));
         }
 
@@ -542,12 +641,13 @@ impl Runtime {
         let start = sess.turn_start(agent)?;
         let turn_id = start.turn.ok_or(Error::TurnNotOpen)?;
         let binding = binding_for_agent(&sess, agent)?;
-        let fence = self.install_lease(&sess, holder, turn_id)?;
+        let fence = self.install_lease(&sess, agent, holder, turn_id)?;
         Ok((turn_id, fence, binding))
     }
 
-    /// End a leased turn. `interrupted: true` drops the live holder without
-    /// `TurnEnd` (host crash). `false` appends `TurnEnd` and clears the lease.
+    /// End a leased turn (the lease's Agent). `interrupted: true` drops the
+    /// live holder without `TurnEnd` (host crash). `false` appends `TurnEnd`
+    /// and clears the lease.
     pub fn end_turn(
         &self,
         session: SessionId,
@@ -556,8 +656,8 @@ impl Runtime {
         interrupted: bool,
     ) -> Result<()> {
         let _gate = self.lock_durable()?;
-        let (agent, _) = self.kept_recipe(session)?;
         self.require_live_holder_fence(session, &holder, fence)?;
+        let agent = self.lease_agent(session)?;
 
         if interrupted {
             let mut g = self.lock_kept()?;
@@ -579,7 +679,8 @@ impl Runtime {
     /// Intra-turn step memoization. If `StepCompleted` for `(turn_id, step_id)`
     /// is already on the EventLog, returns [`StepOutcome::Memoized`] and does
     /// not run `f`. Otherwise runs `f`, appends `StepCompleted` under the live
-    /// lease fence, then returns [`StepOutcome::Executed`].
+    /// lease fence, then returns [`StepOutcome::Executed`]. The turn checked
+    /// is the lease Agent's.
     ///
     /// InMemory EventLog is append-then-return (no fsync). A durable EventLog
     /// must persist `StepCompleted` before returning `Executed`.
@@ -598,7 +699,7 @@ impl Runtime {
         let _gate = self.lock_durable()?;
         let step_id = step_id.into();
         self.require_live_lease(session, &holder, fence, turn_id)?;
-        let (agent, _) = self.kept_recipe(session)?;
+        let agent = self.lease_agent(session)?;
 
         let sess = self.store.session(session)?;
         if sess.current_turn_of(agent)? != Some(turn_id) {
@@ -619,20 +720,21 @@ impl Runtime {
         Ok(StepOutcome::Executed(result))
     }
 
-    /// After host crash: reclaim the lease, restore the open turn from the
-    /// EventLog (`TurnStart` without `TurnEnd`), finalize unmatched tool
-    /// calls as [`EventBody::ToolCallInterrupted`]
+    /// After host crash: reclaim the lease for a kept Agent, restore its open
+    /// turn from the EventLog (`TurnStart` without `TurnEnd`), finalize
+    /// unmatched tool calls as [`EventBody::ToolCallInterrupted`]
     /// ([`crate::ToolInterruptStatus::Indeterminate`]) via
-    /// [`Session::finalize_unmatched_tool_calls_of`] (kept Agent only) (same helper as wire remint),
+    /// [`Session::finalize_unmatched_tool_calls_of`] (this Agent only) (same helper as wire remint),
     /// return `(turn_id, fence, binding_id)`.
     /// Does **not** remint Binding. Refuses if a holder is still live.
     pub fn resume_interrupted_turn(
         &self,
         session: SessionId,
+        agent: AgentId,
         new_holder: HolderId,
     ) -> Result<(u64, u64, BindingId)> {
         let _gate = self.lock_durable()?;
-        let (agent, _) = self.kept_recipe(session)?;
+        let _ = self.kept_host(session, agent)?;
         let sess = self.store.session(session)?;
 
         {
@@ -653,21 +755,28 @@ impl Runtime {
         // Crash reclaim must not leave ToolCalls looking live (tempt a
         // re-run). Same Indeterminate finalize as wire remint — never
         // Completed-without-output, never Cancelled.
-        // Kept Agent only (concurrent per-Binding turns).
+        // This Agent only (concurrent per-Binding turns).
         sess.finalize_unmatched_tool_calls_of(agent)?;
         let binding = binding_for_agent(&sess, agent)?;
-        let fence = self.install_lease(&sess, new_holder, turn_id)?;
+        let fence = self.install_lease(&sess, agent, new_holder, turn_id)?;
         Ok((turn_id, fence, binding))
     }
 
     /// Every new lease (fresh turn, adopted open turn, crash resume) raises
     /// the stored fence, so no two holders ever share one.
-    fn install_lease(&self, sess: &Session, holder: HolderId, turn_id: u64) -> Result<u64> {
+    fn install_lease(
+        &self,
+        sess: &Session,
+        agent: AgentId,
+        holder: HolderId,
+        turn_id: u64,
+    ) -> Result<u64> {
         let mut g = self.lock_kept()?;
         let kept = g.get_mut(&sess.id()).ok_or(Error::NotKept(sess.id()))?;
         let fence = sess.raise_turn_fence(turn_id)?;
         kept.lease = Some(TurnLease {
             holder: Some(holder),
+            agent,
             turn_id,
         });
         Ok(fence)
@@ -731,15 +840,22 @@ fn classify_session(session: &Session, agent: AgentId) -> Result<Liveness> {
         });
     }
     let live_ids: HashSet<_> = bindings.iter().map(|b| b.id).collect();
+    // Only this Agent's Bindings count. Agentless attaches (`agent: None`,
+    // e.g. `Session::bind`) still count for every Agent: fail closed to
+    // Unknown rather than guess. Another Agent's Binding never does.
+    let mut mine: HashSet<BindingId> = HashSet::new();
     let mut attached = false;
     let mut released_without_live = false;
     for e in session.events()? {
         match e.body {
-            EventBody::BindingAttached { .. } => {
+            EventBody::BindingAttached { binding, agent: a } if a.is_none() || a == Some(agent) => {
+                mine.insert(binding);
                 attached = true;
                 released_without_live = false;
             }
-            EventBody::BindingReleased { binding } if !live_ids.contains(&binding) => {
+            EventBody::BindingReleased { binding }
+                if mine.contains(&binding) && !live_ids.contains(&binding) =>
+            {
                 released_without_live = true;
             }
             _ => {}
@@ -815,7 +931,7 @@ mod tests {
         let other = rt.store().create_agent("other", "");
         let session = rt.create_session();
         rt.keep(session.id(), kept.id, goose()).unwrap();
-        let (t_kept, fence, kb) = rt.begin_turn(session.id(), "h".into()).unwrap();
+        let (t_kept, fence, kb) = rt.begin_turn(session.id(), kept.id, "h".into()).unwrap();
 
         // Other Agent opens its own turn while the kept turn is live.
         session.join(Member::Agent(other.id)).unwrap();
@@ -823,7 +939,10 @@ mod tests {
         let t_other = session.turn_start(other.id).unwrap().turn.unwrap();
         assert_ne!(t_kept, t_other);
         assert_ne!(kb, ob.id);
-        assert_eq!(rt.classify(session.id()).unwrap(), Liveness::LiveInTurn);
+        assert_eq!(
+            rt.classify(session.id(), kept.id).unwrap(),
+            Liveness::LiveInTurn
+        );
         assert_eq!(session.current_turn_on(kb).unwrap(), Some(t_kept));
         assert_eq!(session.current_turn_on(ob.id).unwrap(), Some(t_other));
 
@@ -846,11 +965,14 @@ mod tests {
         assert_eq!(msg(other.id, "o"), Some(t_other));
 
         rt.end_turn(session.id(), "h".into(), fence, false).unwrap();
-        assert_eq!(rt.classify(session.id()).unwrap(), Liveness::LiveIdle);
+        assert_eq!(
+            rt.classify(session.id(), kept.id).unwrap(),
+            Liveness::LiveIdle
+        );
         assert_eq!(session.current_turn_of(other.id).unwrap(), Some(t_other));
         // Kept Agent idle while the other Agent is still in its turn: a
         // fresh begin_turn proceeds (no Waiting(TurnOpen) for another owner).
-        let (t2, f2, _) = rt.begin_turn(session.id(), "h".into()).unwrap();
+        let (t2, f2, _) = rt.begin_turn(session.id(), kept.id, "h".into()).unwrap();
         assert!(t2 > t_other);
         rt.end_turn(session.id(), "h".into(), f2, false).unwrap();
         session.turn_end(other.id).unwrap();
@@ -879,6 +1001,7 @@ mod tests {
         let evs = rt
             .wake(
                 session.id(),
+                agent.id,
                 Wake::UserQuery {
                     user: user.id,
                     text: "hi".into(),
@@ -907,6 +1030,7 @@ mod tests {
 
         let evs2 = rt.wake(
             session.id(),
+            agent.id,
             Wake::UserQuery {
                 user: user.id,
                 text: "again".into(),
@@ -935,6 +1059,7 @@ mod tests {
         rt.keep(session.id(), agent.id, goose()).unwrap();
         rt.wake(
             session.id(),
+            agent.id,
             Wake::UserQuery {
                 user: user.id,
                 text: "first".into(),
@@ -950,6 +1075,7 @@ mod tests {
 
         rt.wake(
             session.id(),
+            agent.id,
             Wake::UserQuery {
                 user: user.id,
                 text: "again".into(),
@@ -971,7 +1097,7 @@ mod tests {
         rt.release(sid).unwrap();
         assert!(!rt.kept().contains(&sid));
         assert!(matches!(
-            rt.wake(sid, Wake::Timer).unwrap_err(),
+            rt.wake(sid, agent.id, Wake::Timer).unwrap_err(),
             Error::NotKept(id) if id == sid
         ));
         assert!(rt.store().session(sid).is_ok());
@@ -984,7 +1110,7 @@ mod tests {
         let agent = rt.store().create_agent("scribe", "");
         let session = rt.create_session();
         rt.keep(session.id(), agent.id, goose()).unwrap();
-        rt.schedule(session.id(), 1_000).unwrap();
+        rt.schedule(session.id(), agent.id, 1_000).unwrap();
 
         assert!(rt.tick(Some(0)).unwrap().is_empty());
 
@@ -992,14 +1118,14 @@ mod tests {
         let fired = rt.tick(Some(now)).unwrap();
         assert_eq!(fired.len(), 1);
         assert_eq!(fired[0].0, session.id());
-        assert!(fired[0].1.iter().any(|e| matches!(
+        assert!(fired[0].2.iter().any(|e| matches!(
             e.body,
             EventBody::Wake {
                 source: WakeSource::Timer
             }
         )));
         assert!(fired[0]
-            .1
+            .2
             .iter()
             .any(|e| matches!(e.body, EventBody::TurnStart { .. })));
 
@@ -1009,7 +1135,7 @@ mod tests {
         assert!(rt.tick(Some(now)).unwrap().is_empty());
         let again = rt.tick(Some(now.saturating_add(1_000))).unwrap();
         assert_eq!(again.len(), 1);
-        assert!(again[0].1.iter().any(|e| matches!(
+        assert!(again[0].2.iter().any(|e| matches!(
             e.body,
             EventBody::Wake {
                 source: WakeSource::Timer
@@ -1026,6 +1152,7 @@ mod tests {
         let evs = rt
             .wake(
                 session.id(),
+                agent.id,
                 Wake::Trigger {
                     name: "hook".into(),
                 },
@@ -1052,6 +1179,7 @@ mod tests {
         rt.keep(session.id(), agent.id, goose()).unwrap();
         rt.wake(
             session.id(),
+            agent.id,
             Wake::UserQuery {
                 user: user.id,
                 text: "hi".into(),
@@ -1061,13 +1189,14 @@ mod tests {
         session.turn_end(agent.id).unwrap();
         rt.wake(
             session.id(),
+            agent.id,
             Wake::Trigger {
                 name: "hook".into(),
             },
         )
         .unwrap();
         session.turn_end(agent.id).unwrap();
-        rt.wake(session.id(), Wake::Timer).unwrap();
+        rt.wake(session.id(), agent.id, Wake::Timer).unwrap();
 
         let log = session.events().unwrap();
         assert!(log.iter().any(|e| matches!(e.body, EventBody::Wake { .. })));
@@ -1096,6 +1225,7 @@ mod tests {
         for i in 0..8 {
             let r = rt.wake(
                 session.id(),
+                agent.id,
                 Wake::UserQuery {
                     user: user.id,
                     text: format!("p{i}"),
@@ -1137,6 +1267,7 @@ mod tests {
         rt.keep(session.id(), agent.id, goose()).unwrap();
         rt.wake(
             session.id(),
+            agent.id,
             Wake::UserQuery {
                 user: user.id,
                 text: "hi".into(),
@@ -1144,7 +1275,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            rt.remint(session.id()),
+            rt.remint(session.id(), agent.id),
             Err(Error::Waiting(WaitReason::AlreadyLive))
         ));
         assert_eq!(session.bindings().unwrap().len(), 1);
@@ -1157,7 +1288,9 @@ mod tests {
         let session = rt.create_session();
         rt.keep(session.id(), agent.id, goose()).unwrap();
         let host_a = HolderId::new("host-a");
-        let (turn, fence, binding) = rt.begin_turn(session.id(), host_a.clone()).unwrap();
+        let (turn, fence, binding) = rt
+            .begin_turn(session.id(), agent.id, host_a.clone())
+            .unwrap();
 
         let charges = std::cell::Cell::new(0);
         let refunds = std::cell::Cell::new(0);
@@ -1178,7 +1311,7 @@ mod tests {
 
         let host_b = HolderId::new("host-b");
         let (turn2, fence2, binding2) = rt
-            .resume_interrupted_turn(session.id(), host_b.clone())
+            .resume_interrupted_turn(session.id(), agent.id, host_b.clone())
             .unwrap();
         assert_eq!(turn2, turn);
         assert_ne!(fence2, fence);
@@ -1228,7 +1361,9 @@ mod tests {
         let session = rt.create_session();
         rt.keep(session.id(), agent.id, goose()).unwrap();
         let host_a = HolderId::new("host-a");
-        let (turn, fence, binding) = rt.begin_turn(session.id(), host_a.clone()).unwrap();
+        let (turn, fence, binding) = rt
+            .begin_turn(session.id(), agent.id, host_a.clone())
+            .unwrap();
         rt.durable_step(session.id(), host_a.clone(), fence, turn, "step", || {
             Ok("ok".into())
         })
@@ -1240,7 +1375,7 @@ mod tests {
         assert_eq!(before[0].id, binding);
 
         let (_, _, resumed) = rt
-            .resume_interrupted_turn(session.id(), HolderId::new("host-b"))
+            .resume_interrupted_turn(session.id(), agent.id, HolderId::new("host-b"))
             .unwrap();
         let after = session.bindings().unwrap();
         assert_eq!(resumed, binding);
@@ -1269,7 +1404,9 @@ mod tests {
         let session = rt.create_session();
         rt.keep(session.id(), agent.id, goose()).unwrap();
         let host_a = HolderId::new("host-a");
-        let (turn, fence, _) = rt.begin_turn(session.id(), host_a.clone()).unwrap();
+        let (turn, fence, _) = rt
+            .begin_turn(session.id(), agent.id, host_a.clone())
+            .unwrap();
         rt.durable_step(session.id(), host_a.clone(), fence, turn, "a", || {
             Ok("1".into())
         })
@@ -1278,7 +1415,7 @@ mod tests {
 
         let host_b = HolderId::new("host-b");
         let (turn2, fence2, _) = rt
-            .resume_interrupted_turn(session.id(), host_b.clone())
+            .resume_interrupted_turn(session.id(), agent.id, host_b.clone())
             .unwrap();
         assert!(matches!(
             rt.durable_step(session.id(), host_b.clone(), fence, turn2, "b", || {
@@ -1301,15 +1438,17 @@ mod tests {
         let session = rt.create_session();
         rt.keep(session.id(), agent.id, goose()).unwrap();
         let host_a = HolderId::new("host-a");
-        let (_turn, fence, _) = rt.begin_turn(session.id(), host_a.clone()).unwrap();
+        let (_turn, fence, _) = rt
+            .begin_turn(session.id(), agent.id, host_a.clone())
+            .unwrap();
         assert!(matches!(
-            rt.resume_interrupted_turn(session.id(), HolderId::new("host-b")),
+            rt.resume_interrupted_turn(session.id(), agent.id, HolderId::new("host-b")),
             Err(Error::LiveTurnOpen)
         ));
         assert!(rt.turn_lease(session.id()).unwrap().is_some());
 
         rt.end_turn(session.id(), host_a, fence, true).unwrap();
-        rt.resume_interrupted_turn(session.id(), HolderId::new("host-b"))
+        rt.resume_interrupted_turn(session.id(), agent.id, HolderId::new("host-b"))
             .unwrap();
     }
 
@@ -1320,7 +1459,9 @@ mod tests {
         let session = rt.create_session();
         rt.keep(session.id(), agent.id, goose()).unwrap();
         let holder = HolderId::new("host-a");
-        let (turn, fence, _) = rt.begin_turn(session.id(), holder.clone()).unwrap();
+        let (turn, fence, _) = rt
+            .begin_turn(session.id(), agent.id, holder.clone())
+            .unwrap();
         rt.durable_step(session.id(), holder.clone(), fence, turn, "charge", || {
             Ok("42".into())
         })
@@ -1353,7 +1494,9 @@ mod tests {
         let session = rt.create_session();
         rt.keep(session.id(), agent.id, goose()).unwrap();
         let holder = HolderId::new("host-a");
-        let (turn, fence, _) = rt.begin_turn(session.id(), holder.clone()).unwrap();
+        let (turn, fence, _) = rt
+            .begin_turn(session.id(), agent.id, holder.clone())
+            .unwrap();
         let runs = std::cell::Cell::new(0);
         let first = rt
             .durable_step(session.id(), holder.clone(), fence, turn, "once", || {
@@ -1394,7 +1537,9 @@ mod tests {
             Err(Error::SessionNotOwned)
         ));
         let holder = HolderId::new("host-a");
-        let (turn, fence, _) = rt.begin_turn(session.id(), holder.clone()).unwrap();
+        let (turn, fence, _) = rt
+            .begin_turn(session.id(), agent.id, holder.clone())
+            .unwrap();
         assert!(matches!(
             rt.durable_step(
                 session.id(),
@@ -1415,14 +1560,16 @@ mod tests {
         let session = rt.create_session();
         rt.keep(session.id(), agent.id, goose()).unwrap();
         assert!(matches!(
-            rt.resume_interrupted_turn(session.id(), HolderId::new("host-b")),
+            rt.resume_interrupted_turn(session.id(), agent.id, HolderId::new("host-b")),
             Err(Error::TurnNotOpen)
         ));
         let holder = HolderId::new("host-a");
-        let (turn, fence, _) = rt.begin_turn(session.id(), holder.clone()).unwrap();
+        let (turn, fence, _) = rt
+            .begin_turn(session.id(), agent.id, holder.clone())
+            .unwrap();
         rt.end_turn(session.id(), holder, fence, false).unwrap();
         assert!(matches!(
-            rt.resume_interrupted_turn(session.id(), HolderId::new("host-b")),
+            rt.resume_interrupted_turn(session.id(), agent.id, HolderId::new("host-b")),
             Err(Error::TurnNotOpen)
         ));
         let _ = turn;
@@ -1435,7 +1582,9 @@ mod tests {
         let session = rt.create_session();
         rt.keep(session.id(), agent.id, goose()).unwrap();
         let host_a = HolderId::new("host-a");
-        let (_turn, fence, _) = rt.begin_turn(session.id(), host_a.clone()).unwrap();
+        let (_turn, fence, _) = rt
+            .begin_turn(session.id(), agent.id, host_a.clone())
+            .unwrap();
         session
             .append(EventBody::ToolCall {
                 agent: agent.id,
@@ -1463,7 +1612,7 @@ mod tests {
         rt.end_turn(session.id(), host_a, fence, true).unwrap();
 
         let host_b = HolderId::new("host-b");
-        rt.resume_interrupted_turn(session.id(), host_b.clone())
+        rt.resume_interrupted_turn(session.id(), agent.id, host_b.clone())
             .unwrap();
 
         let log = session.events().unwrap();
@@ -1496,7 +1645,7 @@ mod tests {
         let b = rt.store().create_agent("b", "");
         let session = rt.create_session();
         rt.keep(session.id(), b.id, goose()).unwrap();
-        let (tb, fence, _) = rt.begin_turn(session.id(), "h1".into()).unwrap();
+        let (tb, fence, _) = rt.begin_turn(session.id(), b.id, "h1".into()).unwrap();
 
         session.join(Member::Agent(a.id)).unwrap();
         session.bind_agent(a.id, "cli", None, None).unwrap();
@@ -1529,7 +1678,7 @@ mod tests {
         // Crash + resume_interrupted_turn for B.
         rt.end_turn(session.id(), "h1".into(), fence, true).unwrap();
         let (t_resumed, f2, _) = rt
-            .resume_interrupted_turn(session.id(), "h2".into())
+            .resume_interrupted_turn(session.id(), b.id, "h2".into())
             .unwrap();
         assert_eq!(t_resumed, tb);
         assert_eq!(interrupted("b-open"), 1);
@@ -1540,7 +1689,7 @@ mod tests {
         rt.end_turn(session.id(), "h2".into(), f2, true).unwrap();
         rt.release(session.id()).unwrap();
         rt.keep(session.id(), b.id, goose()).unwrap();
-        let (t_adopt, _, _) = rt.begin_turn(session.id(), "h3".into()).unwrap();
+        let (t_adopt, _, _) = rt.begin_turn(session.id(), b.id, "h3".into()).unwrap();
         assert_eq!(t_adopt, tb);
         assert_eq!(interrupted("b-open-2"), 1);
         assert_eq!(interrupted("a-live"), 0, "adopt must not touch A");
@@ -1560,7 +1709,9 @@ mod tests {
         let session = rt.create_session();
         rt.keep(session.id(), agent.id, goose()).unwrap();
         let host_a = HolderId::new("host-a");
-        let (turn, fence, _) = rt.begin_turn(session.id(), host_a.clone()).unwrap();
+        let (turn, fence, _) = rt
+            .begin_turn(session.id(), agent.id, host_a.clone())
+            .unwrap();
         session
             .append(EventBody::ToolCall {
                 agent: agent.id,
@@ -1573,7 +1724,7 @@ mod tests {
 
         let host_b = HolderId::new("host-b");
         let (turn2, fence2, _) = rt
-            .resume_interrupted_turn(session.id(), host_b.clone())
+            .resume_interrupted_turn(session.id(), agent.id, host_b.clone())
             .unwrap();
         assert_eq!(turn2, turn);
         assert_eq!(
@@ -1595,7 +1746,8 @@ mod tests {
         // Crash again under the new holder; second reclaim must not duplicate.
         rt.end_turn(session.id(), host_b, fence2, true).unwrap();
         let host_c = HolderId::new("host-c");
-        rt.resume_interrupted_turn(session.id(), host_c).unwrap();
+        rt.resume_interrupted_turn(session.id(), agent.id, host_c)
+            .unwrap();
         assert_eq!(
             session
                 .events()
@@ -1624,6 +1776,7 @@ mod tests {
         rt.keep(session.id(), agent.id, goose()).unwrap();
         rt.wake(
             session.id(),
+            agent.id,
             Wake::UserQuery {
                 user: user.id,
                 text: "hi".into(),
@@ -1633,7 +1786,9 @@ mod tests {
         let turn_before = session.current_turn().unwrap();
         let binds_before = session.bindings().unwrap();
         let holder = HolderId::new("host-a");
-        let (turn, fence, binding) = rt.begin_turn(session.id(), holder.clone()).unwrap();
+        let (turn, fence, binding) = rt
+            .begin_turn(session.id(), agent.id, holder.clone())
+            .unwrap();
         assert_eq!(Some(turn), turn_before);
         assert_eq!(binding, binds_before[0].id);
         let out = rt
@@ -1662,22 +1817,28 @@ mod tests {
         let session = rt.create_session();
         let agent = rt.store().create_agent("scribe", "");
         rt.keep(session.id(), agent.id, goose()).unwrap();
-        let first = rt.remint(session.id()).unwrap();
+        let first = rt.remint(session.id(), agent.id).unwrap();
         assert!(matches!(
-            rt.remint(session.id()),
+            rt.remint(session.id(), agent.id),
             Err(Error::Waiting(WaitReason::AlreadyLive))
         ));
         assert!(matches!(
             claim_binding(&session, agent.id, goose()),
             Err(Error::Waiting(WaitReason::AlreadyLive))
         ));
-        rt.wake(session.id(), Wake::Timer).unwrap();
+        rt.wake(session.id(), agent.id, Wake::Timer).unwrap();
         let live: Vec<_> = session.bindings().unwrap().iter().map(|b| b.id).collect();
         assert_eq!(live, vec![first]);
     }
 
-    fn next_due(rt: &Runtime, sid: SessionId) -> Option<u64> {
-        rt.lock_kept().unwrap().get(&sid).unwrap().next_due_ms
+    fn next_due(rt: &Runtime, sid: SessionId, agent: AgentId) -> Option<u64> {
+        rt.lock_kept()
+            .unwrap()
+            .get(&sid)
+            .unwrap()
+            .agent(agent)
+            .unwrap()
+            .next_due_ms
     }
 
     #[test]
@@ -1688,18 +1849,22 @@ mod tests {
         let b = rt.create_session();
         rt.keep(a.id(), agent.id, goose()).unwrap();
         rt.keep(b.id(), agent.id, goose()).unwrap();
-        rt.schedule(a.id(), 1_000).unwrap();
-        rt.schedule(b.id(), 1_000).unwrap();
-        rt.wake(a.id(), Wake::Timer).unwrap(); // A turn open
+        rt.schedule(a.id(), agent.id, 1_000).unwrap();
+        rt.schedule(b.id(), agent.id, 1_000).unwrap();
+        rt.wake(a.id(), agent.id, Wake::Timer).unwrap(); // A turn open
         let a_len = a.events().unwrap().len();
-        let a_due = next_due(&rt, a.id());
+        let a_due = next_due(&rt, a.id(), agent.id);
         let now = now_ts().saturating_add(5_000);
 
         let fired = rt.tick(Some(now)).unwrap();
         assert_eq!(fired.len(), 1);
         assert_eq!(fired[0].0, b.id());
         assert_eq!(a.events().unwrap().len(), a_len, "skip writes nothing");
-        assert_eq!(next_due(&rt, a.id()), a_due, "skip keeps next_due_ms");
+        assert_eq!(
+            next_due(&rt, a.id(), agent.id),
+            a_due,
+            "skip keeps next_due_ms"
+        );
 
         // B rescheduled, A still due but busy: same now fires nothing.
         assert!(rt.tick(Some(now)).unwrap().is_empty());
@@ -1707,7 +1872,7 @@ mod tests {
         let later = rt.tick(Some(now)).unwrap();
         assert_eq!(later.len(), 1);
         assert_eq!(later[0].0, a.id());
-        assert!(later[0].1.iter().any(|e| matches!(
+        assert!(later[0].2.iter().any(|e| matches!(
             e.body,
             EventBody::Wake {
                 source: WakeSource::Timer
@@ -1725,10 +1890,12 @@ mod tests {
         rt.lock_kept().unwrap().insert(
             ghost,
             Kept {
-                agent: agent.id,
-                host: goose(),
-                timer_every_ms: Some(1_000),
-                next_due_ms: Some(0),
+                agents: vec![KeptAgent {
+                    agent: agent.id,
+                    host: goose(),
+                    timer_every_ms: Some(1_000),
+                    next_due_ms: Some(0),
+                }],
                 lease: None,
             },
         );
@@ -1746,7 +1913,7 @@ mod tests {
         rt.keep(session.id(), agent.id, goose()).unwrap();
         assert!(session.bindings().unwrap().is_empty());
         let err = rt
-            .wake_with(session.id(), Wake::Timer, &mut AlreadyBound)
+            .wake_with(session.id(), agent.id, Wake::Timer, &mut AlreadyBound)
             .unwrap_err();
         assert!(matches!(err, Error::Waiting(WaitReason::NoBinding)));
         assert!(
@@ -1766,6 +1933,7 @@ mod tests {
         // First wake claims via default path.
         rt.wake(
             session.id(),
+            agent.id,
             Wake::UserQuery {
                 user: user.id,
                 text: "first".into(),
@@ -1784,6 +1952,7 @@ mod tests {
         let evs = rt
             .wake_with(
                 session.id(),
+                agent.id,
                 Wake::UserQuery {
                     user: user.id,
                     text: "again".into(),
@@ -1812,7 +1981,9 @@ mod tests {
         let session = rt.create_session();
         rt.keep(session.id(), agent.id, goose()).unwrap();
         assert!(session.bindings().unwrap().is_empty());
-        let err = rt.remint_with(session.id(), &mut AlreadyBound).unwrap_err();
+        let err = rt
+            .remint_with(session.id(), agent.id, &mut AlreadyBound)
+            .unwrap_err();
         assert!(matches!(err, Error::Waiting(WaitReason::NoBinding)));
         assert!(
             session.bindings().unwrap().is_empty(),
@@ -1828,7 +1999,12 @@ mod tests {
         rt.keep(session.id(), agent.id, goose()).unwrap();
         assert!(session.bindings().unwrap().is_empty());
         let err = rt
-            .begin_turn_with(session.id(), HolderId::new("host-a"), &mut AlreadyBound)
+            .begin_turn_with(
+                session.id(),
+                agent.id,
+                HolderId::new("host-a"),
+                &mut AlreadyBound,
+            )
             .unwrap_err();
         assert!(matches!(err, Error::Waiting(WaitReason::NoBinding)));
         assert!(
@@ -1844,7 +2020,7 @@ mod tests {
         let session = rt.create_session();
         rt.keep(session.id(), agent.id, goose()).unwrap();
         let (turn, fence, bid) = rt
-            .begin_turn(session.id(), HolderId::new("host-a"))
+            .begin_turn(session.id(), agent.id, HolderId::new("host-a"))
             .unwrap();
         rt.end_turn(session.id(), HolderId::new("host-a"), fence, false)
             .unwrap();
@@ -1855,7 +2031,12 @@ mod tests {
             .filter(|e| matches!(e.body, EventBody::BindingAttached { .. }))
             .count();
         let (turn2, fence2, bid2) = rt
-            .begin_turn_with(session.id(), HolderId::new("host-b"), &mut AlreadyBound)
+            .begin_turn_with(
+                session.id(),
+                agent.id,
+                HolderId::new("host-b"),
+                &mut AlreadyBound,
+            )
             .unwrap();
         assert_ne!(turn2, turn);
         assert_eq!(bid2, bid);
@@ -1883,12 +2064,12 @@ mod tests {
         let session = rt.create_session();
         rt.keep(session.id(), agent.id, goose()).unwrap();
         let h = HolderId::new("host");
-        let (turn, fence, _) = rt.begin_turn(session.id(), h.clone()).unwrap();
+        let (turn, fence, _) = rt.begin_turn(session.id(), agent.id, h.clone()).unwrap();
         // Old process dies without TurnEnd; new process re-keeps.
         rt.release(session.id()).unwrap();
         rt.keep(session.id(), agent.id, goose()).unwrap();
         // Same stable HolderId adopts the open turn from the EventLog.
-        let (turn2, fence2, _) = rt.begin_turn(session.id(), h.clone()).unwrap();
+        let (turn2, fence2, _) = rt.begin_turn(session.id(), agent.id, h.clone()).unwrap();
         assert_eq!(turn2, turn);
         assert!(
             fence2 > fence,
@@ -1906,7 +2087,7 @@ mod tests {
         ));
         // Second begin_turn while the stored turn is live: reject, no enqueue.
         assert!(matches!(
-            rt.begin_turn(session.id(), HolderId::new("other")),
+            rt.begin_turn(session.id(), agent.id, HolderId::new("other")),
             Err(Error::LiveTurnOpen)
         ));
         // New fence still works.
@@ -1928,7 +2109,7 @@ mod tests {
         let session = rt.create_session();
         rt.keep(session.id(), agent.id, goose()).unwrap();
         let h = HolderId::new("host");
-        let (_turn, fence, _) = rt.begin_turn(session.id(), h.clone()).unwrap();
+        let (_turn, fence, _) = rt.begin_turn(session.id(), agent.id, h.clone()).unwrap();
         session
             .append(EventBody::ToolCall {
                 agent: agent.id,
@@ -1956,7 +2137,7 @@ mod tests {
         // Host restart as release + keep + begin_turn (documented adopt path).
         rt.release(session.id()).unwrap();
         rt.keep(session.id(), agent.id, goose()).unwrap();
-        let (_turn2, fence2, _) = rt.begin_turn(session.id(), h.clone()).unwrap();
+        let (_turn2, fence2, _) = rt.begin_turn(session.id(), agent.id, h.clone()).unwrap();
         assert!(fence2 > fence);
 
         let log = session.events().unwrap();
@@ -1985,7 +2166,7 @@ mod tests {
         rt.end_turn(session.id(), h.clone(), fence2, true).unwrap();
         rt.release(session.id()).unwrap();
         rt.keep(session.id(), agent.id, goose()).unwrap();
-        rt.begin_turn(session.id(), HolderId::new("host-b"))
+        rt.begin_turn(session.id(), agent.id, HolderId::new("host-b"))
             .unwrap();
         assert_eq!(
             session
@@ -2004,5 +2185,265 @@ mod tests {
             "second adopt must not duplicate interrupt"
         );
         assert!(crate::unmatched_tool_calls(&session.events().unwrap()).is_empty());
+    }
+
+    // ---- Keep-by-(Session, Agent) ----
+
+    fn codex() -> Host {
+        HostKind::Codex.host(None, None)
+    }
+
+    fn kind_of(session: &Session, agent: AgentId) -> String {
+        session
+            .bindings()
+            .unwrap()
+            .into_iter()
+            .find(|b| b.agent == Some(agent))
+            .expect("binding")
+            .kind
+    }
+
+    fn turn_starts_of(evs: &[Event], agent: AgentId) -> usize {
+        evs.iter()
+            .filter(|e| matches!(e.body, EventBody::TurnStart { agent: a } if a == agent))
+            .count()
+    }
+
+    /// Two Agents kept on one Session: each keeps its own recipe, wake
+    /// addresses one Agent and remints with that Agent's Host only.
+    #[test]
+    fn two_agents_kept_on_one_session_wake_uses_own_recipe() {
+        let rt = Runtime::new();
+        let a = rt.store().create_agent("a", "");
+        let b = rt.store().create_agent("b", "");
+        let session = rt.create_session();
+        let sid = session.id();
+        rt.keep(sid, a.id, goose()).unwrap();
+        rt.keep(sid, b.id, codex()).unwrap();
+        assert_eq!(rt.kept(), vec![sid]);
+        assert_eq!(rt.kept_agents(sid), vec![a.id, b.id]);
+        assert_eq!(rt.classify(sid, a.id).unwrap(), Liveness::NeverBound);
+        assert_eq!(rt.classify(sid, b.id).unwrap(), Liveness::NeverBound);
+
+        // Wake A: A's goose recipe, never B's codex (B was kept last).
+        let evs = rt.wake(sid, a.id, Wake::Timer).unwrap();
+        assert_eq!(turn_starts_of(&evs, a.id), 1);
+        assert_eq!(turn_starts_of(&evs, b.id), 0);
+        assert_eq!(session.bindings().unwrap().len(), 1);
+        assert_eq!(kind_of(&session, a.id), "goose");
+        // A's live Binding is not evidence for B: B is still NeverBound.
+        assert_eq!(rt.classify(sid, a.id).unwrap(), Liveness::LiveInTurn);
+        assert_eq!(rt.classify(sid, b.id).unwrap(), Liveness::NeverBound);
+
+        // A busy does not block B; B mints with its own codex recipe.
+        assert!(matches!(
+            rt.wake(sid, a.id, Wake::Timer),
+            Err(Error::Waiting(WaitReason::TurnOpen))
+        ));
+        let evs = rt.wake(sid, b.id, Wake::Timer).unwrap();
+        assert_eq!(turn_starts_of(&evs, b.id), 1);
+        assert_eq!(kind_of(&session, b.id), "codex");
+        assert_eq!(kind_of(&session, a.id), "goose");
+        assert_eq!(session.bindings().unwrap().len(), 2);
+        assert!(session.current_turn_of(a.id).unwrap().is_some());
+        assert!(session.current_turn_of(b.id).unwrap().is_some());
+    }
+
+    /// A positively dead Binding of one Agent never reads as the other's:
+    /// A unbound → A PositivelyDead, B still NeverBound; remint A uses A's
+    /// recipe and leaves B unbound.
+    #[test]
+    fn remint_addresses_one_agent_other_agent_liveness_untouched() {
+        let rt = Runtime::new();
+        let a = rt.store().create_agent("a", "");
+        let b = rt.store().create_agent("b", "");
+        let session = rt.create_session();
+        let sid = session.id();
+        rt.keep(sid, a.id, goose()).unwrap();
+        rt.keep(sid, b.id, codex()).unwrap();
+        let first = rt.remint(sid, a.id).unwrap();
+        assert!(matches!(
+            rt.remint(sid, a.id),
+            Err(Error::Waiting(WaitReason::AlreadyLive))
+        ));
+        session.unbind(first).unwrap();
+        assert_eq!(rt.classify(sid, a.id).unwrap(), Liveness::PositivelyDead);
+        assert_eq!(rt.classify(sid, b.id).unwrap(), Liveness::NeverBound);
+
+        let bb = rt.remint(sid, b.id).unwrap();
+        assert_eq!(kind_of(&session, b.id), "codex");
+        assert_eq!(rt.classify(sid, a.id).unwrap(), Liveness::PositivelyDead);
+        let again = rt.remint(sid, a.id).unwrap();
+        assert_ne!(again, first);
+        assert_eq!(kind_of(&session, a.id), "goose");
+        let live: Vec<_> = session.bindings().unwrap().iter().map(|x| x.id).collect();
+        assert_eq!(live.len(), 2);
+        assert!(live.contains(&bb) && live.contains(&again));
+    }
+
+    /// Overwriting keep for one Agent updates only that Agent's recipe;
+    /// the other Agent's recipe and timer are untouched.
+    #[test]
+    fn rekeep_overwrites_only_that_agents_recipe() {
+        let rt = Runtime::new();
+        let a = rt.store().create_agent("a", "");
+        let b = rt.store().create_agent("b", "");
+        let session = rt.create_session();
+        let sid = session.id();
+        rt.keep(sid, a.id, goose()).unwrap();
+        rt.keep(sid, b.id, goose()).unwrap();
+        rt.schedule(sid, b.id, 1_000).unwrap();
+        let b_due = next_due(&rt, sid, b.id);
+        rt.keep(sid, a.id, codex()).unwrap();
+        assert_eq!(rt.kept_agents(sid), vec![a.id, b.id], "no duplicate entry");
+        assert_eq!(next_due(&rt, sid, b.id), b_due, "B's timer untouched");
+        assert_eq!(next_due(&rt, sid, a.id), None);
+
+        rt.remint(sid, a.id).unwrap();
+        rt.remint(sid, b.id).unwrap();
+        assert_eq!(kind_of(&session, a.id), "codex");
+        assert_eq!(kind_of(&session, b.id), "goose");
+    }
+
+    /// tick addresses each due (Session, Agent): both fire with their own
+    /// turn; a busy Agent is skipped (stays due) while the other fires.
+    #[test]
+    fn tick_addresses_each_kept_agent() {
+        let rt = Runtime::new();
+        let a = rt.store().create_agent("a", "");
+        let b = rt.store().create_agent("b", "");
+        let c = rt.store().create_agent("c", "");
+        let session = rt.create_session();
+        let sid = session.id();
+        rt.keep(sid, a.id, goose()).unwrap();
+        rt.keep(sid, b.id, codex()).unwrap();
+        rt.keep(sid, c.id, goose()).unwrap(); // kept, never scheduled
+        rt.schedule(sid, a.id, 1_000).unwrap();
+        rt.schedule(sid, b.id, 1_000).unwrap();
+        let now = now_ts().saturating_add(5_000);
+
+        let fired = rt.tick(Some(now)).unwrap();
+        let who: Vec<_> = fired.iter().map(|(s, ag, _)| (*s, *ag)).collect();
+        assert_eq!(
+            who,
+            vec![(sid, a.id), (sid, b.id)],
+            "keep order, C unscheduled"
+        );
+        assert_eq!(turn_starts_of(&fired[0].2, a.id), 1);
+        assert_eq!(turn_starts_of(&fired[0].2, b.id), 0);
+        assert_eq!(turn_starts_of(&fired[1].2, b.id), 1);
+        assert_eq!(kind_of(&session, a.id), "goose");
+        assert_eq!(kind_of(&session, b.id), "codex");
+        assert!(session.current_turn_of(c.id).unwrap().is_none());
+
+        // A ends its turn; B stays busy. Past both due times only A fires,
+        // B is skipped with its next_due_ms unchanged.
+        session.turn_end(a.id).unwrap();
+        let b_due = next_due(&rt, sid, b.id);
+        let later = now.saturating_add(1_000);
+        let fired = rt.tick(Some(later)).unwrap();
+        let who: Vec<_> = fired.iter().map(|(_, ag, _)| *ag).collect();
+        assert_eq!(who, vec![a.id]);
+        assert_eq!(next_due(&rt, sid, b.id), b_due, "busy B stays due");
+        assert_eq!(next_due(&rt, sid, a.id), Some(later.saturating_add(1_000)));
+
+        session.turn_end(b.id).unwrap();
+        let fired = rt.tick(Some(later)).unwrap();
+        let who: Vec<_> = fired.iter().map(|(_, ag, _)| *ag).collect();
+        assert_eq!(who, vec![b.id]);
+    }
+
+    /// release_agent drops one recipe (and only its own lease); releasing
+    /// the last kept Agent un-keeps the Session. A non-kept Agent on a kept
+    /// Session is AgentNotKept.
+    #[test]
+    fn release_agent_keeps_other_agents() {
+        let rt = Runtime::new();
+        let a = rt.store().create_agent("a", "");
+        let b = rt.store().create_agent("b", "");
+        let stranger = rt.store().create_agent("s", "");
+        let session = rt.create_session();
+        let sid = session.id();
+        rt.keep(sid, a.id, goose()).unwrap();
+        rt.keep(sid, b.id, goose()).unwrap();
+        assert!(matches!(
+            rt.wake(sid, stranger.id, Wake::Timer),
+            Err(Error::AgentNotKept(s, ag)) if s == sid && ag == stranger.id
+        ));
+        let (_, _, _) = rt.begin_turn(sid, b.id, "h".into()).unwrap();
+        rt.release_agent(sid, a.id).unwrap();
+        assert_eq!(rt.kept_agents(sid), vec![b.id]);
+        assert!(rt.turn_lease(sid).unwrap().is_some(), "B's lease survives");
+        assert!(matches!(
+            rt.classify(sid, a.id),
+            Err(Error::AgentNotKept(..))
+        ));
+        rt.release_agent(sid, b.id).unwrap();
+        assert!(!rt.kept().contains(&sid));
+        assert!(matches!(
+            rt.wake(sid, b.id, Wake::Timer),
+            Err(Error::NotKept(s)) if s == sid
+        ));
+    }
+
+    /// The lease and fence stay per Session: while A holds the lease B's
+    /// begin_turn is LiveTurnOpen, but B's un-leased wake proceeds. After A
+    /// ends, B leases its own turn under a raised fence; durable steps and
+    /// end_turn address the lease Agent.
+    #[test]
+    fn begin_turn_lease_per_session_addresses_lease_agent() {
+        let rt = Runtime::new();
+        let a = rt.store().create_agent("a", "");
+        let b = rt.store().create_agent("b", "");
+        let session = rt.create_session();
+        let sid = session.id();
+        rt.keep(sid, a.id, goose()).unwrap();
+        rt.keep(sid, b.id, codex()).unwrap();
+        let (ta, fa, ba) = rt.begin_turn(sid, a.id, "ha".into()).unwrap();
+        let lease = rt.turn_lease(sid).unwrap().unwrap();
+        assert_eq!((lease.agent, lease.turn_id, lease.fence), (a.id, ta, fa));
+        assert!(matches!(
+            rt.begin_turn(sid, b.id, "hb".into()),
+            Err(Error::LiveTurnOpen)
+        ));
+        let evs = rt.wake(sid, b.id, Wake::Timer).unwrap();
+        assert_eq!(turn_starts_of(&evs, b.id), 1);
+        let tb_wake = session.current_turn_of(b.id).unwrap().unwrap();
+
+        rt.durable_step(sid, "ha".into(), fa, ta, "s", || Ok("a".into()))
+            .unwrap();
+        rt.end_turn(sid, "ha".into(), fa, false).unwrap();
+        assert!(session.current_turn_of(a.id).unwrap().is_none());
+        assert_eq!(session.current_turn_of(b.id).unwrap(), Some(tb_wake));
+
+        // B adopts its wake-opened turn under a raised fence.
+        let (tb, fb, bb) = rt.begin_turn(sid, b.id, "hb".into()).unwrap();
+        assert_eq!(tb, tb_wake);
+        assert!(fb > fa);
+        assert_ne!(bb, ba);
+        assert_eq!(rt.turn_lease(sid).unwrap().unwrap().agent, b.id);
+        rt.end_turn(sid, "hb".into(), fb, false).unwrap();
+        assert!(session.current_turns().unwrap().is_empty());
+    }
+
+    /// resume_interrupted_turn takes the Agent: it reclaims that Agent's
+    /// open turn, never another kept Agent's.
+    #[test]
+    fn resume_interrupted_turn_addresses_agent() {
+        let rt = Runtime::new();
+        let a = rt.store().create_agent("a", "");
+        let b = rt.store().create_agent("b", "");
+        let session = rt.create_session();
+        let sid = session.id();
+        rt.keep(sid, a.id, goose()).unwrap();
+        rt.keep(sid, b.id, goose()).unwrap();
+        rt.wake(sid, a.id, Wake::Timer).unwrap();
+        let ta = session.current_turn_of(a.id).unwrap().unwrap();
+        let (tb, fb, _) = rt.begin_turn(sid, b.id, "h1".into()).unwrap();
+        rt.end_turn(sid, "h1".into(), fb, true).unwrap();
+        let (t, _, _) = rt.resume_interrupted_turn(sid, b.id, "h2".into()).unwrap();
+        assert_eq!(t, tb);
+        assert_ne!(t, ta);
+        assert_eq!(rt.turn_lease(sid).unwrap().unwrap().agent, b.id);
     }
 }
