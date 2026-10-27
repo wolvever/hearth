@@ -246,11 +246,13 @@ fn event_out(e: &Event) -> EventOut {
     }
 }
 
-/// Agent a user message wakes: the first kept Agent (keep order), else
-/// keep the first Agent member. No per-message Agent addressing yet.
-fn ensure_kept(st: &AppState, id: SessionId) -> Result<hearth::AgentId, StatusCode> {
-    if let Some(agent) = st.runtime.kept_agents(id).first() {
-        return Ok(*agent);
+/// Ensure the Session has at least one kept Agent (bootstrap: keep the
+/// first Agent member). Returns every kept Agent in keep order so a user
+/// message can wake each — not first-only (#47 residual / Wake-each-kept).
+fn ensure_kept_agents(st: &AppState, id: SessionId) -> Result<Vec<hearth::AgentId>, StatusCode> {
+    let kept = st.runtime.kept_agents(id);
+    if !kept.is_empty() {
+        return Ok(kept);
     }
     let session = st.store().session(id).map_err(|_| StatusCode::NOT_FOUND)?;
     let agent = session
@@ -265,11 +267,12 @@ fn ensure_kept(st: &AppState, id: SessionId) -> Result<hearth::AgentId, StatusCo
         return Err(StatusCode::CONFLICT);
     };
     keep_standin(st, id, agent)?;
-    Ok(agent)
+    Ok(vec![agent])
 }
 
 /// Shared steer used by HTTP POST /events and WS `{"type":"message",...}`.
-/// Admit only through [`Runtime::wake`]. Wait is 409. Do not append on wait.
+/// Admit only through [`Runtime::wake_each_kept`]: every kept Agent is
+/// addressed (one shared UserMessage). Wait is 409. Do not append on wait.
 fn apply_user_message(
     st: &AppState,
     id: SessionId,
@@ -283,22 +286,29 @@ fn apply_user_message(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let uid = *names.users.get(&name).ok_or(StatusCode::NOT_FOUND)?;
     drop(names);
-    let agent = ensure_kept(st, id)?;
+    let _agents = ensure_kept_agents(st, id)?;
     match st
         .runtime
-        .wake(id, agent, Wake::UserQuery { user: uid, text })
+        .wake_each_kept(id, Wake::UserQuery { user: uid, text })
     {
-        Ok(evs) => {
-            for e in &evs {
-                st.publish(id, event_out(e));
+        Ok(per_agent) => {
+            let mut um: Option<EventOut> = None;
+            for (_agent, evs) in &per_agent {
+                for e in evs {
+                    let out = event_out(e);
+                    if matches!(e.body, EventBody::UserMessage { .. }) {
+                        um = Some(out.clone());
+                    }
+                    st.publish(id, out);
+                }
             }
-            let um = evs
-                .iter()
-                .rev()
-                .find(|e| matches!(e.body, EventBody::UserMessage { .. }))
-                .or(evs.last())
-                .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
-            Ok(event_out(um))
+            um.or_else(|| {
+                per_agent
+                    .last()
+                    .and_then(|(_, evs)| evs.last())
+                    .map(event_out)
+            })
+            .ok_or(StatusCode::INTERNAL_SERVER_ERROR)
         }
         Err(hearth::Error::Waiting(_))
         | Err(hearth::Error::NotKept(_))
@@ -539,6 +549,59 @@ mod tests {
         assert!(txt.contains("codex"));
         assert!(txt.contains("cursor-agent"));
         assert!(txt.contains("agent"));
+    }
+
+    /// Wake-each-kept service floor: two kept ParallelSafe Agents both
+    /// receive a user message (TurnStart each; one UserMessage). A
+    /// first-only `wake` mutant fails this.
+    #[tokio::test]
+    async fn user_message_wakes_every_kept_agent() {
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let id = sid.0.to_string();
+
+        apply_join(&st, sid, Some("cheng".into()), None).unwrap();
+        apply_join(&st, sid, None, Some("alpha".into())).unwrap();
+        apply_join(&st, sid, None, Some("beta".into())).unwrap();
+        let agents = st.runtime.kept_agents(sid);
+        assert_eq!(agents.len(), 2, "join keeps each Agent");
+        for (i, a) in agents.iter().enumerate() {
+            st.runtime
+                .set_parallel_safe(
+                    sid,
+                    *a,
+                    Some(hearth::ParallelSafe::paths([format!("agent-{i}")])),
+                )
+                .unwrap();
+        }
+
+        let app = router(st.clone());
+        let (code, body) = call(
+            app.clone(),
+            Request::post(format!("/sessions/{id}/events"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"user":"cheng","message":"hi-both"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert!(body.contains("hi-both"));
+
+        let session = st.store().session(sid).unwrap();
+        for a in &agents {
+            assert!(
+                session.current_turn_of(*a).unwrap().is_some(),
+                "kept Agent {a:?} must receive wake (first-only mutant fails)"
+            );
+        }
+        let ums = session
+            .events()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e.body, EventBody::UserMessage { .. }))
+            .count();
+        assert_eq!(ums, 1, "one shared UserMessage");
     }
 
     #[tokio::test]

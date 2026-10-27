@@ -7,7 +7,7 @@ Local HTTP + WebSocket on 0.0.0.0:8787. Bind address only; no public URL is clai
 - POST /sessions {"folder":"/optional/existing/path"}
 - GET /sessions/:id
 - POST /sessions/:id/join {"user":"cheng"} or {"agent":"tag"}
-- POST /sessions/:id/events {"user":"cheng","message":"..."} (text is an alias). Goes through Runtime::wake. 409 if the turn is open; the log is unchanged.
+- POST /sessions/:id/events {"user":"cheng","message":"..."} (text is an alias). Goes through Runtime::wake_each_kept (every kept Agent; one UserMessage). 409 if every Agent waits; the log is unchanged.
 - GET /sessions/:id/events
 - GET /agents/local PATH lookup only. --version only if the binary exists. Missing CLIs have path null. No session CLI is spawned.
 
