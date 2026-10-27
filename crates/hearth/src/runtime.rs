@@ -40,7 +40,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::{
     now_ts, open_turn_of_agent, step_result_of, AgentId, BindingId, Error, Event, EventBody, Host,
-    InMemory, Member, Result, Session, SessionId, WaitReason, WakeSource,
+    InMemory, Member, ParallelSafe, Result, Session, SessionId, WaitReason, WakeSource,
 };
 
 /// Why a kept session is being woken.
@@ -170,6 +170,10 @@ struct KeptAgent {
     /// (ms since epoch, same clock as [`crate::Event::ts`]).
     timer_every_ms: Option<u64>,
     next_due_ms: Option<u64>,
+    /// Explicit parallel-safe opt-in for turns this Runtime opens for the
+    /// Agent ([`Runtime::wake`] / [`Runtime::begin_turn`]); `None` =
+    /// fail-closed ([`Runtime::set_parallel_safe`]).
+    parallel_safe: Option<ParallelSafe>,
 }
 
 /// Internal keep record for one Session: every kept Agent's recipe (keep
@@ -283,6 +287,7 @@ impl Runtime {
                 host: spec.host,
                 timer_every_ms: None,
                 next_due_ms: None,
+                parallel_safe: None,
             }),
         }
         Ok(())
@@ -345,6 +350,52 @@ impl Runtime {
         ka.timer_every_ms = Some(every_ms);
         ka.next_due_ms = Some(now_ts().saturating_add(every_ms));
         Ok(())
+    }
+
+    /// `(session, agent)` must be kept. Sets (or with `None` clears) the
+    /// explicit parallel-safe declaration this Runtime passes to
+    /// [`Session::turn_start_with`] for that Agent's wake / begin_turn
+    /// turns. Default `None`: fail-closed — the Agent's new turn waits
+    /// ([`WaitReason::TurnOpen`]) while any other turn is open, and any
+    /// other new turn waits while its turn is open. Survives re-`keep`.
+    pub fn set_parallel_safe(
+        &self,
+        session: SessionId,
+        agent: AgentId,
+        decl: Option<ParallelSafe>,
+    ) -> Result<()> {
+        let mut g = self.lock_kept()?;
+        let kept = g.get_mut(&session).ok_or(Error::NotKept(session))?;
+        let ka = kept
+            .agent_mut(agent)
+            .ok_or(Error::AgentNotKept(session, agent))?;
+        ka.parallel_safe = decl;
+        Ok(())
+    }
+
+    /// Read-only conflict gate for a new turn of kept `agent` with its
+    /// declaration ([`Self::set_parallel_safe`]; [`Session::check_turn_gate`]).
+    /// Wire seams call this before `host_wake` so a refused turn costs
+    /// zero wire action. Not a reservation: the turn start rechecks.
+    pub fn check_turn_gate(&self, session: SessionId, agent: AgentId) -> Result<()> {
+        let decl = self.kept_parallel_safe(session, agent)?;
+        self.store
+            .session(session)?
+            .check_turn_gate(agent, decl.as_ref())
+    }
+
+    fn kept_parallel_safe(
+        &self,
+        session: SessionId,
+        agent: AgentId,
+    ) -> Result<Option<ParallelSafe>> {
+        let g = self.lock_kept()?;
+        let kept = g.get(&session).ok_or(Error::NotKept(session))?;
+        Ok(kept
+            .agent(agent)
+            .ok_or(Error::AgentNotKept(session, agent))?
+            .parallel_safe
+            .clone())
     }
 
     /// Classify a kept Agent's Binding lease. Absence of a heartbeat is
@@ -410,7 +461,9 @@ impl Runtime {
     ///
     /// Prompt path never remints a live Binding. `NeverBound` / `PositivelyDead`
     /// remint first via [`ClaimBinding`] (idle launch / empty pool), then link.
-    /// `LiveInTurn` / `Unknown` wait. Another Agent's open turn does not.
+    /// `LiveInTurn` / `Unknown` wait. Another Agent's open turn waits too
+    /// (`TurnOpen`) unless both turns opted in parallel-safe on disjoint
+    /// paths ([`Self::set_parallel_safe`]); the gate runs before any claim.
     /// Does **not** call [`Session::turn_end`] — the host runner would end the turn later.
     /// Does **not** spawn a real CLI or invent `AgentMessage`.
     ///
@@ -436,20 +489,19 @@ impl Runtime {
     ) -> Result<Vec<Event>> {
         let _gate = self.lock_durable()?;
         let host = self.kept_host(session, agent)?;
+        let decl = self.kept_parallel_safe(session, agent)?;
         let sess = self.store.session(session)?;
         let start_len = sess.events()?.len();
         ensure_agent_member(&sess, agent)?;
 
-        match classify_session(&sess, agent)? {
-            Liveness::LiveInTurn => return Err(Error::Waiting(WaitReason::TurnOpen)),
-            Liveness::Unknown => return Err(Error::Waiting(WaitReason::LivenessUnknown)),
-            Liveness::LiveIdle => {}
-            Liveness::NeverBound | Liveness::PositivelyDead => {
-                claim.claim(&sess, agent, host)?;
-            }
+        let needs_claim = needs_claim(classify_session(&sess, agent)?)?;
+        // Conflict gate before any side effect (claim / Wake record).
+        sess.check_turn_gate(agent, decl.as_ref())?;
+        if needs_claim {
+            claim.claim(&sess, agent, host)?;
         }
         record_wake(&sess, &wake)?;
-        sess.turn_start(agent)?;
+        sess.turn_start_with(agent, decl)?;
 
         let events = sess.events()?;
         Ok(events[start_len..].to_vec())
@@ -601,6 +653,7 @@ impl Runtime {
     ) -> Result<(u64, u64, BindingId)> {
         let _gate = self.lock_durable()?;
         let host = self.kept_host(session, agent)?;
+        let decl = self.kept_parallel_safe(session, agent)?;
         let sess = self.store.session(session)?;
         ensure_agent_member(&sess, agent)?;
 
@@ -629,16 +682,14 @@ impl Runtime {
             return Ok((turn_id, fence, binding));
         }
 
-        match classify_session(&sess, agent)? {
-            Liveness::LiveInTurn => return Err(Error::Waiting(WaitReason::TurnOpen)),
-            Liveness::Unknown => return Err(Error::Waiting(WaitReason::LivenessUnknown)),
-            Liveness::LiveIdle => {}
-            Liveness::NeverBound | Liveness::PositivelyDead => {
-                claim.claim(&sess, agent, host)?;
-            }
+        let needs_claim = needs_claim(classify_session(&sess, agent)?)?;
+        // Conflict gate before claim; turn_start_with rechecks.
+        sess.check_turn_gate(agent, decl.as_ref())?;
+        if needs_claim {
+            claim.claim(&sess, agent, host)?;
         }
 
-        let start = sess.turn_start(agent)?;
+        let start = sess.turn_start_with(agent, decl)?;
         let turn_id = start.turn.ok_or(Error::TurnNotOpen)?;
         let binding = binding_for_agent(&sess, agent)?;
         let fence = self.install_lease(&sess, agent, holder, turn_id)?;
@@ -819,6 +870,17 @@ impl Runtime {
     }
 }
 
+/// Prompt-path liveness: `LiveInTurn` / `Unknown` wait; `true` when the
+/// Agent needs a Binding claim (`NeverBound` / `PositivelyDead`).
+fn needs_claim(l: Liveness) -> Result<bool> {
+    match l {
+        Liveness::LiveInTurn => Err(Error::Waiting(WaitReason::TurnOpen)),
+        Liveness::Unknown => Err(Error::Waiting(WaitReason::LivenessUnknown)),
+        Liveness::LiveIdle => Ok(false),
+        Liveness::NeverBound | Liveness::PositivelyDead => Ok(true),
+    }
+}
+
 fn record_wake(session: &Session, wake: &Wake) -> Result<Event> {
     match wake {
         // Prefer UserMessage alone so queries are not doubled with Wake.
@@ -906,6 +968,18 @@ mod tests {
     use super::*;
     use crate::{is_model_visible, HostKind, Member};
 
+    fn ps(path: &str) -> Option<ParallelSafe> {
+        Some(ParallelSafe::paths([path]))
+    }
+
+    /// Opt every listed kept Agent in as parallel-safe on its own path.
+    fn opt_in(rt: &Runtime, sid: SessionId, agents: &[AgentId]) {
+        for (i, a) in agents.iter().enumerate() {
+            rt.set_parallel_safe(sid, *a, ps(&format!("agent-{i}")))
+                .unwrap();
+        }
+    }
+
     fn goose() -> Host {
         HostKind::Goose.host(None, None)
     }
@@ -922,8 +996,8 @@ mod tests {
 
     /// Per-Binding turn map: another Agent's open turn on the same Session
     /// does not make the kept Agent `LiveInTurn`; the kept Agent's leased
-    /// turn and durable steps run concurrently with correct turn stamps.
-    /// (No path-conflict gate in the kernel yet.)
+    /// turn and durable steps run concurrently with correct turn stamps
+    /// (both turns opted in parallel-safe on disjoint paths).
     #[test]
     fn other_agent_open_turn_does_not_block_kept_agent() {
         let rt = Runtime::new();
@@ -931,12 +1005,18 @@ mod tests {
         let other = rt.store().create_agent("other", "");
         let session = rt.create_session();
         rt.keep(session.id(), kept.id, goose()).unwrap();
+        rt.set_parallel_safe(session.id(), kept.id, ps("kept"))
+            .unwrap();
         let (t_kept, fence, kb) = rt.begin_turn(session.id(), kept.id, "h".into()).unwrap();
 
         // Other Agent opens its own turn while the kept turn is live.
         session.join(Member::Agent(other.id)).unwrap();
         let ob = session.bind_agent(other.id, "cli", None, None).unwrap();
-        let t_other = session.turn_start(other.id).unwrap().turn.unwrap();
+        let t_other = session
+            .turn_start_with(other.id, ps("other"))
+            .unwrap()
+            .turn
+            .unwrap();
         assert_ne!(t_kept, t_other);
         assert_ne!(kb, ob.id);
         assert_eq!(
@@ -1645,11 +1725,16 @@ mod tests {
         let b = rt.store().create_agent("b", "");
         let session = rt.create_session();
         rt.keep(session.id(), b.id, goose()).unwrap();
+        rt.set_parallel_safe(session.id(), b.id, ps("b")).unwrap();
         let (tb, fence, _) = rt.begin_turn(session.id(), b.id, "h1".into()).unwrap();
 
         session.join(Member::Agent(a.id)).unwrap();
         session.bind_agent(a.id, "cli", None, None).unwrap();
-        let ta = session.turn_start(a.id).unwrap().turn.unwrap();
+        let ta = session
+            .turn_start_with(a.id, ps("a"))
+            .unwrap()
+            .turn
+            .unwrap();
         let tool = |agent, id: &str| {
             session
                 .append(EventBody::ToolCall {
@@ -1895,6 +1980,7 @@ mod tests {
                     host: goose(),
                     timer_every_ms: Some(1_000),
                     next_due_ms: Some(0),
+                    parallel_safe: None,
                 }],
                 lease: None,
             },
@@ -2220,6 +2306,7 @@ mod tests {
         let sid = session.id();
         rt.keep(sid, a.id, goose()).unwrap();
         rt.keep(sid, b.id, codex()).unwrap();
+        opt_in(&rt, sid, &[a.id, b.id]);
         assert_eq!(rt.kept(), vec![sid]);
         assert_eq!(rt.kept_agents(sid), vec![a.id, b.id]);
         assert_eq!(rt.classify(sid, a.id).unwrap(), Liveness::NeverBound);
@@ -2318,6 +2405,7 @@ mod tests {
         rt.keep(sid, a.id, goose()).unwrap();
         rt.keep(sid, b.id, codex()).unwrap();
         rt.keep(sid, c.id, goose()).unwrap(); // kept, never scheduled
+        opt_in(&rt, sid, &[a.id, b.id, c.id]);
         rt.schedule(sid, a.id, 1_000).unwrap();
         rt.schedule(sid, b.id, 1_000).unwrap();
         let now = now_ts().saturating_add(5_000);
@@ -2399,6 +2487,7 @@ mod tests {
         let sid = session.id();
         rt.keep(sid, a.id, goose()).unwrap();
         rt.keep(sid, b.id, codex()).unwrap();
+        opt_in(&rt, sid, &[a.id, b.id]);
         let (ta, fa, ba) = rt.begin_turn(sid, a.id, "ha".into()).unwrap();
         let lease = rt.turn_lease(sid).unwrap().unwrap();
         assert_eq!((lease.agent, lease.turn_id, lease.fence), (a.id, ta, fa));
@@ -2437,6 +2526,7 @@ mod tests {
         let sid = session.id();
         rt.keep(sid, a.id, goose()).unwrap();
         rt.keep(sid, b.id, goose()).unwrap();
+        opt_in(&rt, sid, &[a.id, b.id]);
         rt.wake(sid, a.id, Wake::Timer).unwrap();
         let ta = session.current_turn_of(a.id).unwrap().unwrap();
         let (tb, fb, _) = rt.begin_turn(sid, b.id, "h1".into()).unwrap();
@@ -2445,5 +2535,105 @@ mod tests {
         assert_eq!(t, tb);
         assert_ne!(t, ta);
         assert_eq!(rt.turn_lease(sid).unwrap().unwrap().agent, b.id);
+    }
+
+    /// Fail-closed default: two kept Agents without a parallel-safe
+    /// declaration never run concurrently. The second wake waits
+    /// (`TurnOpen`) before any side effect — no claim, no Wake record —
+    /// and tick skips it (still due) while the first fires.
+    #[test]
+    fn wake_without_parallel_safe_waits_on_other_agents_turn() {
+        let rt = Runtime::new();
+        let a = rt.store().create_agent("a", "");
+        let b = rt.store().create_agent("b", "");
+        let session = rt.create_session();
+        let sid = session.id();
+        rt.keep(sid, a.id, goose()).unwrap();
+        rt.keep(sid, b.id, codex()).unwrap();
+        rt.schedule(sid, a.id, 1_000).unwrap();
+        rt.schedule(sid, b.id, 1_000).unwrap();
+        let now = now_ts().saturating_add(5_000);
+        let b_due = next_due(&rt, sid, b.id);
+
+        let fired = rt.tick(Some(now)).unwrap();
+        let who: Vec<_> = fired.iter().map(|(_, ag, _)| *ag).collect();
+        assert_eq!(who, vec![a.id]);
+        assert_eq!(next_due(&rt, sid, b.id), b_due, "B stays due");
+        assert_eq!(rt.classify(sid, b.id).unwrap(), Liveness::NeverBound);
+
+        let before = session.events().unwrap().len();
+        assert!(matches!(
+            rt.wake(sid, b.id, Wake::Timer),
+            Err(Error::Waiting(WaitReason::TurnOpen))
+        ));
+        assert_eq!(session.events().unwrap().len(), before, "nothing written");
+        assert_eq!(session.bindings().unwrap().len(), 1, "B never claimed");
+
+        // B alone opting in is not enough: A's open turn did not.
+        rt.set_parallel_safe(sid, b.id, ps("b")).unwrap();
+        assert!(matches!(
+            rt.wake(sid, b.id, Wake::Timer),
+            Err(Error::Waiting(WaitReason::TurnOpen))
+        ));
+        assert!(matches!(
+            rt.begin_turn(sid, b.id, "hb".into()),
+            Err(Error::Waiting(WaitReason::TurnOpen))
+        ));
+
+        // A ends; B (declared) now opens alone.
+        session.turn_end(a.id).unwrap();
+        rt.wake(sid, b.id, Wake::Timer).unwrap();
+        assert!(session.current_turn_of(b.id).unwrap().is_some());
+    }
+
+    /// Both kept Agents opted in: overlapping path sets serialize, disjoint
+    /// ones run as concurrent LiveInTurn on one Session.
+    #[test]
+    fn wake_parallel_safe_serializes_same_paths_only() {
+        let rt = Runtime::new();
+        let a = rt.store().create_agent("a", "");
+        let b = rt.store().create_agent("b", "");
+        let session = rt.create_session();
+        let sid = session.id();
+        rt.keep(sid, a.id, goose()).unwrap();
+        rt.keep(sid, b.id, codex()).unwrap();
+        rt.set_parallel_safe(sid, a.id, ps("src")).unwrap();
+        rt.set_parallel_safe(sid, b.id, ps("src/lib.rs")).unwrap();
+
+        rt.wake(sid, a.id, Wake::Timer).unwrap();
+        let before = session.events().unwrap().len();
+        assert!(matches!(
+            rt.wake(sid, b.id, Wake::Timer),
+            Err(Error::Waiting(WaitReason::TurnOpen))
+        ));
+        assert_eq!(session.events().unwrap().len(), before);
+
+        rt.set_parallel_safe(sid, b.id, ps("docs")).unwrap();
+        rt.wake(sid, b.id, Wake::Timer).unwrap();
+        assert_eq!(rt.classify(sid, a.id).unwrap(), Liveness::LiveInTurn);
+        assert_eq!(rt.classify(sid, b.id).unwrap(), Liveness::LiveInTurn);
+        assert_eq!(session.current_turns().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn set_parallel_safe_requires_kept_agent() {
+        let rt = Runtime::new();
+        let a = rt.store().create_agent("a", "");
+        let b = rt.store().create_agent("b", "");
+        let session = rt.create_session();
+        let sid = session.id();
+        assert!(matches!(
+            rt.set_parallel_safe(sid, a.id, ps("a")),
+            Err(Error::NotKept(_))
+        ));
+        rt.keep(sid, a.id, goose()).unwrap();
+        assert!(matches!(
+            rt.set_parallel_safe(sid, b.id, ps("b")),
+            Err(Error::AgentNotKept(_, _))
+        ));
+        rt.set_parallel_safe(sid, a.id, ps("a")).unwrap();
+        // Re-keep keeps the declaration.
+        rt.keep(sid, a.id, codex()).unwrap();
+        assert_eq!(rt.kept_parallel_safe(sid, a.id).unwrap(), ps("a"));
     }
 }
