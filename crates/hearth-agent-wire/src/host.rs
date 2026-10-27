@@ -144,7 +144,8 @@ pub fn host_for(
 ///
 /// A wire `parent` (subagent nesting, e.g. ACP
 /// `_meta.claudeCode.parentToolUseId`) lands as `parent_tool_call_id` on
-/// [`EventBody::ToolCall`] / [`EventBody::AgentMessage`] — an Event field,
+/// [`EventBody::ToolCall`] / [`EventBody::AgentMessage`] /
+/// [`EventBody::PermissionAsked`] (outside [`PermissionRpc`]) — an Event field,
 /// never a child Session or Binding. The wire `subagent` launch marker and
 /// `SubagentStarted` / `SubagentEnded` are not appended.
 pub fn event_bodies(binding: BindingId, agent: AgentId, ev: &AgentEvent) -> Vec<EventBody> {
@@ -209,6 +210,7 @@ pub fn event_bodies(binding: BindingId, agent: AgentId, ev: &AgentEvent) -> Vec<
             description,
             tool_item_id,
             rpc_id,
+            parent,
             ..
         } => {
             let request = description
@@ -223,6 +225,7 @@ pub fn event_bodies(binding: BindingId, agent: AgentId, ev: &AgentEvent) -> Vec<
                     rpc_id: id.to_string(),
                     tool_call_id: tool_item_id.clone(),
                 }),
+                parent_tool_call_id: parent.clone(),
             }]
         }
         AgentEvent::QuestionAsk { prompts, .. } => vec![EventBody::AskUser {
@@ -1142,6 +1145,79 @@ mod tests {
                 other => panic!("want AgentMessage, got {other:?}"),
             }
         }
+    }
+
+    /// G4 on the Host path, claude-agent-acp #708 ordering: a controller
+    /// ask and a subagent ask (parent on its own `toolCall._meta`) arrive
+    /// before the subagent tool's `session/update`. `PermissionAsked`
+    /// carries `parent_tool_call_id` outside the `(binding, rpc_id)`
+    /// address; the later ToolCall names the same parent.
+    #[test]
+    fn claude_acp_subagent_ask_before_update_keeps_parent_on_permission_asked() {
+        use crate::adapters::acp::AcpCodec;
+        use crate::{FramedAgent, JsonlRpcTransport};
+
+        let (_store, _user, agent, session) = room();
+        let binding = session
+            .bind_host(Some(agent.id), host_for(AgentKind::Acp, None, None))
+            .unwrap();
+        let ask = |id: i64, tc: &str, meta: Option<&str>| {
+            let mut tool_call = serde_json::json!({"toolCallId": tc, "title": tc});
+            if let Some(p) = meta {
+                tool_call["_meta"] =
+                    serde_json::json!({"claudeCode": {"toolName": "Bash", "parentToolUseId": p}});
+            }
+            serde_json::json!({"jsonrpc": "2.0", "id": id, "method": "session/request_permission",
+                "params": {"sessionId": "s1", "toolCall": tool_call, "options": [
+                    {"optionId": "allow", "name": "Allow", "kind": "allow_once"}]}})
+        };
+        let frames = [
+            ask(1, "call_ctrl", None),
+            ask(2, "toolu_sub_bash", Some("toolu_task")),
+            serde_json::json!({"jsonrpc": "2.0", "method": "session/update",
+                "params": {"sessionId": "s1", "update": {"sessionUpdate": "tool_call",
+                    "toolCallId": "toolu_sub_bash", "title": "Bash", "status": "pending",
+                    "_meta": {"claudeCode": {"parentToolUseId": "toolu_task"}}}}}),
+        ];
+        let mut io = FramedAgent::new(JsonlRpcTransport::without_rpc_chunks(), AcpCodec);
+        for f in frames {
+            io.transport_mut().push_decoded(f);
+        }
+        let mut attach = HostAttach::attach(binding.clone(), agent.id, io);
+        attach.drain(&session).unwrap();
+        assert_eq!(attach.pending_permissions().len(), 2);
+        assert_eq!(session.bindings().unwrap().len(), 1);
+
+        let asked: Vec<(PermissionRpc, Option<String>)> = session
+            .events()
+            .unwrap()
+            .into_iter()
+            .filter_map(|e| match e.body {
+                EventBody::PermissionAsked {
+                    rpc: Some(rpc),
+                    parent_tool_call_id,
+                    ..
+                } => Some((rpc, parent_tool_call_id)),
+                _ => None,
+            })
+            .collect();
+        let rpc = |id: &str, tc: &str| PermissionRpc {
+            binding: binding.id,
+            rpc_id: id.into(),
+            tool_call_id: Some(tc.into()),
+        };
+        assert_eq!(
+            asked,
+            [
+                (rpc("1", "call_ctrl"), None),
+                (rpc("2", "toolu_sub_bash"), Some("toolu_task".into())),
+            ]
+        );
+        assert!(session.events().unwrap().iter().any(|e| matches!(
+            &e.body,
+            EventBody::ToolCall { tool_call_id, parent_tool_call_id: Some(p), .. }
+                if tool_call_id == "toolu_sub_bash" && p == "toolu_task"
+        )));
     }
 
     #[test]

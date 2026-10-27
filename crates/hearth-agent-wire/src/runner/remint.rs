@@ -170,6 +170,11 @@ pub struct PermissionRef {
     pub binding: BindingId,
     pub rpc_id: RpcId,
     pub tool_call_id: Option<ToolCallId>,
+    /// Subagent launch the gated tool ran under, as stated on the ask
+    /// (ACP `toolCall._meta.claudeCode.parentToolUseId`). Carried unchanged
+    /// onto [`RemintEventKind::PermissionResurface`] across remints. Not
+    /// part of the [`PermissionKey`].
+    pub parent_tool_call_id: Option<ToolCallId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -308,6 +313,9 @@ pub struct PendingPermission {
     pub rpc_id: RpcId,
     /// Not unique across concurrent asks (copilot-cli #989).
     pub tool_call_id: Option<ToolCallId>,
+    /// Subagent launch the gated tool ran under (`None` = top level or
+    /// unstated on the ask). Correlation only; never part of the key.
+    pub parent_tool_call_id: Option<ToolCallId>,
     pub title: String,
     pub options: Vec<PermissionOption>,
 }
@@ -322,6 +330,7 @@ impl PendingPermission {
             binding: self.binding.clone(),
             rpc_id: self.rpc_id.clone(),
             tool_call_id: self.tool_call_id.clone(),
+            parent_tool_call_id: self.parent_tool_call_id.clone(),
         }
     }
 }
@@ -1077,10 +1086,12 @@ impl RemintSession {
                 tool_item_id,
                 title,
                 options,
+                parent,
                 ..
-            } => self.request_permission(
+            } => self.request_permission_under(
                 rpc_id.clone(),
                 tool_item_id.as_deref(),
+                parent.as_deref(),
                 title,
                 options.clone(),
             ),
@@ -1101,6 +1112,23 @@ impl RemintSession {
         title: &str,
         options: Vec<PermissionOption>,
     ) -> Result<PermissionRef, RemintError> {
+        self.request_permission_under(rpc_id, tool_call_id, None, title, options)
+    }
+
+    /// [`Self::request_permission`] for an ask that states the subagent
+    /// launch it ran under (`parent_tool_call_id`, from the ask's own wire
+    /// `_meta`). The parent rides the Host `PermissionAsked` and every
+    /// remint marker for this ask; it never changes the `(binding, rpc_id)`
+    /// key, re-ask adoption, or routing. `None` is recorded as-is: Host does
+    /// not borrow a parent from another frame (ask-before-update, #708).
+    pub fn request_permission_under(
+        &self,
+        rpc_id: RpcId,
+        tool_call_id: Option<&str>,
+        parent_tool_call_id: Option<&str>,
+        title: &str,
+        options: Vec<PermissionOption>,
+    ) -> Result<PermissionRef, RemintError> {
         let mut g = self.inner.lock().unwrap();
         let key = (g.binding_id.clone(), rpc_id.clone());
         if g.pending.contains_key(&key) {
@@ -1110,6 +1138,7 @@ impl RemintSession {
             binding: key.0.clone(),
             rpc_id,
             tool_call_id: tool_call_id.map(str::to_string),
+            parent_tool_call_id: parent_tool_call_id.map(str::to_string),
             title: title.into(),
             options,
         };
@@ -1117,7 +1146,12 @@ impl RemintSession {
         // Host EventLog first: on failure nothing is adopted or tracked.
         let rpc = Self::host_rpc(&g, &ask)?;
         g.host_session
-            .ask_permission_rpc(g.host_agent, title.to_string(), rpc)
+            .ask_permission_rpc(
+                g.host_agent,
+                title.to_string(),
+                rpc,
+                ask.parent_tool_call_id.clone(),
+            )
             .map_err(|e| RemintError::HostLog(e.to_string()))?;
         if let Some(tc) = tool_call_id {
             let live_shares = g
@@ -1766,17 +1800,32 @@ mod tests {
 
         /// Agent → client `session/request_permission` (ACP v1 shape).
         fn ask(&mut self, tool_call_id: &str, title: &str) -> WireFrame {
+            self.ask_under(tool_call_id, title, None)
+        }
+
+        /// [`Self::ask`] from a subagent: claude-agent-acp stamps
+        /// `toolCall._meta.claudeCode.parentToolUseId` on the ask itself.
+        fn ask_under(
+            &mut self,
+            tool_call_id: &str,
+            title: &str,
+            parent: Option<&str>,
+        ) -> WireFrame {
             self.next_rpc += 1;
             let rpc = RpcId::Num(self.next_rpc);
             self.waiting.insert(rpc.clone(), tool_call_id.into());
             let advertised = self.shared_tool_call_id.unwrap_or(tool_call_id);
+            let mut tool_call = serde_json::json!({"toolCallId": advertised, "title": title});
+            if let Some(p) = parent {
+                tool_call["_meta"] = serde_json::json!({"claudeCode": {"parentToolUseId": p}});
+            }
             WireFrame::Json(serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": rpc.to_json(),
                 "method": "session/request_permission",
                 "params": {
                     "sessionId": self.agent_session_id,
-                    "toolCall": {"toolCallId": advertised, "title": title},
+                    "toolCall": tool_call,
                     "options": [
                         {"optionId": "allow-once", "name": "Allow", "kind": "allow_once"},
                         {"optionId": "reject-once", "name": "Reject", "kind": "reject_once"}
@@ -1844,6 +1893,19 @@ mod tests {
         title: &str,
     ) -> Result<PermissionRef, RemintError> {
         let frame = peer.ask(tool_call_id, title);
+        let ev = AcpCodec.decode_event(&frame).unwrap().unwrap();
+        s.on_permission_ask(&ev)
+    }
+
+    /// [`ask_via_codec`] for a subagent ask carrying its parent in `_meta`.
+    fn ask_under_via_codec(
+        s: &RemintSession,
+        peer: &mut FakeAcp,
+        tool_call_id: &str,
+        title: &str,
+        parent: &str,
+    ) -> Result<PermissionRef, RemintError> {
+        let frame = peer.ask_under(tool_call_id, title, Some(parent));
         let ev = AcpCodec.decode_event(&frame).unwrap().unwrap();
         s.on_permission_ask(&ev)
     }
@@ -2680,6 +2742,7 @@ mod tests {
             tool_item_id: None,
             options: opts(),
             rpc_id: None,
+            parent: None,
         };
         assert_eq!(
             s.on_permission_ask(&notif),
@@ -2868,6 +2931,238 @@ mod tests {
         assert_maps_empty(&s, "after re-asks answered");
         assert!(peer.methods.iter().all(|m| m != "session/new"));
         assert_eq!(s.agent_session_id(), "S-stable");
+    }
+
+    /// G4: controller ask + subagent ask (parent on its own
+    /// `toolCall._meta`, claude-agent-acp #708 ask-before-update), then
+    /// remint twice. Both resurface on their old `(binding, rpc_id)` keys;
+    /// the subagent's ask keeps its parent on every marker, on the Host
+    /// `PermissionAsked`, and through re-ask adoption; the controller's
+    /// stays `None`. The parent never enters the key or the Host rpc.
+    #[test]
+    fn fake_acp_remint_resurfaces_subagent_ask_with_parent() {
+        let (s, _, bid1) = RemintSession::open("sess-1", "S-1", caps_resume());
+        let mut old = FakeAcp::new("S-1");
+        s.begin_turn("work");
+        let ctrl = ask_via_codec(&s, &mut old, "call_ctrl", "git log").unwrap();
+        let sub = ask_under_via_codec(&s, &mut old, "toolu_sub", "npm test", "toolu_task").unwrap();
+        assert_eq!(ctrl.parent_tool_call_id, None);
+        assert_eq!(sub.parent_tool_call_id.as_deref(), Some("toolu_task"));
+        let keys: Vec<PermissionKey> = s.pending_permissions().iter().map(|p| p.key()).collect();
+        assert_eq!(
+            keys,
+            [
+                (bid1.clone(), ctrl.rpc_id.clone()),
+                (bid1.clone(), sub.rpc_id.clone())
+            ]
+        );
+
+        // Host EventLog: parent rides PermissionAsked, outside PermissionRpc.
+        let asked: Vec<(String, Option<String>, Option<String>)> = s
+            .host_events()
+            .into_iter()
+            .filter_map(|e| match e.body {
+                EventBody::PermissionAsked {
+                    rpc: Some(rpc),
+                    parent_tool_call_id,
+                    ..
+                } => Some((rpc.rpc_id, rpc.tool_call_id, parent_tool_call_id)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            asked,
+            [
+                (ctrl.rpc_id.to_string(), Some("call_ctrl".into()), None),
+                (
+                    sub.rpc_id.to_string(),
+                    Some("toolu_sub".into()),
+                    Some("toolu_task".into())
+                ),
+            ]
+        );
+
+        let resurfaced = |s: &RemintSession, n: usize| -> Vec<PermissionRef> {
+            let all: Vec<PermissionRef> = s
+                .observe()
+                .into_iter()
+                .filter_map(|e| match e.kind {
+                    RemintEventKind::PermissionResurface(r) => Some(r),
+                    _ => None,
+                })
+                .collect();
+            all[all.len() - n..].to_vec()
+        };
+        let o1 = s.remint_and_attach().unwrap();
+        assert!(o1.permission_resurfaced && !o1.turn_interrupted);
+        assert!(s.pending_permissions().is_empty());
+        assert_eq!(resurfaced(&s, 2), [ctrl.clone(), sub.clone()]);
+        let mut held = s.resurfaced_permissions();
+        held.sort_by(|a, b| a.rpc_id.cmp(&b.rpc_id));
+        assert_eq!(
+            held.iter().map(|p| p.as_ref()).collect::<Vec<_>>(),
+            [ctrl.clone(), sub.clone()]
+        );
+        // Dead Binding stays dead regardless of parent.
+        assert_eq!(
+            s.resolve_permission(&bid1, &sub.rpc_id, "allow-once"),
+            Err(RemintError::DeadBinding)
+        );
+
+        // Second remint: same refs, parent intact.
+        let o2 = s.remint_and_attach().unwrap();
+        assert_ne!(o1.binding_id, o2.binding_id);
+        assert_eq!(resurfaced(&s, 2), [ctrl.clone(), sub.clone()]);
+
+        // Resumed agent re-asks the subagent call (unique toolCallId):
+        // adopted, and the new ref carries the parent from the new ask.
+        let mut peer = FakeAcp::new("S-1");
+        let r = ask_under_via_codec(&s, &mut peer, "toolu_sub", "npm test", "toolu_task").unwrap();
+        assert_eq!(r.binding, o2.binding_id);
+        assert_eq!(r.parent_tool_call_id.as_deref(), Some("toolu_task"));
+        assert!(s.observe().iter().any(|e| matches!(
+            &e.kind,
+            RemintEventKind::PermissionReasked { old, new } if *old == sub && *new == r
+        )));
+        assert_eq!(
+            s.resurfaced_permissions()
+                .iter()
+                .map(|p| p.as_ref())
+                .collect::<Vec<_>>(),
+            std::slice::from_ref(&ctrl),
+            "controller ask still waits, still unparented"
+        );
+        send_via_codec(
+            &mut peer,
+            &s.resolve_permission(&o2.binding_id, &r.rpc_id, "allow-once")
+                .unwrap(),
+        );
+        assert_eq!(peer.outcome("toolu_sub").unwrap()["optionId"], "allow-once");
+        assert!(old.got.is_empty() && old.ignored.is_empty());
+
+        // Remint observe stream: PermissionRequested carries the parent for
+        // the original asks and the re-ask (not just the returned ref).
+        let requested: Vec<PermissionRef> = s
+            .observe()
+            .into_iter()
+            .filter_map(|e| match e.kind {
+                RemintEventKind::PermissionRequested(r) => Some(r),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(requested, [ctrl.clone(), sub.clone(), r.clone()]);
+        assert_eq!(
+            requested
+                .iter()
+                .map(|p| p.parent_tool_call_id.as_deref())
+                .collect::<Vec<_>>(),
+            [None, Some("toolu_task"), Some("toolu_task")]
+        );
+        // PermissionResolved (answer) after resolve_permission keeps the parent.
+        let resolved: Vec<PermissionRef> = s
+            .observe()
+            .into_iter()
+            .filter_map(|e| match e.kind {
+                RemintEventKind::PermissionResolved(p) if e.text == "allow-once" => Some(p),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(resolved, std::slice::from_ref(&r));
+        assert_eq!(
+            resolved[0].parent_tool_call_id.as_deref(),
+            Some("toolu_task")
+        );
+
+        // Cancel drops the dead controller ask on the Host log only.
+        let cmds = s.cancel_turn().unwrap();
+        assert_eq!(cmds.len(), 1, "session/cancel only; dead id unanswered");
+        assert!(s.observe().iter().any(|e| matches!(
+            &e.kind,
+            RemintEventKind::PermissionResolved(r2) if *r2 == ctrl && e.text == "cancelled"
+        )));
+        assert_maps_empty(&s, "after re-ask + cancel");
+    }
+
+    /// Pep Must 2: the observe-stream `PermissionRequested` event (not just
+    /// the returned ref) carries the ask's parent, before and after remint.
+    #[test]
+    fn permission_requested_event_carries_parent_across_remint() {
+        let (s, _, bid1) = RemintSession::open("sess-1", "S-1", caps_resume());
+        s.begin_turn("work");
+        let requested = |s: &RemintSession| -> Vec<PermissionRef> {
+            s.observe()
+                .into_iter()
+                .filter_map(|e| match e.kind {
+                    RemintEventKind::PermissionRequested(r) => Some(r),
+                    _ => None,
+                })
+                .collect()
+        };
+        let a = s
+            .request_permission_under(
+                RpcId::Num(1),
+                Some("toolu_sub"),
+                Some("toolu_task"),
+                "npm test",
+                opts(),
+            )
+            .unwrap();
+        assert_eq!(a.binding, bid1);
+        let ev = requested(&s);
+        assert_eq!(ev, std::slice::from_ref(&a));
+        assert_eq!(ev[0].parent_tool_call_id.as_deref(), Some("toolu_task"));
+
+        let o = s.remint_and_attach().unwrap();
+        let b = s
+            .request_permission_under(
+                RpcId::Num(1),
+                Some("toolu_sub"),
+                Some("toolu_task"),
+                "npm test",
+                opts(),
+            )
+            .unwrap();
+        assert_eq!(b.binding, o.binding_id);
+        let ev = requested(&s);
+        assert_eq!(ev, [a, b]);
+        assert_eq!(
+            ev.iter()
+                .map(|p| p.parent_tool_call_id.as_deref())
+                .collect::<Vec<_>>(),
+            [Some("toolu_task"), Some("toolu_task")]
+        );
+    }
+
+    /// Pep Must 1: `PermissionResolved` emitted by `resolve_permission`
+    /// (an answer, not a cancel) carries the ask's parent.
+    #[test]
+    fn permission_resolved_answer_carries_parent() {
+        let (s, _, bid1) = RemintSession::open("sess-1", "S-1", caps_resume());
+        s.begin_turn("work");
+        let a = s
+            .request_permission_under(
+                RpcId::Num(7),
+                Some("toolu_sub"),
+                Some("toolu_task"),
+                "npm test",
+                opts(),
+            )
+            .unwrap();
+        s.resolve_permission(&bid1, &RpcId::Num(7), "allow-once")
+            .unwrap();
+        let resolved: Vec<(PermissionRef, String)> = s
+            .observe()
+            .into_iter()
+            .filter_map(|e| match e.kind {
+                RemintEventKind::PermissionResolved(r) => Some((r, e.text)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(resolved, [(a, "allow-once".to_string())]);
+        assert_eq!(
+            resolved[0].0.parent_tool_call_id.as_deref(),
+            Some("toolu_task")
+        );
     }
 
     /// After remint, a shared toolCallId (copilot-cli #989) is ambiguous:

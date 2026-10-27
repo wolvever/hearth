@@ -53,7 +53,11 @@ never answered (`DeadBinding`; the resumed process restarts ids). A re-ask
 from the resumed agent adopts a resurfaced ask only when its `toolCallId`
 is unique; shared ids (copilot-cli #989) are never routed by `toolCallId`.
 Host `PermissionAsked` / `PermissionDecided` carry a typed
-`PermissionRpc { binding, rpc_id, tool_call_id }`.
+`PermissionRpc { binding, rpc_id, tool_call_id }`. A subagent ask's
+`parent_tool_call_id` (from the ask's own ACP `toolCall._meta`) rides
+`PermissionAsked` beside the rpc and every remint marker
+(`PermissionResurface` included), never the key; no ask-before-update
+patching (DESIGN.md → **Permission parent**).
 
 ## Live attach initialize + remint flush (2026-10-12)
 

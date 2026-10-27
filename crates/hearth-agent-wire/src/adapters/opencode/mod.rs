@@ -118,6 +118,7 @@ pub fn map_event(msg: &Value) -> Result<AgentEvent, BusError> {
                 })
                 .unwrap_or_default(),
             rpc_id: None,
+            parent: None,
         }),
         "question.asked" => Ok(AgentEvent::QuestionAsk {
             session_id,

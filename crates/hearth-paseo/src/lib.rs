@@ -84,6 +84,7 @@ pub fn permission_requested(agent: hearth::AgentId, request: impl Into<String>) 
         agent,
         request: request.into(),
         rpc: None,
+        parent_tool_call_id: None,
     }
 }
 
