@@ -141,20 +141,28 @@ pub fn host_for(
 /// A JSON-RPC permission ask becomes [`EventBody::PermissionAsked`] with a
 /// typed [`PermissionRpc`] (`binding`, `rpc_id`, `tool_call_id`) — not an
 /// `"id:title"` string.
+///
+/// A wire `parent` (subagent nesting, e.g. ACP
+/// `_meta.claudeCode.parentToolUseId`) lands as `parent_tool_call_id` on
+/// [`EventBody::ToolCall`] / [`EventBody::AgentMessage`] — an Event field,
+/// never a child Session or Binding. The wire `subagent` launch marker and
+/// `SubagentStarted` / `SubagentEnded` are not appended.
 pub fn event_bodies(binding: BindingId, agent: AgentId, ev: &AgentEvent) -> Vec<EventBody> {
     match ev {
-        AgentEvent::Message { role, text, .. }
-            if role == "assistant" || role == "agent" || role == "model" =>
-        {
+        AgentEvent::Message {
+            role, text, parent, ..
+        } if role == "assistant" || role == "agent" || role == "model" => {
             vec![EventBody::AgentMessage {
                 agent,
                 text: text.clone(),
+                parent_tool_call_id: parent.clone(),
             }]
         }
-        AgentEvent::MessageDelta { delta, .. } if !delta.is_empty() => {
+        AgentEvent::MessageDelta { delta, parent, .. } if !delta.is_empty() => {
             vec![EventBody::AgentMessage {
                 agent,
                 text: delta.clone(),
+                parent_tool_call_id: parent.clone(),
             }]
         }
         AgentEvent::Thinking { text, .. } => vec![EventBody::AgentThink {
@@ -171,12 +179,14 @@ pub fn event_bodies(binding: BindingId, agent: AgentId, ev: &AgentEvent) -> Vec<
             item_id,
             name,
             arguments,
+            parent,
             ..
         } => vec![EventBody::ToolCall {
             agent,
             tool_call_id: item_id.clone(),
             name: name.clone(),
             input: arguments.to_string(),
+            parent_tool_call_id: parent.clone(),
         }],
         AgentEvent::ToolResult {
             item_id, output, ..
@@ -191,6 +201,7 @@ pub fn event_bodies(binding: BindingId, agent: AgentId, ev: &AgentEvent) -> Vec<
             vec![EventBody::AgentMessage {
                 agent,
                 text: entries.join("\n"),
+                parent_tool_call_id: None,
             }]
         }
         AgentEvent::PermissionAsk {
@@ -221,6 +232,7 @@ pub fn event_bodies(binding: BindingId, agent: AgentId, ev: &AgentEvent) -> Vec<
         AgentEvent::TaskCompleted { task_id, ok, .. } => vec![EventBody::AgentMessage {
             agent,
             text: format!("task {task_id} {}", if *ok { "ok" } else { "failed" }),
+            parent_tool_call_id: None,
         }],
         _ => vec![],
     }
@@ -998,6 +1010,138 @@ mod tests {
                 sandbox_id: None,
             } if kind == "acp" && id == "native-acp"
         ));
+    }
+
+    /// Fake claude-agent-acp: subagent frames on the root ACP session land
+    /// as `parent_tool_call_id` on the one Session's EventLog. No child
+    /// Session, no second Binding, no remint, no subagent body appended.
+    #[test]
+    fn claude_acp_subagent_nests_on_eventlog_without_child_session_or_binding() {
+        use crate::adapters::acp::AcpCodec;
+        use crate::{FramedAgent, JsonlRpcTransport};
+
+        for (name, expect) in [
+            (
+                "claude_subagent_task.json",
+                &[
+                    ("toolu_task", None),
+                    ("toolu_sub_read", Some("toolu_task")),
+                    ("toolu_sub_bash", Some("toolu_task")),
+                    ("toolu_sub_edit", Some("toolu_task")),
+                ][..],
+            ),
+            (
+                "claude_subagent_nested.json",
+                &[
+                    ("toolu_outer", None),
+                    ("toolu_inner", Some("toolu_outer")),
+                    ("toolu_grandchild_read", Some("toolu_inner")),
+                ][..],
+            ),
+        ] {
+            let (_store, _user, agent, session) = room();
+            let binding = session
+                .bind_host(Some(agent.id), host_for(AgentKind::Acp, None, None))
+                .unwrap();
+            let before = session.events().unwrap().len();
+            let frames = crate::adapters::fixture("acp", name);
+            let mut io = FramedAgent::new(JsonlRpcTransport::without_rpc_chunks(), AcpCodec);
+            for f in frames.as_array().unwrap() {
+                io.transport_mut().push_decoded(f.clone());
+            }
+            let mut attach = HostAttach::attach(binding.clone(), agent.id, io);
+            let appended = attach.drain(&session).unwrap();
+            assert_eq!(appended.len(), frames.as_array().unwrap().len(), "{name}");
+
+            // Same Binding, no remint, no native child session adopted.
+            assert_eq!(attach.binding().id, binding.id);
+            assert_eq!(session.bindings().unwrap().len(), 1, "{name}");
+            assert_eq!(session.bindings().unwrap()[0].id, binding.id);
+            assert_eq!(attach.native_session(), None);
+            let log = session.events().unwrap();
+            let new = &log[before..];
+            assert!(
+                new.iter().all(|e| matches!(
+                    e.body,
+                    EventBody::ToolCall { .. } | EventBody::AgentMessage { .. }
+                )),
+                "{name}: only ToolCall / AgentMessage appended"
+            );
+            assert_eq!(
+                log.iter()
+                    .filter(|e| matches!(e.body, EventBody::BindingAttached { .. }))
+                    .count(),
+                1
+            );
+
+            // Every ToolCall frame of an id carries that id's wire parent.
+            for (id, want) in expect {
+                let parents: Vec<Option<&str>> = new
+                    .iter()
+                    .filter_map(|e| match &e.body {
+                        EventBody::ToolCall {
+                            tool_call_id,
+                            parent_tool_call_id,
+                            ..
+                        } if tool_call_id == id => Some(parent_tool_call_id.as_deref()),
+                        _ => None,
+                    })
+                    .collect();
+                assert!(!parents.is_empty(), "{name}: {id}");
+                assert!(
+                    parents.iter().all(|p| p == want),
+                    "{name}: {id} {parents:?}"
+                );
+            }
+            // Child narration nests; nested root text does not.
+            for e in new {
+                if let EventBody::AgentMessage {
+                    text,
+                    parent_tool_call_id,
+                    ..
+                } = &e.body
+                {
+                    let want = match text.as_str() {
+                        "Done." => None,
+                        "Reading the spec first." | "Plan: do X." => Some("toolu_outer"),
+                        _ => Some("toolu_task"),
+                    };
+                    assert_eq!(parent_tool_call_id.as_deref(), want, "{name}: {text}");
+                }
+            }
+            // Nesting is metadata: child activity stays model-visible.
+            assert!(session.surface().unwrap().len() >= new.len());
+        }
+    }
+
+    /// Pin the whole-item `Message` → `AgentMessage` parent copy directly:
+    /// the nest fixtures only exercise `ToolCall` / `MessageDelta`.
+    #[test]
+    fn event_bodies_copies_message_parent_onto_agent_message() {
+        let agent = AgentId::new();
+        let msg = |parent: Option<&str>| AgentEvent::Message {
+            session_id: "s".into(),
+            item_id: "m1".into(),
+            role: "assistant".into(),
+            text: "child says".into(),
+            parent: parent.map(Into::into),
+        };
+        for (parent, want) in [(Some("toolu_task"), Some("toolu_task")), (None, None)] {
+            let bodies = event_bodies(BindingId::new(), agent, &msg(parent));
+            assert_eq!(bodies.len(), 1);
+            match &bodies[0] {
+                EventBody::AgentMessage {
+                    agent: a,
+                    text,
+                    parent_tool_call_id,
+                } => {
+                    assert_eq!(*a, agent);
+                    assert_eq!(text, "child says");
+                    assert_eq!(parent_tool_call_id.as_deref(), want);
+                }
+                other => panic!("want AgentMessage, got {other:?}"),
+            }
+        }
     }
 
     #[test]

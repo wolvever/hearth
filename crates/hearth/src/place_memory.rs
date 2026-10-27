@@ -628,6 +628,7 @@ mod tests {
             .append(EventBody::AgentMessage {
                 agent: agent.id,
                 text: "old-b".into(),
+                parent_tool_call_id: None,
             })
             .unwrap();
         session

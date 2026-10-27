@@ -233,11 +233,23 @@ pub enum AgentEvent {
         item_id: ItemId,
         role: String,
         text: String,
+        /// Tool call this item ran under (Claude Code
+        /// `_meta.claudeCode.parentToolUseId`): the subagent launch it nests
+        /// under. `None` = top level or unknown. Correlation only — never a
+        /// child Session or Binding.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent: Option<ItemId>,
     },
     MessageDelta {
         session_id: SessionId,
         item_id: ItemId,
         delta: String,
+        /// Tool call this item ran under (Claude Code
+        /// `_meta.claudeCode.parentToolUseId`): the subagent launch it nests
+        /// under. `None` = top level or unknown. Correlation only — never a
+        /// child Session or Binding.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent: Option<ItemId>,
     },
     Thinking {
         session_id: SessionId,
@@ -255,6 +267,18 @@ pub enum AgentEvent {
         name: String,
         arguments: serde_json::Value,
         status: ToolStatus,
+        /// Tool call this item ran under (Claude Code
+        /// `_meta.claudeCode.parentToolUseId`): the subagent launch it nests
+        /// under. `None` = top level or unknown. Correlation only — never a
+        /// child Session or Binding.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent: Option<ItemId>,
+        /// This call launches a subagent (Claude Code
+        /// `_meta.claudeCode.subagent == true`, the Task / Agent tool). Its
+        /// `item_id` is what child items name as `parent`. Wire-only marker;
+        /// no child Session, no `SubagentStarted`.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        subagent: bool,
     },
     ToolResult {
         session_id: SessionId,
@@ -512,6 +536,7 @@ impl CodingAgent for LoopbackAgent {
                     item_id: "m1".into(),
                     role: "assistant".into(),
                     text: format!("echo:{text}"),
+                    parent: None,
                 });
                 self.out.push(AgentEvent::TurnCompleted {
                     session_id,

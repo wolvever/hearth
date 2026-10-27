@@ -50,6 +50,7 @@ pub fn map_notification(msg: &Value) -> Result<AgentEvent, BusError> {
                 .and_then(|d| d.as_str())
                 .unwrap_or("")
                 .into(),
+            parent: None,
         }),
         "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta" => {
             Ok(AgentEvent::ThinkingDelta {
@@ -94,6 +95,7 @@ fn map_item(method: &str, session_id: &str, params: &Value) -> Result<AgentEvent
                 .and_then(|t| t.as_str())
                 .unwrap_or("")
                 .into(),
+            parent: None,
         }),
         "reasoning" => Ok(AgentEvent::Thinking {
             session_id: session_id.into(),
@@ -132,6 +134,8 @@ fn map_item(method: &str, session_id: &str, params: &Value) -> Result<AgentEvent
                     name: ty.into(),
                     arguments: item.get("arguments").cloned().unwrap_or(Value::Null),
                     status,
+                    parent: None,
+                    subagent: false,
                 })
             }
         }

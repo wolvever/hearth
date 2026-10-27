@@ -163,6 +163,10 @@ pub enum EventBody {
     AgentMessage {
         agent: AgentId,
         text: String,
+        /// Tool call this message was produced under (subagent nesting from
+        /// the wire, e.g. ACP `_meta.claudeCode.parentToolUseId`). `None` =
+        /// top level. An Event field only — no child Session or Binding.
+        parent_tool_call_id: Option<String>,
     },
     AgentThink {
         agent: AgentId,
@@ -175,6 +179,10 @@ pub enum EventBody {
         tool_call_id: String,
         name: String,
         input: String,
+        /// `tool_call_id` of the tool call this one ran under (a subagent
+        /// launch). `None` = top level. An Event field only — no child
+        /// Session or Binding.
+        parent_tool_call_id: Option<String>,
     },
     ToolResult {
         agent: AgentId,
@@ -1667,6 +1675,7 @@ mod tests {
                 tool_call_id: "t1".into(),
                 name: "read_file".into(),
                 input: "src/lib.rs".into(),
+                parent_tool_call_id: None,
             })
             .unwrap();
         assert!(matches!(
@@ -1809,6 +1818,7 @@ mod tests {
             .append(EventBody::AgentMessage {
                 agent: agent.id,
                 text: "hi".into(),
+                parent_tool_call_id: None,
             })
             .unwrap();
         session.join(Member::User(u2.id)).unwrap();
@@ -1933,6 +1943,7 @@ mod tests {
                 tool_call_id: "tc-ls".into(),
                 name: "ls".into(),
                 input: "{}".into(),
+                parent_tool_call_id: None,
             })
             .unwrap();
         session
@@ -1947,6 +1958,7 @@ mod tests {
             .append(EventBody::AgentMessage {
                 agent: agent.id,
                 text: "done".into(),
+                parent_tool_call_id: None,
             })
             .unwrap();
         session.unbind(bind.id).unwrap();
@@ -1972,6 +1984,7 @@ mod tests {
                 tool_call_id: "x1".into(),
                 name: "bash".into(),
                 input: "{}".into(),
+                parent_tool_call_id: None,
             })
             .unwrap();
         session
@@ -1980,6 +1993,7 @@ mod tests {
                 tool_call_id: "x2".into(),
                 name: "bash".into(),
                 input: "{}".into(),
+                parent_tool_call_id: None,
             })
             .unwrap();
         session
@@ -2018,6 +2032,7 @@ mod tests {
                 tool_call_id: "t1".into(),
                 name: "bash".into(),
                 input: "{}".into(),
+                parent_tool_call_id: None,
             })
             .unwrap();
         session
@@ -2026,6 +2041,7 @@ mod tests {
                 tool_call_id: "t2".into(),
                 name: "read".into(),
                 input: "{}".into(),
+                parent_tool_call_id: None,
             })
             .unwrap();
         session
@@ -2104,6 +2120,7 @@ mod tests {
             .append(EventBody::AgentMessage {
                 agent: agent.id,
                 text: "old-b".into(),
+                parent_tool_call_id: None,
             })
             .unwrap();
         let m3 = session
@@ -2301,6 +2318,7 @@ mod tests {
             .append(EventBody::AgentMessage {
                 agent: agent.id,
                 text: "during".into(),
+                parent_tool_call_id: None,
             })
             .unwrap();
         assert_eq!(mid.turn, Some(1));
@@ -2311,6 +2329,7 @@ mod tests {
             .append(EventBody::AgentMessage {
                 agent: agent.id,
                 text: "after".into(),
+                parent_tool_call_id: None,
             })
             .unwrap();
         assert_eq!(later.turn, None);
@@ -2334,6 +2353,7 @@ mod tests {
             .append(EventBody::AgentMessage {
                 agent,
                 text: text.into(),
+                parent_tool_call_id: None,
             })
             .unwrap()
     }
@@ -2378,6 +2398,7 @@ mod tests {
                 tool_call_id: "t1".into(),
                 name: "edit".into(),
                 input: "{}".into(),
+                parent_tool_call_id: None,
             })
             .unwrap();
         assert_eq!(tc.turn, Some(tb));
@@ -2504,6 +2525,7 @@ mod tests {
                     tool_call_id: id.into(),
                     name: "bash".into(),
                     input: "{}".into(),
+                    parent_tool_call_id: None,
                 })
                 .unwrap();
         }
@@ -2637,6 +2659,7 @@ mod tests {
             .append(EventBody::AgentMessage {
                 agent: agent.id,
                 text: "old-b".into(),
+                parent_tool_call_id: None,
             })
             .unwrap();
         let m3 = session
@@ -2838,6 +2861,7 @@ mod environment {
                 tool_call_id: "tc-claude-write".into(),
                 name: "write".into(),
                 input: "path=/note.txt\nbody=from-claude".into(),
+                parent_tool_call_id: None,
             })
             .unwrap();
         session
@@ -2846,6 +2870,7 @@ mod environment {
                 tool_call_id: "tc-codex-write".into(),
                 name: "write".into(),
                 input: "path=/other.txt\nbody=from-codex".into(),
+                parent_tool_call_id: None,
             })
             .unwrap();
 
@@ -2855,6 +2880,7 @@ mod environment {
                 tool_call_id,
                 name,
                 input,
+                ..
             } = e.body
             {
                 if name != "write" {

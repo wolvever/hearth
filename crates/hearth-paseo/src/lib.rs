@@ -178,6 +178,7 @@ mod tests {
             EventBody::AgentMessage {
                 agent: agent.id,
                 text: "ok".into(),
+                parent_tool_call_id: None,
             },
         ];
         let binding =

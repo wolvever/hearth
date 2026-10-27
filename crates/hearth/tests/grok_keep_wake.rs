@@ -65,6 +65,7 @@ fn keep_wake_then_optional_grok_chat_completion() {
         .append(EventBody::AgentMessage {
             agent: agent.id,
             text: reply,
+            parent_tool_call_id: None,
         })
         .unwrap();
     session.turn_end(agent.id).unwrap();

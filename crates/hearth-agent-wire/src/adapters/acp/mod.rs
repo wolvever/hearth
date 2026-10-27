@@ -30,6 +30,27 @@ pub fn map_notification(msg: &Value, agent: AgentKind) -> Result<AgentEvent, Bus
     }
 }
 
+/// `update._meta.claudeCode.parentToolUseId`: the Task / Agent tool call a
+/// Claude Code (claude-agent-acp) item ran under. Fail-closed: a missing,
+/// non-string, or empty value is `None`, never a guessed parent. `self_id`
+/// (the item's own id) is never its own parent.
+fn claude_parent(update: &Value, self_id: Option<&str>) -> Option<String> {
+    update
+        .pointer("/_meta/claudeCode/parentToolUseId")
+        .and_then(Value::as_str)
+        .filter(|p| !p.is_empty() && Some(*p) != self_id)
+        .map(str::to_string)
+}
+
+/// `update._meta.claudeCode.subagent == true` (JSON `true` only): this tool
+/// call launches a subagent. Anything else is `false`.
+fn claude_subagent(update: &Value) -> bool {
+    update
+        .pointer("/_meta/claudeCode/subagent")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
 pub fn map_session_update(params: &Value, agent: AgentKind) -> Result<AgentEvent, BusError> {
     let session_id = params
         .get("sessionId")
@@ -59,6 +80,7 @@ pub fn map_session_update(params: &Value, agent: AgentKind) -> Result<AgentEvent
                     .unwrap_or("msg")
                     .to_string(),
                 delta: text,
+                parent: claude_parent(&update, None),
             })
         }
         "tool_call" | "tool_call_update" => {
@@ -74,13 +96,16 @@ pub fn map_session_update(params: &Value, agent: AgentKind) -> Result<AgentEvent
                 "cancelled" => ToolStatus::Cancelled,
                 _ => ToolStatus::Pending,
             };
+            let item_id = update
+                .get("toolCallId")
+                .and_then(|i| i.as_str())
+                .unwrap_or("")
+                .to_string();
             Ok(AgentEvent::ToolCall {
                 session_id,
-                item_id: update
-                    .get("toolCallId")
-                    .and_then(|i| i.as_str())
-                    .unwrap_or("")
-                    .to_string(),
+                parent: claude_parent(&update, Some(&item_id)),
+                subagent: claude_subagent(&update),
+                item_id,
                 name: update
                     .get("title")
                     .or_else(|| update.get("kind"))
@@ -636,6 +661,194 @@ mod map_tests {
         };
         assert_eq!(v["method"], "session/cancel");
         assert!(v.get("id").is_none());
+    }
+
+    /// (kind, id, parent, subagent) per decoded frame. Panics on any event
+    /// other than ToolCall / MessageDelta: no SubagentStarted, no
+    /// SessionStarted, no child-session event is invented.
+    fn nesting(name: &str) -> Vec<(&'static str, String, Option<String>, bool)> {
+        let frames = fixture(name);
+        frames
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| {
+                match AcpCodec
+                    .decode_event(&WireFrame::Json(f.clone()))
+                    .unwrap()
+                    .unwrap()
+                {
+                    AgentEvent::ToolCall {
+                        item_id,
+                        parent,
+                        subagent,
+                        session_id,
+                        ..
+                    } => {
+                        assert_eq!(session_id, "s1");
+                        ("tool", item_id, parent, subagent)
+                    }
+                    AgentEvent::MessageDelta {
+                        item_id,
+                        parent,
+                        session_id,
+                        ..
+                    } => {
+                        assert_eq!(session_id, "s1");
+                        ("msg", item_id, parent, false)
+                    }
+                    other => panic!("{name}: unexpected {other:?}"),
+                }
+            })
+            .collect()
+    }
+
+    /// claude-agent-acp origin-main zed snapshot `subagent-task-legacy`:
+    /// Task launch carries `subagent:true`; every child frame names
+    /// `parentToolUseId: toolu_task`; the Task's own frames have no parent.
+    #[test]
+    fn claude_task_fixture_decodes_parent_and_subagent() {
+        let rows = nesting("claude_subagent_task.json");
+        assert_eq!(rows.len(), 25);
+        let mut launch_marked = 0;
+        for (kind, id, parent, subagent) in &rows {
+            if id == "toolu_task" {
+                assert_eq!(*kind, "tool");
+                assert_eq!(parent, &None, "launch is top level");
+                launch_marked += usize::from(*subagent);
+            } else {
+                assert_eq!(parent.as_deref(), Some("toolu_task"), "{kind} {id}");
+                assert!(!subagent, "{id} is not a launch");
+            }
+        }
+        // Only the four frames that carry the flag; later Task updates
+        // (toolResponse / completion) drop it on the wire and decode false.
+        assert_eq!(launch_marked, 4);
+        assert!(rows[0].3, "initial tool_call is the marked launch");
+        assert!(rows
+            .iter()
+            .any(|r| r.0 == "msg" && r.1 == "msg_sub_1" && r.2.as_deref() == Some("toolu_task")));
+    }
+
+    /// Agent → Agent launch: the inner launch is both a child (of outer) and
+    /// a launch (`subagent:true`); the grandchild names the inner call.
+    #[test]
+    fn claude_nested_fixture_decodes_two_levels() {
+        let rows = nesting("claude_subagent_nested.json");
+        let p = |id: &str| -> Vec<(Option<&str>, bool)> {
+            rows.iter()
+                .filter(|r| r.1 == id)
+                .map(|r| (r.2.as_deref(), r.3))
+                .collect()
+        };
+        assert_eq!(p("toolu_outer"), [(None, true), (None, false)]);
+        assert_eq!(
+            p("toolu_inner"),
+            [(Some("toolu_outer"), true), (Some("toolu_outer"), false)]
+        );
+        assert_eq!(
+            p("toolu_grandchild_read"),
+            [(Some("toolu_inner"), false), (Some("toolu_inner"), false)]
+        );
+        assert_eq!(p("msg_outer_1"), [(Some("toolu_outer"), false)]);
+        assert_eq!(p("msg_root"), [(None, false)]);
+    }
+
+    /// Missing / malformed meta never invents a parent or a launch.
+    #[test]
+    fn claude_meta_fail_closed() {
+        let tool = |meta: Option<serde_json::Value>| {
+            let mut update = serde_json::json!({
+                "sessionUpdate": "tool_call", "toolCallId": "t1", "title": "x"
+            });
+            if let Some(m) = meta {
+                update["_meta"] = m;
+            }
+            let msg = serde_json::json!({"jsonrpc": "2.0", "method": "session/update",
+                "params": {"sessionId": "s", "update": update}});
+            match map_notification(&msg, AgentKind::Acp).unwrap() {
+                AgentEvent::ToolCall {
+                    parent, subagent, ..
+                } => (parent, subagent),
+                other => panic!("unexpected {other:?}"),
+            }
+        };
+        let none = (None, false);
+        assert_eq!(tool(None), none);
+        assert_eq!(tool(Some(serde_json::json!(null))), none);
+        assert_eq!(tool(Some(serde_json::json!({"other": {}}))), none);
+        assert_eq!(tool(Some(serde_json::json!({"claudeCode": "x"}))), none);
+        for bad in [
+            serde_json::json!(null),
+            serde_json::json!(7),
+            serde_json::json!(""),
+            serde_json::json!({"id": "p"}),
+            serde_json::json!("t1"), // self-parent
+        ] {
+            assert_eq!(
+                tool(Some(
+                    serde_json::json!({"claudeCode": {"parentToolUseId": bad}})
+                )),
+                none,
+                "{bad}"
+            );
+        }
+        for bad in [
+            serde_json::json!("true"),
+            serde_json::json!(1),
+            serde_json::json!(false),
+        ] {
+            assert_eq!(
+                tool(Some(serde_json::json!({"claudeCode": {"subagent": bad}}))),
+                none,
+                "{bad}"
+            );
+        }
+        // Vendor key is exact: parent under another namespace is ignored.
+        assert_eq!(
+            tool(Some(serde_json::json!({"codex": {"parentToolUseId": "p"}}))),
+            none
+        );
+        assert_eq!(
+            tool(Some(
+                serde_json::json!({"claudeCode": {"parentToolUseId": "p", "subagent": true}})
+            )),
+            (Some("p".to_string()), true)
+        );
+        // Message chunk without meta: no parent.
+        let msg = serde_json::json!({"jsonrpc": "2.0", "method": "session/update",
+            "params": {"sessionId": "s", "update": {"sessionUpdate": "agent_message_chunk",
+                "content": {"text": "hi"}, "_meta": {"claudeCode": {"toolName": "Read"}}}}});
+        assert!(matches!(
+            map_notification(&msg, AgentKind::Acp).unwrap(),
+            AgentEvent::MessageDelta { parent: None, .. }
+        ));
+    }
+
+    /// Absent fields keep the old serde shape (back-compat both ways).
+    #[test]
+    fn parent_fields_are_additive_on_serde() {
+        let old = serde_json::json!({"event": "tool_call", "session_id": "s", "item_id": "c",
+            "name": "read", "arguments": null, "status": "pending"});
+        let ev: AgentEvent = serde_json::from_value(old.clone()).unwrap();
+        assert!(matches!(
+            ev,
+            AgentEvent::ToolCall {
+                parent: None,
+                subagent: false,
+                ..
+            }
+        ));
+        assert_eq!(serde_json::to_value(&ev).unwrap(), old);
+        let nested = AgentEvent::MessageDelta {
+            session_id: "s".into(),
+            item_id: "m".into(),
+            delta: "d".into(),
+            parent: Some("toolu_task".into()),
+        };
+        let v = serde_json::to_value(&nested).unwrap();
+        assert_eq!(v["parent"], "toolu_task");
+        assert_eq!(serde_json::from_value::<AgentEvent>(v).unwrap(), nested);
     }
 
     #[test]

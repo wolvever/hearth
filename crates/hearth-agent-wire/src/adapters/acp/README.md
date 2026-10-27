@@ -78,3 +78,13 @@ the reply. Earlier these requests decoded as `AgentEvent::Native` and got
 ```bash
 cargo test -p hearth-agent-wire acp::
 ```
+
+## Subagent nesting (Claude Code `_meta`)
+
+`tool_call` / `tool_call_update` / `agent_message_chunk` read
+`update._meta.claudeCode.parentToolUseId` into `parent` and (tool calls only)
+`update._meta.claudeCode.subagent == true` into `subagent`. Missing or
+malformed meta decodes as `None` / `false`; no SubagentStarted and no child
+session are emitted. Host maps `parent` to `parent_tool_call_id` on the
+EventLog. See `crates/hearth/DESIGN.md` → **ACP parent**.
+
