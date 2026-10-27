@@ -10,7 +10,8 @@ use std::time::Duration;
 
 use hearth::{AgentId, Event, Place, SessionId, Wake};
 use hearth_agent_wire::{
-    transport_for_wire, wake_each_kept_through_host_wake, AttachRunner, HostRemintFullArgs,
+    complete_host_tool, transport_for_wire, wake_each_kept_through_host_wake, AttachRunner,
+    CompleteHostTool, CompleteHostToolArgs, CompleteHostToolError, HostRemintFullArgs, HostWake,
     KeptWakeWire, LaunchSpec, OldWire, RemintSession, RpcId, RunnerTransport,
     WakeEachKeptThroughHost, WakeEachKeptThroughHostArgs, WakeThroughError, WireKind,
 };
@@ -128,6 +129,61 @@ impl HostWireMap {
         self.agents.keys().any(|(s, _)| *s == session)
     }
 
+    pub fn get(&self, session: SessionId, agent: AgentId) -> Option<&AgentHostWire> {
+        self.agents.get(&(session, agent))
+    }
+
+    /// Single-Agent Host tool completion (not fan-out).
+    ///
+    /// Takes the wire out, runs [`complete_host_tool`], puts it back. Updates
+    /// `old_wire` to LiveIdle after a successful remint/reuse so a follow-up
+    /// completion reuses the Binding.
+    pub fn complete_host_tool_for(
+        &mut self,
+        runtime: &hearth::Runtime,
+        session_id: SessionId,
+        agent: AgentId,
+        tool_call_id: &str,
+        output: &str,
+    ) -> Result<CompleteHostTool, CompleteHostToolError> {
+        let mut wire = self
+            .agents
+            .remove(&(session_id, agent))
+            .ok_or(CompleteHostToolError::Orphan)?;
+        let result = complete_host_tool(
+            &mut wire.old,
+            &mut wire.new,
+            &mut wire.new_transport,
+            CompleteHostToolArgs {
+                runtime,
+                session_id,
+                agent,
+                tool_call_id,
+                output,
+                old_wire: wire.old_wire.clone(),
+                remint: HostRemintFullArgs {
+                    session: &wire.remint,
+                    place: wire.place.as_ref(),
+                    mcp_servers: &[],
+                    init_rpc_id: &wire.init_rpc_id,
+                    old_next_rpc_id: &mut wire.old_next_rpc_id,
+                    new_next_rpc_id: &mut wire.new_next_rpc_id,
+                },
+            },
+        );
+        // After remint/reuse, subsequent wakes see LiveIdle (same as steer path).
+        if let Ok(CompleteHostTool::Applied { host, .. }) = &result {
+            match host {
+                HostWake::Reminted(_) | HostWake::ReuseLive => {
+                    wire.old_wire = OldWire::LiveIdle;
+                }
+                HostWake::Waiting(_) => {}
+            }
+        }
+        self.agents.insert((session_id, agent), wire);
+        result
+    }
+
     /// Drain this Session's wires, run `wake_each_kept_through_host_wake`, put back.
     pub fn wake_each_kept(
         &mut self,
@@ -239,6 +295,103 @@ pub enum SteerError {
     Waiting(hearth::WaitReason),
     Runtime(hearth::Error),
     Remint(hearth_agent_wire::RemintError),
+}
+
+/// Outcome of [`complete_tool_result`].
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
+pub enum CompleteToolOutcome {
+    /// Fresh ToolResult + Trigger wake applied.
+    Applied {
+        tool_result: Event,
+        wake_events: Vec<Event>,
+    },
+    /// Duplicate / late-after-Interrupted — zero new Result/Wake.
+    NotApplied,
+}
+
+/// Error from [`complete_tool_result`].
+#[derive(Debug)]
+pub enum CompleteToolError {
+    Lock,
+    /// No prior unmatched Host ToolCall for this Agent + id.
+    Orphan,
+    /// Wake Waiting after Result applied (or before on kernel path).
+    Waiting(hearth::WaitReason),
+    Runtime(hearth::Error),
+    Remint(hearth_agent_wire::RemintError),
+    /// Agent has no Host wire and kernel path refused.
+    NoWire,
+}
+
+/// Service Host-owned tool completion → ToolResult + single-Agent Trigger wake.
+///
+/// Wired Sessions: [`complete_host_tool`] via that Agent's wire only (never
+/// `wake_each_kept`). Unwired Goose stand-in: Session append + `Runtime::wake`
+/// Trigger. Orphan → Orphan; terminal → NotApplied; wake Waiting → Waiting
+/// (Result may already be on the log — M8).
+pub fn complete_tool_result(
+    st: &AppState,
+    session_id: SessionId,
+    agent: AgentId,
+    tool_call_id: &str,
+    output: &str,
+) -> Result<CompleteToolOutcome, CompleteToolError> {
+    let mut wires = st.host_wires.lock().map_err(|_| CompleteToolError::Lock)?;
+    if wires.get(session_id, agent).is_some() {
+        match wires.complete_host_tool_for(&st.runtime, session_id, agent, tool_call_id, output) {
+            Ok(CompleteHostTool::Applied {
+                tool_result,
+                wake_events,
+                ..
+            }) => Ok(CompleteToolOutcome::Applied {
+                tool_result,
+                wake_events,
+            }),
+            Ok(CompleteHostTool::NotApplied) => Ok(CompleteToolOutcome::NotApplied),
+            Ok(CompleteHostTool::AppliedWakeWaiting { reason, .. }) => {
+                Err(CompleteToolError::Waiting(reason))
+            }
+            Err(CompleteHostToolError::Orphan) => Err(CompleteToolError::Orphan),
+            Err(CompleteHostToolError::Remint(e)) => Err(CompleteToolError::Remint(e)),
+            Err(CompleteHostToolError::Runtime(hearth::Error::Waiting(r))) => {
+                Err(CompleteToolError::Waiting(r))
+            }
+            Err(CompleteHostToolError::Runtime(e)) => Err(CompleteToolError::Runtime(e)),
+        }
+    } else {
+        // Goose stand-in: append then Runtime::wake (ClaimBinding).
+        drop(wires);
+        let sess = st
+            .runtime
+            .store()
+            .session(session_id)
+            .map_err(CompleteToolError::Runtime)?;
+        let append = match sess.append_host_tool_result(agent, tool_call_id, output) {
+            Ok(a) => a,
+            Err(hearth::HostToolResultError::Orphan) => return Err(CompleteToolError::Orphan),
+        };
+        let tool_result = match append {
+            hearth::HostToolResultAppend::AlreadyTerminal => {
+                return Ok(CompleteToolOutcome::NotApplied);
+            }
+            hearth::HostToolResultAppend::Applied(ev) => ev,
+        };
+        match st.runtime.wake(
+            session_id,
+            agent,
+            Wake::Trigger {
+                name: "tool_result".into(),
+            },
+        ) {
+            Ok(wake_events) => Ok(CompleteToolOutcome::Applied {
+                tool_result,
+                wake_events,
+            }),
+            Err(hearth::Error::Waiting(reason)) => Err(CompleteToolError::Waiting(reason)),
+            Err(e) => Err(CompleteToolError::Runtime(e)),
+        }
+    }
 }
 
 /// Spawn a Real CLI that exits with `code` and probe until [`OldWire::Exited`].
