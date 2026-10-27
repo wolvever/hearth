@@ -468,7 +468,7 @@ impl Runtime {
     /// and no lease exists, restores that turn, finalizes unmatched tool
     /// calls as [`crate::EventBody::ToolCallInterrupted`]
     /// ([`crate::ToolInterruptStatus::Indeterminate`]) via
-    /// [`Session::finalize_unmatched_tool_calls`] (same helper as
+    /// [`Session::finalize_unmatched_tool_calls_of`] (kept Agent only) (same helper as
     /// [`Self::resume_interrupted_turn`] / wire remint), then attaches a
     /// lease under a raised stored fence. After re-keep **any** [`HolderId`]
     /// may adopt (fenced takeover); [`Error::LiveTurnOpen`] is per-Runtime.
@@ -522,7 +522,9 @@ impl Runtime {
             // keep + begin_turn). Same Indeterminate finalize as
             // resume_interrupted_turn / wire remint — never leave ToolCalls
             // looking live across the rebuild.
-            sess.finalize_unmatched_tool_calls()?;
+            // Scoped to the kept Agent: another Agent's live ToolCall
+            // under a concurrent turn is not this recovery's to finalize.
+            sess.finalize_unmatched_tool_calls_of(agent)?;
             let binding = binding_for_agent(&sess, agent)?;
             let fence = self.install_lease(&sess, holder, turn_id)?;
             return Ok((turn_id, fence, binding));
@@ -621,7 +623,7 @@ impl Runtime {
     /// EventLog (`TurnStart` without `TurnEnd`), finalize unmatched tool
     /// calls as [`EventBody::ToolCallInterrupted`]
     /// ([`crate::ToolInterruptStatus::Indeterminate`]) via
-    /// [`Session::finalize_unmatched_tool_calls`] (same helper as wire remint),
+    /// [`Session::finalize_unmatched_tool_calls_of`] (kept Agent only) (same helper as wire remint),
     /// return `(turn_id, fence, binding_id)`.
     /// Does **not** remint Binding. Refuses if a holder is still live.
     pub fn resume_interrupted_turn(
@@ -651,7 +653,8 @@ impl Runtime {
         // Crash reclaim must not leave ToolCalls looking live (tempt a
         // re-run). Same Indeterminate finalize as wire remint — never
         // Completed-without-output, never Cancelled.
-        sess.finalize_unmatched_tool_calls()?;
+        // Kept Agent only (concurrent per-Binding turns).
+        sess.finalize_unmatched_tool_calls_of(agent)?;
         let binding = binding_for_agent(&sess, agent)?;
         let fence = self.install_lease(&sess, new_holder, turn_id)?;
         Ok((turn_id, fence, binding))
@@ -1481,6 +1484,73 @@ mod tests {
         assert!(crate::tool_call_is_terminal(&log, "t-open"));
         assert!(crate::tool_call_is_terminal(&log, "t-done"));
         assert!(crate::unmatched_tool_calls(&log).is_empty());
+    }
+
+    /// Concurrent per-Binding turns: Agent A (not kept) has a live,
+    /// unmatched ToolCall. Recovering kept Agent B via resume and via
+    /// re-keep adopt finalizes only B's orphans — never A's call.
+    #[test]
+    fn resume_and_adopt_do_not_finalize_other_agents_tool_call() {
+        let rt = Runtime::new();
+        let a = rt.store().create_agent("a", "");
+        let b = rt.store().create_agent("b", "");
+        let session = rt.create_session();
+        rt.keep(session.id(), b.id, goose()).unwrap();
+        let (tb, fence, _) = rt.begin_turn(session.id(), "h1".into()).unwrap();
+
+        session.join(Member::Agent(a.id)).unwrap();
+        session.bind_agent(a.id, "cli", None, None).unwrap();
+        let ta = session.turn_start(a.id).unwrap().turn.unwrap();
+        let tool = |agent, id: &str| {
+            session
+                .append(EventBody::ToolCall {
+                    agent,
+                    tool_call_id: id.into(),
+                    name: "bash".into(),
+                    input: "{}".into(),
+                })
+                .unwrap()
+        };
+        assert_eq!(tool(a.id, "a-live").turn, Some(ta));
+        assert_eq!(tool(b.id, "b-open").turn, Some(tb));
+        let interrupted =
+            |id: &str| {
+                session
+                .events()
+                .unwrap()
+                .iter()
+                .filter(|e| matches!(
+                    &e.body,
+                    EventBody::ToolCallInterrupted { tool_call_id, .. } if tool_call_id == id
+                ))
+                .count()
+            };
+
+        // Crash + resume_interrupted_turn for B.
+        rt.end_turn(session.id(), "h1".into(), fence, true).unwrap();
+        let (t_resumed, f2, _) = rt
+            .resume_interrupted_turn(session.id(), "h2".into())
+            .unwrap();
+        assert_eq!(t_resumed, tb);
+        assert_eq!(interrupted("b-open"), 1);
+        assert_eq!(interrupted("a-live"), 0, "resume must not touch A");
+
+        // Re-keep adopt for B with a fresh B orphan.
+        assert_eq!(tool(b.id, "b-open-2").turn, Some(tb));
+        rt.end_turn(session.id(), "h2".into(), f2, true).unwrap();
+        rt.release(session.id()).unwrap();
+        rt.keep(session.id(), b.id, goose()).unwrap();
+        let (t_adopt, _, _) = rt.begin_turn(session.id(), "h3".into()).unwrap();
+        assert_eq!(t_adopt, tb);
+        assert_eq!(interrupted("b-open-2"), 1);
+        assert_eq!(interrupted("a-live"), 0, "adopt must not touch A");
+
+        let log = session.events().unwrap();
+        assert_eq!(
+            crate::unmatched_tool_calls(&log),
+            vec![(a.id, "a-live".to_string(), "bash".to_string())]
+        );
+        assert_eq!(session.current_turn_of(a.id).unwrap(), Some(ta));
     }
 
     #[test]

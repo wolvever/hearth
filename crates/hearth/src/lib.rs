@@ -363,6 +363,12 @@ pub fn surface_of(events: &[Event]) -> Vec<Event> {
 /// Every `TurnStart` without a later `TurnEnd` by the same Agent, in start
 /// order. A `TurnEnd { agent }` closes only that Agent's open turn, so many
 /// Agents may each hold one open turn on the same Session.
+///
+/// The log carries Agent, not Binding, on `TurnStart` / `TurnEnd`, so this
+/// assumes **at most one open turn per Agent** (≤1 live Binding per Agent,
+/// as [`Session::rebind`] enforces). Two `bind_agent` Bindings of the same
+/// Agent may each hold a live turn in the map, but the log replay collapses
+/// them to that Agent's latest `TurnStart`.
 pub fn open_turns_of(events: &[Event]) -> Vec<(u64, AgentId)> {
     let mut open: Vec<(u64, AgentId)> = Vec::new();
     for e in events {
@@ -1110,11 +1116,8 @@ impl Session {
         if !data.bindings.contains_key(&binding) {
             return Err(Error::UnknownBinding(binding));
         }
-        let turn = data
-            .current_turn
-            .get(&binding)
-            .map(|o| o.turn)
-            .or_else(|| data.sole_turn());
+        // Only this Binding's own turn — never another Binding's sole turn.
+        let turn = data.current_turn.get(&binding).map(|o| o.turn);
         Ok(data.push_turn(
             EventBody::UserMessage {
                 user,
@@ -1328,11 +1331,29 @@ impl Session {
     /// remint, [`crate::Runtime::resume_interrupted_turn`], and the open-turn
     /// re-keep adopt path in [`crate::Runtime::begin_turn_with`] — never
     /// Completed-without-output, never Cancelled.
+    ///
+    /// Session-wide sweep (every Agent). Recovery paths (wire remint,
+    /// resume, re-keep adopt) must use [`Self::finalize_unmatched_tool_calls_of`]
+    /// so another Agent's live ToolCall under a concurrent turn is untouched.
     pub fn finalize_unmatched_tool_calls(&self) -> Result<usize> {
+        self.finalize_unmatched(None)
+    }
+
+    /// [`Self::finalize_unmatched_tool_calls`] scoped to `agent`'s own
+    /// unmatched ToolCalls. Per-Binding turns: recovering one Agent never
+    /// interrupts another Agent's in-flight tool.
+    pub fn finalize_unmatched_tool_calls_of(&self, agent: AgentId) -> Result<usize> {
+        self.finalize_unmatched(Some(agent))
+    }
+
+    fn finalize_unmatched(&self, only: Option<AgentId>) -> Result<usize> {
         self.write(|data| {
             let orphans = unmatched_tool_calls(&data.events);
             let mut n = 0usize;
             for (agent, tool_call_id, name) in orphans {
+                if only.is_some_and(|a| a != agent) {
+                    continue;
+                }
                 if tool_call_is_terminal(&data.events, &tool_call_id) {
                     continue;
                 }
@@ -2075,6 +2096,98 @@ mod tests {
             session.turn_end_on(bb.id),
             Err(Error::TurnNotOpen)
         ));
+    }
+
+    /// Later starter ends first: B starts after A, B ends first; A's turn
+    /// stays open and keeps stamping A's events. Kills the "turn_end closes
+    /// the oldest open turn of any Agent" mutant.
+    #[test]
+    fn later_starter_ends_first_leaves_earlier_turn_open() {
+        let store = InMemory::new();
+        let a = store.create_agent("a", "");
+        let b = store.create_agent("b", "");
+        let session = store.create_session();
+        let ba = session.bind_agent(a.id, "cli", None, None).unwrap();
+        let bb = session.bind_agent(b.id, "cli", None, None).unwrap();
+        let ta = session.turn_start(a.id).unwrap().turn.unwrap();
+        let tb = session.turn_start(b.id).unwrap().turn.unwrap();
+        assert!(tb > ta, "B started later");
+
+        let end_b = session.turn_end(b.id).unwrap();
+        assert_eq!(end_b.turn, Some(tb), "B's TurnEnd stamps B's turn");
+        assert!(matches!(end_b.body, EventBody::TurnEnd { agent } if agent == b.id));
+        assert_eq!(session.current_turn_of(a.id).unwrap(), Some(ta));
+        assert_eq!(session.current_turn_on(ba.id).unwrap(), Some(ta));
+        assert_eq!(session.current_turn_of(b.id).unwrap(), None);
+        assert_eq!(session.current_turn_on(bb.id).unwrap(), None);
+        assert_eq!(session.current_turns().unwrap(), vec![(ba.id, ta)]);
+        assert_eq!(agent_msg(&session, a.id, "a-after").turn, Some(ta));
+        assert_eq!(agent_msg(&session, b.id, "b-after").turn, None);
+        assert_eq!(open_turns_of(&session.events().unwrap()), vec![(ta, a.id)]);
+
+        // B may start again while A is still open; then A ends via its Binding.
+        let tb2 = session.turn_start_on(bb.id).unwrap().turn.unwrap();
+        assert_eq!(session.turn_end_on(ba.id).unwrap().turn, Some(ta));
+        assert_eq!(session.current_turns().unwrap(), vec![(bb.id, tb2)]);
+        assert_eq!(agent_msg(&session, b.id, "b2").turn, Some(tb2));
+        assert_eq!(agent_msg(&session, a.id, "a-done").turn, None);
+    }
+
+    /// `user_message_on(binding)` stamps only that Binding's own turn: an
+    /// idle Binding never borrows another Binding's sole open turn.
+    #[test]
+    fn user_message_on_idle_binding_is_unstamped() {
+        let store = InMemory::new();
+        let user = store.create_user("cheng");
+        let a = store.create_agent("a", "");
+        let b = store.create_agent("b", "");
+        let session = store.create_session();
+        session.join(Member::User(user.id)).unwrap();
+        let ba = session.bind_agent(a.id, "cli", None, None).unwrap();
+        let bb = session.bind_agent(b.id, "cli", None, None).unwrap();
+        let tb = session.turn_start(b.id).unwrap().turn.unwrap();
+        assert_eq!(
+            session
+                .user_message_on(ba.id, user.id, "to a")
+                .unwrap()
+                .turn,
+            None
+        );
+        assert_eq!(
+            session
+                .user_message_on(bb.id, user.id, "to b")
+                .unwrap()
+                .turn,
+            Some(tb)
+        );
+    }
+
+    /// Agent-scoped finalize leaves another Agent's unmatched ToolCall live.
+    #[test]
+    fn finalize_unmatched_tool_calls_of_is_agent_scoped() {
+        let store = InMemory::new();
+        let a = store.create_agent("a", "");
+        let b = store.create_agent("b", "");
+        let session = store.create_session();
+        for (agent, id) in [(a.id, "a-live"), (b.id, "b-open")] {
+            session
+                .append(EventBody::ToolCall {
+                    agent,
+                    tool_call_id: id.into(),
+                    name: "bash".into(),
+                    input: "{}".into(),
+                })
+                .unwrap();
+        }
+        assert_eq!(session.finalize_unmatched_tool_calls_of(b.id).unwrap(), 1);
+        assert_eq!(session.finalize_unmatched_tool_calls_of(b.id).unwrap(), 0);
+        let log = session.events().unwrap();
+        assert!(tool_call_is_terminal(&log, "b-open"));
+        assert!(!tool_call_is_terminal(&log, "a-live"));
+        assert_eq!(
+            unmatched_tool_calls(&log),
+            vec![(a.id, "a-live".to_string(), "bash".to_string())]
+        );
     }
 
     /// Same Binding cannot open a second turn while one is open.
