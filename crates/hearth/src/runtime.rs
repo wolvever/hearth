@@ -2615,6 +2615,30 @@ mod tests {
         assert_eq!(session.current_turns().unwrap().len(), 2);
     }
 
+    /// Gate refusal in `begin_turn` writes nothing: no event, no Binding
+    /// claimed for B, no lease. Kills the mutant that drops the pre-gate in
+    /// `begin_turn_with` (claim would mint B's Binding before refusing).
+    #[test]
+    fn begin_turn_gate_refusal_writes_nothing() {
+        let rt = Runtime::new();
+        let a = rt.store().create_agent("a", "");
+        let b = rt.store().create_agent("b", "");
+        let session = rt.create_session();
+        let sid = session.id();
+        rt.keep(sid, a.id, goose()).unwrap();
+        rt.keep(sid, b.id, codex()).unwrap();
+        rt.wake(sid, a.id, Wake::Timer).unwrap();
+        rt.set_parallel_safe(sid, b.id, ps("b")).unwrap();
+        let before = session.events().unwrap().len();
+        assert!(matches!(
+            rt.begin_turn(sid, b.id, "hb".into()),
+            Err(Error::Waiting(WaitReason::TurnOpen))
+        ));
+        assert_eq!(session.events().unwrap().len(), before, "nothing written");
+        assert_eq!(session.bindings().unwrap().len(), 1, "B never claimed");
+        assert!(rt.turn_lease(sid).unwrap().is_none());
+    }
+
     #[test]
     fn set_parallel_safe_requires_kept_agent() {
         let rt = Runtime::new();

@@ -4123,6 +4123,45 @@ mod tests {
             .id
     }
 
+    /// Gate refusal in `begin_turn_through_host_wake` is zero wire action:
+    /// `Waiting(TurnOpen)`, no `BindingAttached` mint, no events, no stdin on
+    /// old or new wire. Kills the mutant that drops the gate before `host_wake`.
+    #[test]
+    fn begin_turn_through_host_wake_gate_refusal_zero_wire_action() {
+        let (rt, sid, _uid, remint, place) = shared_runtime_remint();
+        let b = rt.store().create_agent("other", "").id;
+        rt.keep(sid, b, hearth::HostKind::Codex.host(None, None))
+            .expect("keep B");
+        rt.wake(sid, b, hearth::Wake::Timer).expect("B turn");
+        let session = rt.store().session(sid).unwrap();
+        let before_len = session.events().unwrap().len();
+        let before = binding_attached_count(&rt, sid);
+        let mut old = initialized_fake(Vec::new());
+        let old_log = old.stdin_log().unwrap().len();
+        let mut new = new_wire_fake();
+        let r = begin_through(
+            &rt,
+            sid,
+            hearth::HolderId::new("h"),
+            &remint,
+            &place,
+            OldWire::Exited(1),
+            &mut old,
+            &mut new,
+        );
+        assert!(
+            matches!(
+                r,
+                Ok(BeginTurnThroughHost::Waiting(hearth::WaitReason::TurnOpen))
+            ),
+            "{r:?}"
+        );
+        assert_eq!(binding_attached_count(&rt, sid), before, "zero mints");
+        assert_eq!(session.events().unwrap().len(), before_len);
+        assert_eq!(old.stdin_log().unwrap().len(), old_log);
+        assert!(new.stdin_log().unwrap().is_empty());
+    }
+
     /// LiveIdle begin_turn: ReuseLive, zero mints, no wire writes; lease opens
     /// on the existing Binding.
     #[test]
