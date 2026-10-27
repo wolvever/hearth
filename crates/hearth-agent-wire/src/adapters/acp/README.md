@@ -5,18 +5,20 @@
 - **Codec:** `AcpCodec` — generic / catalog profile (`AgentKind::Acp`)
 - **Profile:** `adapters/grok_build` calls `acp::map_*` and keeps `GrokBuildCodec` / `AgentKind::GrokBuild`
 
-Catalog agents (Cursor, Copilot) start here and share `AcpCodec`. Launch
-argv is data in `src/catalog/builtin.toml` (`profile` → `LaunchSpec`), not a
-second codec and not a process spawn.
+Catalog agents (Cursor, Copilot, Claude-acp) start here and share
+`AcpCodec`. Launch argv is data in `src/catalog/builtin.toml`
+(`profile` → `LaunchSpec`), not a second codec and not a process spawn.
 
 ## Caps defaults
 
 [`CapabilityFlags::ACP`](../../capabilities.rs): session · message · tool ·
-thinking · plan · permission.
+thinking · plan · permission (`subagent: false`).
 
-Compact encode is a stub (`compact: false`); question / subagent / Paseo
-reserved flags stay unset until a profile or later slice overrides. See
-`CAPABILITIES.md`.
+[`CapabilityFlags::CLAUDE_ACP`](../../capabilities.rs) is the curated
+`claude-acp` catalog override: same surface plus `subagent: true`, so #49
+parent/subagent decode is capability-honest when that profile is selected.
+Compact encode is a stub (`compact: false`); question / Paseo reserved
+flags stay unset. See `CAPABILITIES.md`.
 
 ## Rules
 

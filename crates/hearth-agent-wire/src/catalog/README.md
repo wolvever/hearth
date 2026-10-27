@@ -4,13 +4,17 @@ ACP profile list. **Data only** — a profile resolves to a `LaunchSpec`
 (program, args, env, `WireKind`). Nothing here spawns a process.
 `AttachRunner` lives in `src/runner/` (slice 5).
 
-| id | command | extends | codec | wire |
-|----|---------|---------|-------|------|
-| `copilot` | `copilot --acp` | `acp` | `AcpCodec` | `jsonl-rpc` |
-| `cursor` | `cursor-agent acp` | `acp` | `AcpCodec` | `jsonl-rpc` |
+| id | command | extends | codec | wire | caps note |
+|----|---------|---------|-------|------|-----------|
+| `copilot` | `copilot --acp` | `acp` | `AcpCodec` | `jsonl-rpc` | ACP defaults (`subagent: false`) |
+| `cursor` | `cursor-agent acp` | `acp` | `AcpCodec` | `jsonl-rpc` | ACP defaults (`subagent: false`) |
+| `claude-acp` | `claude-agent-acp` | `acp` | `AcpCodec` | `jsonl-rpc` | `CLAUDE_ACP` (`subagent: true`) |
 
-Cursor and Copilot are not separate adapters. Add a row to `builtin.toml`
-(`id`, `label`, `command`, `extends = "acp"`). Do not fork `AcpCodec`.
+Cursor, Copilot, and Claude-acp are not separate adapters. Add a row to
+`builtin.toml` (`id`, `label`, `command`, `extends = "acp"`). Do not fork
+`AcpCodec`. Capability overrides (today: Claude-acp `subagent`) are applied
+in Rust via `apply_builtin_caps` / `CatalogProfile::caps` — not from TOML —
+so Host fast-mode toggles and the generic ACP registry row stay separate.
 
 ACP stdio is newline-delimited JSON-RPC (`jsonl-rpc`: one line, one JSON
 value). Profiles do **not** use `jsonrpc-content-length`, and they do not

@@ -110,8 +110,9 @@ pub type AttachResult<T> = std::result::Result<T, AttachError>;
 /// Binding `kind` string for an [`AgentKind`]. [`AgentKind::GrokBuild`] is
 /// `grok_build`, distinct from chat [`HostKind::Grok`] (`grok`).
 /// [`AgentKind::Acp`] is `"acp"` — `HostKind` has no Acp variant; [`host_for`]
-/// goes through [`Host::from_bind`] → [`Host::Other`]. Claude later uses the
-/// existing [`HostKind::ClaudeCode`] (`claude_code`).
+/// goes through [`Host::from_bind`] → [`Host::Other`]. The `claude-acp`
+/// catalog profile shares [`AgentKind::Acp`] (binding kind `"acp"`); the
+/// kernel [`HostKind::ClaudeCode`] (`claude_code`) ticket stays separate.
 pub fn binding_kind(kind: AgentKind) -> &'static str {
     match kind {
         AgentKind::GrokBuild => HostKind::GrokBuild.as_str(),
