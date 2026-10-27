@@ -315,12 +315,86 @@ pub enum Error {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WaitReason {
     NoBinding,
+    /// This Binding already holds an open turn, or the parallel-safe
+    /// conflict gate refused a concurrent turn ([`ParallelSafe`]).
     TurnOpen,
     LivenessUnknown,
     AlreadyLive,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Explicit parallel-safe opt-in for one turn: the files / paths that turn
+/// may touch. A declaration value (like [`KeepSpec`]), not a product noun.
+///
+/// Conflict gate ([`Session::turn_start_with`]): a new turn may run while
+/// other turns are open on the Session only if it **and** every other open
+/// turn carry a `ParallelSafe`, and no two path sets overlap. Absent
+/// declaration (`None`) is fail-closed: [`WaitReason::TurnOpen`]. Never
+/// inferred from tool / effect kind (read-only tools do not opt in).
+///
+/// Paths are compared lexically by component (no filesystem access), meant
+/// Place-relative: `a` overlaps `a`, `a/b`, and `a/b/c.rs`; `a/b` does not
+/// overlap `a/c`. `.` components are ignored; an empty path or `.` means the
+/// whole tree; any path with a `..` component overlaps everything
+/// (fail-closed). An empty set touches no paths.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ParallelSafe {
+    pub paths: Vec<String>,
+}
+
+impl ParallelSafe {
+    /// Opt in as parallel-safe touching exactly `paths`.
+    pub fn paths<I, P>(paths: I) -> Self
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<String>,
+    {
+        Self {
+            paths: paths.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    /// Whether any declared path of `self` overlaps any of `other`.
+    pub fn overlaps(&self, other: &ParallelSafe) -> bool {
+        self.paths
+            .iter()
+            .any(|a| other.paths.iter().any(|b| paths_overlap(a, b)))
+    }
+}
+
+/// Lexical component-prefix overlap; `..` anywhere is a wildcard.
+fn paths_overlap(a: &str, b: &str) -> bool {
+    use std::path::{Component, Path};
+    fn norm(p: &str) -> Option<Vec<Component<'_>>> {
+        let mut out = Vec::new();
+        for c in Path::new(p).components() {
+            match c {
+                Component::CurDir => {}
+                Component::ParentDir => return None,
+                c => out.push(c),
+            }
+        }
+        Some(out)
+    }
+    match (norm(a), norm(b)) {
+        (Some(a), Some(b)) => {
+            let n = a.len().min(b.len());
+            a[..n] == b[..n]
+        }
+        _ => true,
+    }
+}
+
+/// Parallel-safe conflict gate: does a new turn declaring `decl` conflict
+/// with an open turn declaring `open`? Fail-closed when either side lacks
+/// a declaration; serialize on path overlap.
+fn turn_conflicts(decl: Option<&ParallelSafe>, open: Option<&ParallelSafe>) -> bool {
+    match (decl, open) {
+        (Some(a), Some(b)) => a.overlaps(b),
+        _ => true,
+    }
+}
 
 pub(crate) fn now_ts() -> u64 {
     SystemTime::now()
@@ -498,10 +572,12 @@ struct SessionData {
 }
 
 /// One open turn in [`SessionData::current_turn`]. Bookkeeping, not a noun.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct OpenTurn {
     turn: u64,
     agent: AgentId,
+    /// Explicit opt-in for the conflict gate; `None` = not parallel-safe.
+    parallel_safe: Option<ParallelSafe>,
 }
 
 impl SessionData {
@@ -605,11 +681,27 @@ impl SessionData {
         }
     }
 
+    /// Parallel-safe conflict gate for a new turn of `agent` declaring
+    /// `decl`: every open turn that would stay open alongside it (all but
+    /// `agent`'s released-Binding entries, which a start supersedes) must
+    /// be declared parallel-safe with no path overlap, and so must `decl`.
+    /// Refusal is [`WaitReason::TurnOpen`]. No other open turn → always ok.
+    fn gate_turn(&self, agent: AgentId, decl: Option<&ParallelSafe>) -> Result<()> {
+        let blocked = self.current_turn.iter().any(|(b, o)| {
+            let superseded = o.agent == agent && !self.bindings.contains_key(b);
+            !superseded && turn_conflicts(decl, o.parallel_safe.as_ref())
+        });
+        if blocked {
+            return Err(Error::Waiting(WaitReason::TurnOpen));
+        }
+        Ok(())
+    }
+
     /// Open a turn owned by live `binding`. Refuses a second open turn on
-    /// the same Binding ([`WaitReason::TurnOpen`]). Other Bindings' turns
-    /// are untouched. A released-Binding entry of the same Agent is
-    /// superseded (dropped).
-    fn start_turn(&mut self, binding: BindingId) -> Result<Event> {
+    /// the same Binding, or one the conflict gate ([`Self::gate_turn`])
+    /// refuses ([`WaitReason::TurnOpen`] either way). A released-Binding
+    /// entry of the same Agent is superseded (dropped).
+    fn start_turn(&mut self, binding: BindingId, decl: Option<ParallelSafe>) -> Result<Event> {
         let agent = self
             .bindings
             .get(&binding)
@@ -619,12 +711,20 @@ impl SessionData {
         if self.current_turn.contains_key(&binding) {
             return Err(Error::Waiting(WaitReason::TurnOpen));
         }
+        self.gate_turn(agent, decl.as_ref())?;
         let live: HashSet<BindingId> = self.bindings.keys().copied().collect();
         self.current_turn
             .retain(|b, o| o.agent != agent || live.contains(b));
         let turn = self.next_turn_id;
         self.next_turn_id += 1;
-        self.current_turn.insert(binding, OpenTurn { turn, agent });
+        self.current_turn.insert(
+            binding,
+            OpenTurn {
+                turn,
+                agent,
+                parallel_safe: decl,
+            },
+        );
         Ok(self.push_turn(EventBody::TurnStart { agent }, Some(turn)))
     }
 }
@@ -1180,13 +1280,20 @@ impl Session {
     }
 
     /// Open a turn on `agent`'s live Binding ([`Self::turn_start_on`]).
-    /// No live Binding → [`WaitReason::NoBinding`].
+    /// No live Binding → [`WaitReason::NoBinding`]. Not parallel-safe:
+    /// any other open turn → [`WaitReason::TurnOpen`].
     pub fn turn_start(&self, agent: AgentId) -> Result<Event> {
+        self.turn_start_with(agent, None)
+    }
+
+    /// [`Self::turn_start`] with an explicit parallel-safe declaration
+    /// (`None` = not parallel-safe, fail-closed). See [`ParallelSafe`].
+    pub fn turn_start_with(&self, agent: AgentId, decl: Option<ParallelSafe>) -> Result<Event> {
         self.write(|data| {
             let binding = data
                 .live_binding_of(agent)
                 .ok_or(Error::Waiting(WaitReason::NoBinding))?;
-            data.start_turn(binding)
+            data.start_turn(binding, decl)
         })
     }
 
@@ -1194,9 +1301,38 @@ impl Session {
     /// [`Error::UnknownBinding`]). Allocates `next_turn_id`; the
     /// `TurnStart` and later events of that Agent carry it. Same Binding
     /// already in a turn → [`Error::Waiting`]`(`[`WaitReason::TurnOpen`]`)`.
-    /// Other Bindings' open turns do not block (no conflict gate here).
+    /// Not parallel-safe: any other Binding's open turn → `TurnOpen` too.
     pub fn turn_start_on(&self, binding: BindingId) -> Result<Event> {
-        self.write(|data| data.start_turn(binding))
+        self.turn_start_on_with(binding, None)
+    }
+
+    /// [`Self::turn_start_on`] with an explicit parallel-safe declaration.
+    /// Opens alongside other open turns only when this turn and every
+    /// other open turn opted in ([`ParallelSafe`]) and no paths overlap.
+    pub fn turn_start_on_with(
+        &self,
+        binding: BindingId,
+        decl: Option<ParallelSafe>,
+    ) -> Result<Event> {
+        self.write(|data| data.start_turn(binding, decl))
+    }
+
+    /// Read-only conflict-gate check for a new turn of `agent` declaring
+    /// `decl` (same rule as [`Self::turn_start_with`]), so callers can
+    /// refuse before side effects (wake record, claim, wire prompt). Not
+    /// a reservation: `turn_start_*` rechecks under the store lock.
+    pub fn check_turn_gate(&self, agent: AgentId, decl: Option<&ParallelSafe>) -> Result<()> {
+        self.read(|data| data.gate_turn(agent, decl))?
+    }
+
+    /// Parallel-safe declaration of the turn owned by `binding`
+    /// (`Ok(None)` when no open turn or not parallel-safe).
+    pub fn parallel_safe_on(&self, binding: BindingId) -> Result<Option<ParallelSafe>> {
+        self.read(|data| {
+            data.current_turn
+                .get(&binding)
+                .and_then(|o| o.parallel_safe.clone())
+        })
     }
 
     /// Close `agent`'s open turn (`TurnEnd` stamped with it). Lenient: with
@@ -1310,7 +1446,14 @@ impl Session {
                     .current_turn
                     .iter()
                     .find(|(_, o)| o.turn == *turn)
-                    .map(|(b, _)| *b);
+                    .map(|(b, o)| (*b, o.parallel_safe.clone()));
+                // The declaration lives in the map, not on the EventLog: a
+                // turn rebuilt from the log alone is not parallel-safe
+                // (fail-closed).
+                let (existing, parallel_safe) = match existing {
+                    Some((b, d)) => (Some(b), d),
+                    None => (None, None),
+                };
                 let key = match existing {
                     Some(b) if data.bindings.contains_key(&b) => Some(b),
                     _ => data.live_binding_of(*agent).or(existing),
@@ -1321,6 +1464,7 @@ impl Session {
                         OpenTurn {
                             turn: *turn,
                             agent: *agent,
+                            parallel_safe,
                         },
                     );
                 }
@@ -1458,6 +1602,162 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ps(path: &str) -> Option<ParallelSafe> {
+        Some(ParallelSafe::paths([path]))
+    }
+
+    fn two_agents() -> (InMemory, Agent, Agent, Session, Binding, Binding) {
+        let store = InMemory::new();
+        let a = store.create_agent("a", "");
+        let b = store.create_agent("b", "");
+        let session = store.create_session();
+        let ba = session.bind_agent(a.id, "cli", None, None).unwrap();
+        let bb = session.bind_agent(b.id, "cli", None, None).unwrap();
+        (store, a, b, session, ba, bb)
+    }
+
+    const TURN_OPEN: WaitReason = WaitReason::TurnOpen;
+
+    /// Fail-closed: a turn that did not opt in blocks every concurrent
+    /// start, and a start that does not opt in is blocked by any open turn.
+    #[test]
+    fn conflict_gate_missing_declaration_is_fail_closed() {
+        let (_s, a, b, session, _ba, bb) = two_agents();
+        session.turn_start(a.id).unwrap();
+        assert!(matches!(
+            session.turn_start_with(b.id, ps("b")),
+            Err(Error::Waiting(TURN_OPEN))
+        ));
+        assert!(matches!(
+            session.turn_start_on(bb.id),
+            Err(Error::Waiting(TURN_OPEN))
+        ));
+        assert!(matches!(
+            session.check_turn_gate(b.id, ps("b").as_ref()),
+            Err(Error::Waiting(TURN_OPEN))
+        ));
+        session.turn_end(a.id).unwrap();
+
+        session.turn_start_with(a.id, ps("a")).unwrap();
+        assert!(matches!(
+            session.turn_start(b.id),
+            Err(Error::Waiting(TURN_OPEN))
+        ));
+        assert_eq!(session.current_turns().unwrap().len(), 1);
+        // Refusals write nothing.
+        let starts = session
+            .events()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e.body, EventBody::TurnStart { .. }))
+            .count();
+        assert_eq!(starts, 2);
+    }
+
+    /// Effect kind never substitutes for the opt-in: an undeclared turn
+    /// that has only made a read-only tool call still blocks.
+    #[test]
+    fn conflict_gate_read_only_effect_is_not_opt_in() {
+        let (_s, a, b, session, _ba, _bb) = two_agents();
+        session.turn_start(a.id).unwrap();
+        session
+            .append(EventBody::ToolCall {
+                agent: a.id,
+                tool_call_id: "t1".into(),
+                name: "read_file".into(),
+                input: "src/lib.rs".into(),
+            })
+            .unwrap();
+        assert!(matches!(
+            session.turn_start_with(b.id, ps("docs")),
+            Err(Error::Waiting(TURN_OPEN))
+        ));
+    }
+
+    /// Opt-in on both sides with disjoint paths runs concurrently; any
+    /// overlap (same file, or a directory containing it) serializes.
+    #[test]
+    fn conflict_gate_parallel_safe_serializes_only_overlapping_paths() {
+        let (_s, a, b, session, ba, bb) = two_agents();
+        let ta = session.turn_start_with(a.id, ps("src")).unwrap().turn;
+        assert!(matches!(
+            session.turn_start_with(b.id, ps("src/lib.rs")),
+            Err(Error::Waiting(TURN_OPEN))
+        ));
+        assert!(matches!(
+            session.turn_start_with(b.id, Some(ParallelSafe::paths(["docs", "./src"]))),
+            Err(Error::Waiting(TURN_OPEN))
+        ));
+        let tb = session.turn_start_with(b.id, ps("docs")).unwrap().turn;
+        assert_ne!(ta, tb);
+        assert_eq!(session.current_turns().unwrap().len(), 2);
+        assert_eq!(session.parallel_safe_on(ba.id).unwrap(), ps("src"));
+        assert_eq!(session.parallel_safe_on(bb.id).unwrap(), ps("docs"));
+
+        // Once the overlapping turn ends, the serialized start opens.
+        session.turn_end(a.id).unwrap();
+        session.turn_end(b.id).unwrap();
+        session.turn_start_with(a.id, ps("src")).unwrap();
+        assert!(session.turn_start_with(b.id, ps("src/lib.rs")).is_err());
+        session.turn_end(a.id).unwrap();
+        session.turn_start_with(b.id, ps("src/lib.rs")).unwrap();
+    }
+
+    /// A parallel-safe turn with an empty path set touches nothing; a
+    /// lone turn needs no declaration at all.
+    #[test]
+    fn conflict_gate_empty_set_and_lone_turn() {
+        let (_s, a, b, session, _ba, _bb) = two_agents();
+        session.turn_start_with(a.id, ps("")).unwrap();
+        session
+            .turn_start_with(b.id, Some(ParallelSafe::default()))
+            .unwrap();
+        session.turn_end(a.id).unwrap();
+        session.turn_end(b.id).unwrap();
+        session.turn_start(a.id).unwrap();
+        session.turn_end(a.id).unwrap();
+    }
+
+    #[test]
+    fn parallel_safe_path_overlap_is_lexical_by_component() {
+        let o = |a: &str, b: &str| ParallelSafe::paths([a]).overlaps(&ParallelSafe::paths([b]));
+        assert!(o("src/lib.rs", "src/lib.rs"));
+        assert!(o("src", "src/lib.rs"));
+        assert!(o("src/lib.rs", "src"));
+        assert!(o("./src/", "src/lib.rs"));
+        assert!(!o("src/lib.rs", "src/main.rs"));
+        assert!(!o("src/lib", "src/lib.rs"));
+        assert!(!o("a/b", "a/c"));
+        assert!(o("", "anything"));
+        assert!(o(".", "anything"));
+        assert!(o("x/../y", "z"));
+        assert!(!ParallelSafe::default().overlaps(&ParallelSafe::paths(["src"])));
+    }
+
+    /// The declaration is map-only: a turn rebuilt from the EventLog alone
+    /// is not parallel-safe, so it blocks new concurrent starts.
+    #[test]
+    fn restore_from_log_alone_drops_declaration_fail_closed() {
+        let (_s, a, b, session, ba, _bb) = two_agents();
+        session.turn_start_with(a.id, ps("a")).unwrap();
+        // In-place restore keeps the declaration.
+        session.restore_open_turn().unwrap();
+        assert_eq!(session.parallel_safe_on(ba.id).unwrap(), ps("a"));
+        session
+            .write(|d| {
+                d.current_turn.clear();
+                Ok(())
+            })
+            .unwrap();
+        session.restore_open_turn().unwrap();
+        assert!(session.current_turn_on(ba.id).unwrap().is_some());
+        assert_eq!(session.parallel_safe_on(ba.id).unwrap(), None);
+        assert!(matches!(
+            session.turn_start_with(b.id, ps("b")),
+            Err(Error::Waiting(TURN_OPEN))
+        ));
+    }
 
     #[test]
     fn session_survives_all_bindings_released() {
@@ -2050,8 +2350,16 @@ mod tests {
         let ba = session.bind_agent(a.id, "cli", None, None).unwrap();
         let bb = session.bind_agent(b.id, "cli", None, None).unwrap();
 
-        let ta = session.turn_start(a.id).unwrap().turn.unwrap();
-        let tb = session.turn_start_on(bb.id).unwrap().turn.unwrap();
+        let ta = session
+            .turn_start_with(a.id, ps("a"))
+            .unwrap()
+            .turn
+            .unwrap();
+        let tb = session
+            .turn_start_on_with(bb.id, ps("b"))
+            .unwrap()
+            .turn
+            .unwrap();
         assert_ne!(ta, tb);
         assert_eq!(session.current_turn_on(ba.id).unwrap(), Some(ta));
         assert_eq!(session.current_turn_on(bb.id).unwrap(), Some(tb));
@@ -2117,8 +2425,16 @@ mod tests {
         let session = store.create_session();
         let ba = session.bind_agent(a.id, "cli", None, None).unwrap();
         let bb = session.bind_agent(b.id, "cli", None, None).unwrap();
-        let ta = session.turn_start(a.id).unwrap().turn.unwrap();
-        let tb = session.turn_start(b.id).unwrap().turn.unwrap();
+        let ta = session
+            .turn_start_with(a.id, ps("a"))
+            .unwrap()
+            .turn
+            .unwrap();
+        let tb = session
+            .turn_start_with(b.id, ps("b"))
+            .unwrap()
+            .turn
+            .unwrap();
         assert!(tb > ta, "B started later");
 
         let end_b = session.turn_end(b.id).unwrap();
@@ -2134,7 +2450,11 @@ mod tests {
         assert_eq!(open_turns_of(&session.events().unwrap()), vec![(ta, a.id)]);
 
         // B may start again while A is still open; then A ends via its Binding.
-        let tb2 = session.turn_start_on(bb.id).unwrap().turn.unwrap();
+        let tb2 = session
+            .turn_start_on_with(bb.id, ps("b"))
+            .unwrap()
+            .turn
+            .unwrap();
         assert_eq!(session.turn_end_on(ba.id).unwrap().turn, Some(ta));
         assert_eq!(session.current_turns().unwrap(), vec![(bb.id, tb2)]);
         assert_eq!(agent_msg(&session, b.id, "b2").turn, Some(tb2));
@@ -2253,8 +2573,16 @@ mod tests {
         let session = store.create_session();
         let ba = session.bind_agent(a.id, "cli", None, None).unwrap();
         let bb = session.bind_agent(b.id, "cli", None, None).unwrap();
-        let ta = session.turn_start(a.id).unwrap().turn.unwrap();
-        let tb = session.turn_start(b.id).unwrap().turn.unwrap();
+        let ta = session
+            .turn_start_with(a.id, ps("a"))
+            .unwrap()
+            .turn
+            .unwrap();
+        let tb = session
+            .turn_start_with(b.id, ps("b"))
+            .unwrap()
+            .turn
+            .unwrap();
         session
             .write(|d| {
                 d.current_turn.clear();

@@ -897,6 +897,11 @@ pub fn wake_through_host_wake(
     } = args;
     // The wire's Host Agent picks the kept recipe: waking A never uses B's.
     let agent = remint.session.host_agent_id();
+    // Parallel-safe conflict gate before any wire action.
+    match runtime.check_turn_gate(session_id, agent) {
+        Err(hearth::Error::Waiting(reason)) => return Ok(WakeThroughHost::Waiting(reason)),
+        r => r?,
+    }
     let host = host_wake(old_wire, old, new, new_transport, remint)?;
     match host {
         HostWake::Waiting(reason) => Ok(WakeThroughHost::Waiting(reason)),
@@ -1040,6 +1045,17 @@ pub fn begin_turn_through_host_wake(
             ));
         }
         _ => {}
+    }
+    // Parallel-safe conflict gate before any wire action — only for a new
+    // turn (re-keep adopt of this Agent's log-open turn opens none).
+    let log = runtime.store().session(session_id)?.events()?;
+    if hearth::open_turn_of_agent(&log, agent).is_none() {
+        match runtime.check_turn_gate(session_id, agent) {
+            Err(hearth::Error::Waiting(reason)) => {
+                return Ok(BeginTurnThroughHost::Waiting(reason));
+            }
+            r => r?,
+        }
     }
     let host = host_wake(old_wire, old, new, new_transport, remint)?;
     match host {
@@ -3469,6 +3485,74 @@ mod tests {
         );
     }
 
+    /// Parallel-safe conflict gate runs before host_wake: another kept
+    /// Agent's undeclared open turn makes a lost-wire wake Waiting(TurnOpen)
+    /// with zero mints, zero wire writes, nothing written. Both opted in on
+    /// disjoint paths, the same wake remints and opens a concurrent turn.
+    #[test]
+    fn wake_through_host_wake_conflict_gate_waits_before_wire_action() {
+        let (rt, sid, uid, remint, place) = shared_runtime_remint();
+        let a = remint.host_agent_id();
+        let b = rt.store().create_agent("other", "").id;
+        rt.keep(sid, b, hearth::HostKind::Codex.host(None, None))
+            .expect("keep B");
+        rt.wake(sid, b, hearth::Wake::Timer).expect("B turn");
+        let session = rt.store().session(sid).unwrap();
+        let before_len = session.events().unwrap().len();
+        let before = binding_attached_count(&rt, sid);
+        let query = || hearth::Wake::UserQuery {
+            user: uid,
+            text: "hi".into(),
+        };
+        let mut old = initialized_fake(Vec::new());
+        let old_log = old.stdin_log().unwrap().len();
+        let mut new = new_wire_fake();
+        let r = run_through(
+            &rt,
+            sid,
+            query(),
+            &remint,
+            &place,
+            OldWire::StdoutEof,
+            &mut old,
+            &mut new,
+        )
+        .expect("through");
+        assert_eq!(r, WakeThroughHost::Waiting(hearth::WaitReason::TurnOpen));
+        assert_eq!(binding_attached_count(&rt, sid), before, "zero mints");
+        assert_eq!(session.events().unwrap().len(), before_len);
+        assert_eq!(old.stdin_log().unwrap().len(), old_log);
+        assert!(new.stdin_log().unwrap().is_empty());
+
+        session.turn_end(b).unwrap();
+        for (ag, path) in [(a, "a"), (b, "b")] {
+            rt.set_parallel_safe(sid, ag, Some(hearth::ParallelSafe::paths([path])))
+                .expect("opt in");
+        }
+        rt.wake(sid, b, hearth::Wake::Timer)
+            .expect("B declared turn");
+        let r = run_through(
+            &rt,
+            sid,
+            query(),
+            &remint,
+            &place,
+            OldWire::StdoutEof,
+            &mut old,
+            &mut new,
+        )
+        .expect("through");
+        assert!(matches!(
+            r,
+            WakeThroughHost::Woke {
+                host: HostWake::Reminted(_),
+                ..
+            }
+        ));
+        assert!(session.current_turn_of(a).unwrap().is_some());
+        assert!(session.current_turn_of(b).unwrap().is_some());
+    }
+
     // ---- tick_through_host_wake (timer through the same seam) ----
 
     #[allow(clippy::too_many_arguments)]
@@ -3656,6 +3740,10 @@ mod tests {
         rt.keep(sid, b, hearth::HostKind::Codex.host(None, None))
             .expect("keep B");
         rt.schedule(sid, b, 1_000).expect("schedule B");
+        for (ag, path) in [(a, "a"), (b, "b")] {
+            rt.set_parallel_safe(sid, ag, Some(hearth::ParallelSafe::paths([path])))
+                .expect("opt in");
+        }
         let mut old = initialized_fake(Vec::new());
         let mut new = new_wire_fake();
         let fired = tick_through(
@@ -4033,6 +4121,45 @@ mod tests {
             .find(|b| b.agent == Some(agent))
             .unwrap()
             .id
+    }
+
+    /// Gate refusal in `begin_turn_through_host_wake` is zero wire action:
+    /// `Waiting(TurnOpen)`, no `BindingAttached` mint, no events, no stdin on
+    /// old or new wire. Kills the mutant that drops the gate before `host_wake`.
+    #[test]
+    fn begin_turn_through_host_wake_gate_refusal_zero_wire_action() {
+        let (rt, sid, _uid, remint, place) = shared_runtime_remint();
+        let b = rt.store().create_agent("other", "").id;
+        rt.keep(sid, b, hearth::HostKind::Codex.host(None, None))
+            .expect("keep B");
+        rt.wake(sid, b, hearth::Wake::Timer).expect("B turn");
+        let session = rt.store().session(sid).unwrap();
+        let before_len = session.events().unwrap().len();
+        let before = binding_attached_count(&rt, sid);
+        let mut old = initialized_fake(Vec::new());
+        let old_log = old.stdin_log().unwrap().len();
+        let mut new = new_wire_fake();
+        let r = begin_through(
+            &rt,
+            sid,
+            hearth::HolderId::new("h"),
+            &remint,
+            &place,
+            OldWire::Exited(1),
+            &mut old,
+            &mut new,
+        );
+        assert!(
+            matches!(
+                r,
+                Ok(BeginTurnThroughHost::Waiting(hearth::WaitReason::TurnOpen))
+            ),
+            "{r:?}"
+        );
+        assert_eq!(binding_attached_count(&rt, sid), before, "zero mints");
+        assert_eq!(session.events().unwrap().len(), before_len);
+        assert_eq!(old.stdin_log().unwrap().len(), old_log);
+        assert!(new.stdin_log().unwrap().is_empty());
     }
 
     /// LiveIdle begin_turn: ReuseLive, zero mints, no wire writes; lease opens

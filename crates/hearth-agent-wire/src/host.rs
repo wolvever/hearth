@@ -243,6 +243,9 @@ pub struct HostAttach<A: CodingAgent> {
     /// In-flight agent→client requests for advertised methods, keyed like
     /// permission asks by `(Binding, rpc id)`; value is the method.
     client_requests: HashMap<(BindingId, RpcId), String>,
+    /// Explicit parallel-safe opt-in for turns this attach opens (prompt
+    /// submit / wire `TurnStarted`). `None` = fail-closed.
+    parallel_safe: Option<hearth::ParallelSafe>,
 }
 
 impl<A: CodingAgent> HostAttach<A> {
@@ -257,7 +260,25 @@ impl<A: CodingAgent> HostAttach<A> {
             pending: HashMap::new(),
             client_caps: ClientCapabilities::HOST,
             client_requests: HashMap::new(),
+            parallel_safe: None,
         }
+    }
+
+    /// Declare the turns this attach opens parallel-safe on `decl`'s paths
+    /// ([`hearth::ParallelSafe`]); `None` (default) is fail-closed.
+    pub fn with_parallel_safe(mut self, decl: Option<hearth::ParallelSafe>) -> Self {
+        self.parallel_safe = decl;
+        self
+    }
+
+    /// Whether this attach's Agent has an open turn on a live Binding.
+    fn agent_in_turn(&self, session: &Session) -> AttachResult<bool> {
+        for b in session.bindings()? {
+            if b.agent == Some(self.agent) && session.current_turn_on(b.id)?.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Override the advertised client capabilities. Only for a Host that
@@ -363,6 +384,11 @@ impl<A: CodingAgent> HostAttach<A> {
     /// Prompt submit rechecks, under the store lock, that this attach's
     /// Binding still owns the Session (not reminted away); a stale attach
     /// gets [`hearth::Error::UnknownBinding`] and nothing is sent.
+    ///
+    /// A prompt that would open a new turn (this Agent has none open) is
+    /// conflict-gated first ([`Session::check_turn_gate`] with this
+    /// attach's declaration): refused → `Waiting(TurnOpen)`, nothing
+    /// appended or sent.
     pub fn user_message(
         &mut self,
         session: &Session,
@@ -370,6 +396,9 @@ impl<A: CodingAgent> HostAttach<A> {
         text: impl Into<String>,
     ) -> AttachResult<Event> {
         let text = text.into();
+        if !self.agent_in_turn(session)? {
+            session.check_turn_gate(self.agent, self.parallel_safe.as_ref())?;
+        }
         let ev = session.user_message_on(self.binding.id, user, text.clone())?;
         self.coding.send(AgentCommand::UserMessage {
             session_id: self.wire_session(),
@@ -594,11 +623,16 @@ impl<A: CodingAgent> HostAttach<A> {
             // Per-Binding turn map: the kernel (wake / begin_turn) may have
             // already opened this Binding's turn; the wire echo is absorbed
             // rather than minting a second turn id or failing the drain.
-            AgentEvent::TurnStarted { .. } => match session.turn_start(self.agent) {
-                Ok(ev) => Ok(vec![ev]),
-                Err(hearth::Error::Waiting(hearth::WaitReason::TurnOpen)) => Ok(vec![]),
-                Err(e) => Err(e.into()),
-            },
+            // A conflict-gate refusal (another turn open, not parallel-safe
+            // or overlapping) is not absorbed: it surfaces as Waiting.
+            AgentEvent::TurnStarted { .. } => {
+                if self.agent_in_turn(session)? {
+                    return Ok(vec![]);
+                }
+                Ok(vec![
+                    session.turn_start_with(self.agent, self.parallel_safe.clone())?
+                ])
+            }
             AgentEvent::TurnCompleted { .. } => Ok(vec![session.turn_end(self.agent)?]),
             AgentEvent::PermissionAsk {
                 rpc_id: Some(rpc_id),
@@ -754,6 +788,87 @@ mod tests {
         assert_eq!(attach2.binding().id, binding_id);
         assert_eq!(session.bindings().unwrap().len(), 1);
         assert_eq!(session.bindings().unwrap()[0].id, binding_id);
+    }
+
+    /// Prompt submit that would open a new turn is conflict-gated: another
+    /// Agent's undeclared open turn refuses it (fail-closed) with nothing
+    /// appended or sent; with both declared on disjoint paths it opens.
+    #[test]
+    fn wire_prompt_is_conflict_gated() {
+        let (store, user, agent, session) = room();
+        let other = store.create_agent("other", "");
+        session.join(Member::Agent(other.id)).unwrap();
+        session.bind_agent(other.id, "cli", None, None).unwrap();
+        let mut attach = HostAttach::loopback(&session, agent.id, AgentKind::Codex)
+            .unwrap()
+            .with_parallel_safe(Some(hearth::ParallelSafe::paths(["src"])));
+        attach.open(None).unwrap();
+        attach.drain(&session).unwrap();
+
+        session.turn_start(other.id).unwrap();
+        let before = session.events().unwrap().len();
+        assert!(matches!(
+            attach.user_message(&session, user.id, "hi"),
+            Err(AttachError::Hearth(hearth::Error::Waiting(
+                hearth::WaitReason::TurnOpen
+            )))
+        ));
+        assert!(attach.drain(&session).unwrap().is_empty(), "nothing sent");
+        assert_eq!(session.events().unwrap().len(), before);
+        session.turn_end(other.id).unwrap();
+
+        // Overlapping declaration still serializes.
+        session
+            .turn_start_with(other.id, Some(hearth::ParallelSafe::paths(["src/lib.rs"])))
+            .unwrap();
+        assert!(attach.user_message(&session, user.id, "hi").is_err());
+        session.turn_end(other.id).unwrap();
+
+        session
+            .turn_start_with(other.id, Some(hearth::ParallelSafe::paths(["docs"])))
+            .unwrap();
+        attach.user_message(&session, user.id, "hi").unwrap();
+        let drained = attach.drain(&session).unwrap();
+        let start = drained
+            .iter()
+            .find(|e| matches!(e.body, EventBody::TurnStart { agent: a } if a == agent.id))
+            .expect("own turn opened");
+        let msg = drained
+            .iter()
+            .find(|e| matches!(e.body, EventBody::AgentMessage { .. }))
+            .unwrap();
+        assert_eq!(msg.turn, start.turn);
+        assert!(session.current_turn_of(other.id).unwrap().is_some());
+    }
+
+    /// A wire `TurnStarted` the conflict gate refuses is not absorbed as an
+    /// echo: drain surfaces `Waiting(TurnOpen)` instead of running a wire
+    /// turn with no kernel turn.
+    #[test]
+    fn wire_turn_started_conflict_is_not_absorbed() {
+        let (store, _user, agent, session) = room();
+        let other = store.create_agent("other", "");
+        session.join(Member::Agent(other.id)).unwrap();
+        session.bind_agent(other.id, "cli", None, None).unwrap();
+        let mut attach = HostAttach::loopback(&session, agent.id, AgentKind::Codex).unwrap();
+        attach.open(None).unwrap();
+        attach.drain(&session).unwrap();
+        session.turn_start(other.id).unwrap();
+        // Bypass the prompt gate: the wire starts a turn on its own.
+        let wire_session = attach.wire_session();
+        attach
+            .send(AgentCommand::UserMessage {
+                session_id: wire_session,
+                text: "hi".into(),
+            })
+            .unwrap();
+        assert!(matches!(
+            attach.drain(&session),
+            Err(AttachError::Hearth(hearth::Error::Waiting(
+                hearth::WaitReason::TurnOpen
+            )))
+        ));
+        assert!(session.current_turn_of(agent.id).unwrap().is_none());
     }
 
     /// Kernel already opened this Binding's turn (wake / begin_turn): the
