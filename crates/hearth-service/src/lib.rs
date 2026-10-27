@@ -3522,6 +3522,391 @@ mod tests {
         assert_eq!(count_trigger_wakes(&st, sid), 0);
     }
 
+    // -------------------------------------------------------------------------
+    // Host-owned-tool-yield Must floors (H-I1 Soft under #78). Tip already
+    // allows: Session::turn_end does not finalize unmatched ToolCalls.
+    // -------------------------------------------------------------------------
+
+    /// Yield helper: open turn, record Host ToolCall, end turn → LiveIdle.
+    fn yield_host_tool_to_live_idle(
+        st: &AppState,
+        sid: SessionId,
+        agent: hearth::AgentId,
+        tool_call_id: &str,
+        name: &str,
+    ) -> hearth::BindingId {
+        st.runtime
+            .begin_turn(sid, agent, hearth::HolderId::new("yield"))
+            .expect("begin_turn opens LiveInTurn");
+        assert_eq!(
+            st.runtime.classify(sid, agent).unwrap(),
+            hearth::Liveness::LiveInTurn
+        );
+        record_host_tool_call(st, sid, agent, tool_call_id, name);
+        let bid = st.runtime.binding_for(sid, agent).unwrap();
+        if let Some(lease) = st.runtime.turn_lease_of(sid, agent).unwrap() {
+            st.runtime
+                .end_turn(sid, lease.holder, lease.fence, false)
+                .unwrap();
+        } else {
+            st.store().session(sid).unwrap().turn_end(agent).unwrap();
+        }
+        assert_eq!(
+            st.runtime.classify(sid, agent).unwrap(),
+            hearth::Liveness::LiveIdle,
+            "yield must leave LiveIdle"
+        );
+        bid
+    }
+
+    fn count_tool_interrupted(st: &AppState, sid: SessionId, tool_call_id: &str) -> usize {
+        st.store()
+            .session(sid)
+            .unwrap()
+            .events()
+            .unwrap()
+            .iter()
+            .filter(|e| {
+                matches!(
+                    &e.body,
+                    EventBody::ToolCallInterrupted { tool_call_id: id, .. } if id == tool_call_id
+                )
+            })
+            .count()
+    }
+
+    /// M1: Mid-turn Host ToolCall + turn_end → LiveIdle; tool_call_id unmatched
+    /// (no Interrupt); Binding stays.
+    #[tokio::test]
+    async fn http_host_owned_yield_live_idle_unmatched_no_interrupt() {
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let (a, _, _) = install_two_parallel_safe_host_wires(&st, sid, None);
+        let bid_before = yield_host_tool_to_live_idle(&st, sid, a, "tc-y1", "yield_tool");
+
+        assert_eq!(st.runtime.binding_for(sid, a).unwrap(), bid_before);
+        assert!(
+            !hearth::tool_call_is_terminal(
+                &st.store().session(sid).unwrap().events().unwrap(),
+                "tc-y1"
+            ),
+            "yield must not finalize unmatched Host ToolCall"
+        );
+        assert_eq!(count_tool_interrupted(&st, sid, "tc-y1"), 0);
+        assert_eq!(count_tool_results(&st, sid, "tc-y1"), 0);
+        let unmatched =
+            hearth::unmatched_tool_calls(&st.store().session(sid).unwrap().events().unwrap());
+        assert!(
+            unmatched
+                .iter()
+                .any(|(ag, id, _)| *ag == a && id == "tc-y1"),
+            "tool_call_id must stay unmatched after yield: {unmatched:?}"
+        );
+    }
+
+    /// M2: After yield → POST tool-result → one ToolResult + Wake(Trigger) +
+    /// LiveInTurn (compose #78 M1; closes M8 Trigger trap as happy path).
+    #[tokio::test]
+    async fn http_host_owned_yield_later_complete_triggers_live_in_turn() {
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let id = sid.0.to_string();
+        let (a, _, _) = install_two_parallel_safe_host_wires(&st, sid, None);
+        let _bid = yield_host_tool_to_live_idle(&st, sid, a, "tc-y2", "yield_complete");
+
+        let app = router(st.clone());
+        let (code, body) = call(
+            app,
+            Request::post(format!("/sessions/{id}/agents/alpha/tool-result"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"tool_call_id":"tc-y2","output":"after-yield"}"#,
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "body={body}");
+        assert!(body.contains(r#""applied":true"#), "body={body}");
+        assert_eq!(count_tool_results(&st, sid, "tc-y2"), 1);
+        assert_eq!(count_trigger_wakes(&st, sid), 1);
+        assert_eq!(
+            st.runtime.classify(sid, a).unwrap(),
+            hearth::Liveness::LiveInTurn
+        );
+        assert!(st
+            .store()
+            .session(sid)
+            .unwrap()
+            .current_turn_of(a)
+            .unwrap()
+            .is_some());
+        let evs = st.store().session(sid).unwrap().events().unwrap();
+        assert!(evs.iter().any(|e| matches!(
+            &e.body,
+            EventBody::ToolResult {
+                tool_call_id,
+                name,
+                output,
+                ..
+            } if tool_call_id == "tc-y2" && name == "yield_complete" && output == "after-yield"
+        )));
+        assert!(evs.iter().any(|e| matches!(
+            &e.body,
+            EventBody::Wake {
+                source: hearth::WakeSource::Trigger { name }
+            } if name == "tool_result"
+        )));
+    }
+
+    /// M3: Peer ParallelSafe can begin_turn / HTTP steer during yielded
+    /// LiveIdle; lease/fence/Binding pins; completion wake not fan-out.
+    #[tokio::test]
+    async fn http_host_owned_yield_peer_parallel_safe_runs_completion_not_fanout() {
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let id = sid.0.to_string();
+        let (a, b, _) = install_two_parallel_safe_host_wires(&st, sid, None);
+        let bid_a = yield_host_tool_to_live_idle(&st, sid, a, "tc-y3", "yield_peer");
+        let lease_a_before = st.runtime.turn_lease_of(sid, a).unwrap();
+        let fence_a_before = st.store().session(sid).unwrap().turn_fence_of(a).unwrap();
+        let bid_b_before = st.runtime.binding_for(sid, b).unwrap();
+        let lease_b_before = st.runtime.turn_lease_of(sid, b).unwrap();
+        let fence_b_before = st.store().session(sid).unwrap().turn_fence_of(b).unwrap();
+
+        // Peer begins its own turn while A is yielded LiveIdle.
+        st.runtime
+            .begin_turn(sid, b, hearth::HolderId::new("peer-y3"))
+            .expect("peer ParallelSafe begin_turn during yield");
+        assert_eq!(
+            st.runtime.classify(sid, b).unwrap(),
+            hearth::Liveness::LiveInTurn
+        );
+        assert_eq!(
+            st.runtime.classify(sid, a).unwrap(),
+            hearth::Liveness::LiveIdle,
+            "yielded Agent stays LiveIdle while peer runs"
+        );
+        assert_eq!(st.runtime.binding_for(sid, a).unwrap(), bid_a);
+        assert_eq!(st.runtime.turn_lease_of(sid, a).unwrap(), lease_a_before);
+        assert_eq!(
+            st.store().session(sid).unwrap().turn_fence_of(a).unwrap(),
+            fence_a_before
+        );
+        assert_eq!(st.runtime.binding_for(sid, b).unwrap(), bid_b_before);
+        // Peer's lease is new; fence may raise — pin Binding identity only for
+        // cross-Agent steal (B's Binding unchanged).
+        assert_ne!(
+            st.runtime.turn_lease_of(sid, b).unwrap(),
+            lease_b_before,
+            "peer should hold its own lease"
+        );
+        let _ = fence_b_before;
+
+        // End peer turn so completion wake of A is not Waiting(TurnOpen) via gate.
+        if let Some(lease) = st.runtime.turn_lease_of(sid, b).unwrap() {
+            st.runtime
+                .end_turn(sid, lease.holder, lease.fence, false)
+                .unwrap();
+        }
+
+        let app = router(st.clone());
+        let (code, body) = call(
+            app,
+            Request::post(format!("/sessions/{id}/agents/alpha/tool-result"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"tool_call_id":"tc-y3","output":"solo-y3"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "body={body}");
+        assert!(body.contains(r#""applied":true"#), "body={body}");
+        assert_eq!(count_trigger_wakes(&st, sid), 1);
+        assert_eq!(
+            st.runtime.classify(sid, a).unwrap(),
+            hearth::Liveness::LiveInTurn
+        );
+        assert_eq!(
+            st.runtime.classify(sid, b).unwrap(),
+            hearth::Liveness::LiveIdle,
+            "completion must not fan-out wake peer"
+        );
+        assert!(
+            st.store()
+                .session(sid)
+                .unwrap()
+                .current_turn_of(b)
+                .unwrap()
+                .is_none(),
+            "peer no TurnStart from completion"
+        );
+        let turn_starts: Vec<_> = st
+            .store()
+            .session(sid)
+            .unwrap()
+            .events()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match &e.body {
+                EventBody::TurnStart { agent } => Some(*agent),
+                _ => None,
+            })
+            .collect();
+        // Peer began+ended one TurnStart; completion adds A's TurnStart only
+        // as the LiveInTurn wake — assert the last TurnStart is A and peer
+        // is not in-turn now.
+        assert!(
+            turn_starts.contains(&a) && turn_starts.contains(&b),
+            "both Agents opened a turn at some point: {turn_starts:?}"
+        );
+        assert!(
+            st.store()
+                .session(sid)
+                .unwrap()
+                .current_turn_of(a)
+                .unwrap()
+                .is_some(),
+            "completing Agent must be LiveInTurn"
+        );
+    }
+
+    /// M4: remint while LiveIdle + unmatched Host ToolCall → AlreadyLive;
+    /// no finalize_unmatched_tool_calls_of (waiter stays open).
+    #[tokio::test]
+    async fn http_host_owned_yield_live_idle_remint_already_live_no_finalize() {
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let (a, _, _) = install_two_parallel_safe_host_wires(&st, sid, None);
+        let bid_before = yield_host_tool_to_live_idle(&st, sid, a, "tc-y4", "yield_remint");
+
+        let remint_err = st.runtime.remint(sid, a).expect_err("LiveIdle remint");
+        assert!(
+            matches!(
+                remint_err,
+                hearth::Error::Waiting(hearth::WaitReason::AlreadyLive)
+            ),
+            "expected AlreadyLive, got {remint_err:?}"
+        );
+        assert_eq!(st.runtime.binding_for(sid, a).unwrap(), bid_before);
+        assert_eq!(count_tool_interrupted(&st, sid, "tc-y4"), 0);
+        assert!(
+            !hearth::tool_call_is_terminal(
+                &st.store().session(sid).unwrap().events().unwrap(),
+                "tc-y4"
+            ),
+            "LiveIdle remint must not finalize Host tool waiter"
+        );
+        assert_eq!(
+            st.runtime.classify(sid, a).unwrap(),
+            hearth::Liveness::LiveIdle
+        );
+    }
+
+    /// M5: PositivelyDead / mid-turn remint still finalizes unmatched →
+    /// Interrupted; late complete → NotApplied (#78 M5 regression).
+    #[tokio::test]
+    async fn http_host_owned_yield_positively_dead_remint_finalizes_late_not_applied() {
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let id = sid.0.to_string();
+        let (a, _, _) = install_two_parallel_safe_host_wires(&st, sid, None);
+
+        // Mid-turn Host ToolCall on RemintSession → remint_and_attach finalizes
+        // (PositivelyDead-class recovery: old Binding reminted away).
+        {
+            let mut wires = st.host_wires.lock().unwrap();
+            let w = wires.get_mut(sid, a).unwrap();
+            w.remint.begin_turn("mid-y5");
+            w.remint.start_tool("tc-y5", "remint_finalize");
+            let out = w.remint.remint_and_attach().expect("mid-turn remint");
+            assert!(out.turn_interrupted);
+            assert_eq!(out.tools_finalized, 1);
+        }
+        assert_eq!(count_tool_interrupted(&st, sid, "tc-y5"), 1);
+        assert!(hearth::tool_call_is_terminal(
+            &st.store().session(sid).unwrap().events().unwrap(),
+            "tc-y5"
+        ));
+
+        let app = router(st.clone());
+        let (code, body) = call(
+            app,
+            Request::post(format!("/sessions/{id}/agents/alpha/tool-result"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"tool_call_id":"tc-y5","output":"late-y5"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "body={body}");
+        assert!(body.contains(r#""applied":false"#), "body={body}");
+        assert_eq!(count_tool_results(&st, sid, "tc-y5"), 0);
+        assert_eq!(count_trigger_wakes(&st, sid), 0);
+    }
+
+    /// M6: ACP HostAttach drain ToolCall/ToolResult unused path stays
+    /// byte-identical under Host-owned yield (no mid-ACP auto turn_end).
+    #[tokio::test]
+    async fn http_host_owned_yield_leaves_acp_drain_path_byte_identical() {
+        use hearth_agent_wire::{event_bodies, AgentEvent, CapabilityFlags, ToolStatus};
+        let agent = hearth::AgentId(uuid::Uuid::nil());
+        let call = AgentEvent::ToolCall {
+            session_id: "s".into(),
+            item_id: "drain-y6".into(),
+            name: "Bash".into(),
+            arguments: serde_json::json!({}),
+            status: ToolStatus::Completed,
+            parent: None,
+            subagent: false,
+        };
+        let result = AgentEvent::ToolResult {
+            session_id: "s".into(),
+            item_id: "drain-y6".into(),
+            output: serde_json::json!("ok"),
+            status: ToolStatus::Completed,
+        };
+        let bodies_call = event_bodies(
+            hearth::BindingId(uuid::Uuid::nil()),
+            agent,
+            &call,
+            CapabilityFlags::ACP,
+        );
+        let bodies_res = event_bodies(
+            hearth::BindingId(uuid::Uuid::nil()),
+            agent,
+            &result,
+            CapabilityFlags::ACP,
+        );
+        assert!(matches!(
+            &bodies_call[0],
+            EventBody::ToolCall {
+                tool_call_id,
+                name,
+                ..
+            } if tool_call_id == "drain-y6" && name == "Bash"
+        ));
+        assert!(matches!(
+            &bodies_res[0],
+            EventBody::ToolResult {
+                tool_call_id,
+                name,
+                output,
+                ..
+            } if tool_call_id == "drain-y6" && name == "drain-y6" && output.contains("ok")
+        ));
+        // Drain path emits Event bodies only — never TurnEnd (no mid-ACP auto yield).
+        assert!(
+            !bodies_call
+                .iter()
+                .chain(bodies_res.iter())
+                .any(|b| matches!(b, EventBody::TurnEnd { .. })),
+            "ACP drain must not smuggle turn_end"
+        );
+    }
+
     #[allow(clippy::result_large_err)] // tungstenite::Error is upstream; test-only helper
     async fn expect_text(
         ws: &mut (impl StreamExt<Item = Result<WsMsg, tokio_tungstenite::tungstenite::Error>> + Unpin),
