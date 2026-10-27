@@ -52,6 +52,7 @@ pub use runner::{
     RemintEventKind, RemintOutcome, RemintSession, RemintThroughHost, RemintThroughHostArgs,
     RemintWireMethod, RunnerTransport, StdoutRead, TickWire, WakeEachKeptThroughHost,
     WakeEachKeptThroughHostArgs, WakeThroughError, WakeThroughHost, WakeThroughHostArgs,
+    HOST_WAKE_REMINT_RETRY_BACKOFF, HOST_WAKE_REMINT_RETRY_BUDGET,
 };
 pub use transport::{
     JsonRpcTransport, JsonlProblem, JsonlRpcTransport, SseFrame, SseTransport, Transport,
