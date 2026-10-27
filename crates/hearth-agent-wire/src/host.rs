@@ -1654,6 +1654,202 @@ mod tests {
         }
     }
 
+    /// Nesting-proof Must floor: Host-drain e2e joining axis-4
+    /// (ToolCall + AgentMessage + PermissionAsked + AgentThink).
+    /// CLAUDE_ACP / Pi retain all four `parent_tool_call_id`s; generic ACP /
+    /// Copilot / Cursor strip all four to `None` even when wire `_meta`
+    /// carries `parentToolUseId`. Reuses `claude_subagent_nested` + #59/#60
+    /// Host floors; Concurrent-*-remint only pins Permission on remint —
+    /// this locks the full quartet on drain. Drop-any-one / always-retain
+    /// mutants KILL. No child Session/Binding; no ToolResult parent.
+    #[test]
+    fn host_drain_joins_axis4_parent_quartet_under_caps() {
+        use crate::adapters::acp::AcpCodec;
+        use crate::{FramedAgent, JsonlRpcTransport};
+
+        let nested = crate::adapters::fixture("acp", "claude_subagent_nested.json");
+        let ask = serde_json::json!({"jsonrpc": "2.0", "id": 7, "method": "session/request_permission",
+            "params": {"sessionId": "s1", "toolCall": {
+                "toolCallId": "toolu_grandchild_read", "title": "Read /spec.md",
+                "_meta": {"claudeCode": {"toolName": "Read", "parentToolUseId": "toolu_inner"}}},
+                "options": [{"optionId": "allow", "name": "Allow", "kind": "allow_once"}]}});
+        let thought = serde_json::json!({"jsonrpc": "2.0", "method": "session/update",
+            "params": {"sessionId": "s1", "update": {
+                "sessionUpdate": "agent_thought_chunk",
+                "content": {"type": "text", "text": "axis4 nested think"},
+                "_meta": {"claudeCode": {"parentToolUseId": "toolu_outer"}}}}});
+
+        let push_quartet = |io: &mut FramedAgent<JsonlRpcTransport, AcpCodec>| {
+            for f in nested.as_array().unwrap() {
+                io.transport_mut().push_decoded(f.clone());
+            }
+            io.transport_mut().push_decoded(ask.clone());
+            io.transport_mut().push_decoded(thought.clone());
+        };
+
+        // Named fields (not a filtered list) kill drop-any-one: omitting a
+        // match arm leaves that field None → panic on the seen probe.
+        struct Axis4Parents {
+            tool: Option<Option<String>>,
+            msg: Option<Option<String>>,
+            ask: Option<Option<String>>,
+            think: Option<Option<String>>,
+        }
+        fn axis4_parents(log: &[hearth::Event]) -> Axis4Parents {
+            let mut out = Axis4Parents {
+                tool: None,
+                msg: None,
+                ask: None,
+                think: None,
+            };
+            for e in log {
+                match &e.body {
+                    EventBody::ToolCall {
+                        tool_call_id,
+                        parent_tool_call_id,
+                        ..
+                    } if tool_call_id == "toolu_inner" && out.tool.is_none() => {
+                        out.tool = Some(parent_tool_call_id.clone());
+                    }
+                    EventBody::AgentMessage {
+                        text,
+                        parent_tool_call_id,
+                        ..
+                    } if text == "Reading the spec first." && out.msg.is_none() => {
+                        out.msg = Some(parent_tool_call_id.clone());
+                    }
+                    EventBody::PermissionAsked {
+                        rpc: Some(rpc),
+                        parent_tool_call_id,
+                        ..
+                    } if rpc.tool_call_id.as_deref() == Some("toolu_grandchild_read")
+                        && out.ask.is_none() =>
+                    {
+                        out.ask = Some(parent_tool_call_id.clone());
+                    }
+                    EventBody::AgentThink {
+                        text,
+                        parent_tool_call_id,
+                        ..
+                    } if text == "axis4 nested think" && out.think.is_none() => {
+                        out.think = Some(parent_tool_call_id.clone());
+                    }
+                    _ => {}
+                }
+            }
+            out
+        }
+
+        // Retain: CLAUDE_ACP + Pi.
+        for (label, caps) in [
+            ("CLAUDE_ACP", CapabilityFlags::CLAUDE_ACP),
+            ("Pi", CapabilityFlags::for_agent(AgentKind::Pi)),
+        ] {
+            assert!(caps.subagent, "{label}");
+            let (_store, _user, agent, session) = room();
+            let kind = if label == "Pi" {
+                AgentKind::Pi
+            } else {
+                AgentKind::Acp
+            };
+            let binding = session
+                .bind_host(Some(agent.id), host_for(kind, None, None))
+                .unwrap();
+            let mut io = FramedAgent::new(JsonlRpcTransport::without_rpc_chunks(), AcpCodec);
+            push_quartet(&mut io);
+            let mut attach =
+                HostAttach::attach(binding.clone(), agent.id, io).with_agent_caps(caps);
+            assert!(attach.agent_caps().subagent, "{label}");
+            attach.drain(&session).unwrap();
+
+            // Same Binding; no child Session / remint.
+            assert_eq!(attach.binding().id, binding.id, "{label}");
+            assert_eq!(session.bindings().unwrap().len(), 1, "{label}");
+            assert_eq!(attach.native_session(), None, "{label}");
+
+            let log = session.events().unwrap();
+            let q = axis4_parents(&log);
+            // Seen probes: drop-any-one (omit one EventBody arm) → None → panic.
+            let tool = q
+                .tool
+                .unwrap_or_else(|| panic!("{label}: missing ToolCall toolu_inner"));
+            let msg = q.msg.unwrap_or_else(|| {
+                panic!("{label}: missing AgentMessage 'Reading the spec first.'")
+            });
+            let asked = q.ask.unwrap_or_else(|| {
+                panic!("{label}: missing PermissionAsked toolu_grandchild_read")
+            });
+            let think = q
+                .think
+                .unwrap_or_else(|| panic!("{label}: missing AgentThink 'axis4 nested think'"));
+
+            // Quartet retain — always-None / drop-arm mutants KILL.
+            assert_eq!(
+                tool.as_deref(),
+                Some("toolu_outer"),
+                "{label}: ToolCall parent"
+            );
+            assert_eq!(
+                msg.as_deref(),
+                Some("toolu_outer"),
+                "{label}: AgentMessage parent"
+            );
+            assert_eq!(
+                asked.as_deref(),
+                Some("toolu_inner"),
+                "{label}: PermissionAsked parent"
+            );
+            assert_eq!(
+                think.as_deref(),
+                Some("toolu_outer"),
+                "{label}: AgentThink parent"
+            );
+        }
+
+        // Strip: generic ACP / Copilot / Cursor — wire `_meta` present, no leak.
+        for (label, caps) in [
+            ("acp-default", CapabilityFlags::ACP),
+            ("copilot", lookup_profile("copilot").unwrap().caps()),
+            ("cursor", lookup_profile("cursor").unwrap().caps()),
+        ] {
+            assert!(!caps.subagent, "{label}");
+            let (_store, _user, agent, session) = room();
+            let binding = session
+                .bind_host(Some(agent.id), host_for(AgentKind::Acp, None, None))
+                .unwrap();
+            let mut io = FramedAgent::new(JsonlRpcTransport::without_rpc_chunks(), AcpCodec);
+            push_quartet(&mut io);
+            let mut attach =
+                HostAttach::attach(binding.clone(), agent.id, io).with_agent_caps(caps);
+            assert!(!attach.agent_caps().subagent, "{label}");
+            attach.drain(&session).unwrap();
+
+            assert_eq!(session.bindings().unwrap().len(), 1, "{label}");
+            assert_eq!(attach.native_session(), None, "{label}");
+
+            let log = session.events().unwrap();
+            let q = axis4_parents(&log);
+            let tool = q
+                .tool
+                .unwrap_or_else(|| panic!("{label}: missing ToolCall toolu_inner"));
+            let msg = q.msg.unwrap_or_else(|| {
+                panic!("{label}: missing AgentMessage 'Reading the spec first.'")
+            });
+            let asked = q.ask.unwrap_or_else(|| {
+                panic!("{label}: missing PermissionAsked toolu_grandchild_read")
+            });
+            let think = q
+                .think
+                .unwrap_or_else(|| panic!("{label}: missing AgentThink 'axis4 nested think'"));
+
+            // Quartet strip — always-retain mutant KILL (any Some leaks).
+            assert_eq!(tool, None, "{label}: ToolCall must strip");
+            assert_eq!(msg, None, "{label}: AgentMessage must strip");
+            assert_eq!(asked, None, "{label}: PermissionAsked must strip");
+            assert_eq!(think, None, "{label}: AgentThink must strip");
+        }
+    }
+
     #[test]
     fn framed_agent_jsonl_pi_rpc_appends_tool_call() {
         use crate::adapters::pi::PiCodec;
