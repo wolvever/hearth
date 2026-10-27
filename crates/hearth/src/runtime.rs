@@ -2705,6 +2705,72 @@ mod tests {
         assert_eq!(rt.classify(sid, b.id).unwrap(), Liveness::NeverBound);
     }
 
+    /// Claim-before-record (closes #56 Soft Should M7): Host `AlreadyBound` +
+    /// `NoBinding` on the would-be first ready Agent (classify/gate pass,
+    /// claim Waiting) appends no shared wake record. All-Waiting via claim
+    /// → `Waiting`, log unchanged. Mutant that `record_wake`s before claim
+    /// leaves a UserMessage / Wake with zero turns — this floor KILLs it.
+    /// Extends the busy/"wait appends nothing" floor (classify TurnOpen only).
+    #[test]
+    fn wake_each_kept_claim_waiting_appends_nothing() {
+        let rt = Runtime::new();
+        let a = rt.store().create_agent("a", "");
+        let b = rt.store().create_agent("b", "");
+        let user = rt.store().create_user("cheng");
+        let session = rt.create_session();
+        let sid = session.id();
+        session.join(Member::User(user.id)).unwrap();
+        rt.keep(sid, a.id, goose()).unwrap();
+        rt.keep(sid, b.id, codex()).unwrap();
+        opt_in(&rt, sid, &[a.id, b.id]);
+        assert!(session.bindings().unwrap().is_empty(), "NeverBound both");
+
+        let before = session.events().unwrap().len();
+        let um = |log: &[crate::Event]| {
+            log.iter()
+                .filter(|e| matches!(e.body, EventBody::UserMessage { .. }))
+                .count()
+        };
+        let wakes = |log: &[crate::Event]| {
+            log.iter()
+                .filter(|e| matches!(e.body, EventBody::Wake { .. }))
+                .count()
+        };
+        let um_before = um(&session.events().unwrap());
+        let wake_before = wakes(&session.events().unwrap());
+
+        // UserQuery: both Agents need claim; AlreadyBound → NoBinding each.
+        assert!(matches!(
+            rt.wake_each_kept_with(
+                sid,
+                Wake::UserQuery {
+                    user: user.id,
+                    text: "no-bind".into(),
+                },
+                &mut AlreadyBound,
+            ),
+            Err(Error::Waiting(WaitReason::NoBinding))
+        ));
+        let log = session.events().unwrap();
+        assert_eq!(log.len(), before, "claim Waiting appends nothing");
+        assert_eq!(um(&log), um_before, "no UserMessage on claim Waiting");
+        assert!(session.current_turn_of(a.id).unwrap().is_none());
+        assert!(session.current_turn_of(b.id).unwrap().is_none());
+        assert!(
+            session.bindings().unwrap().is_empty(),
+            "AlreadyBound must not mint"
+        );
+
+        // Timer path: same claim-Waiting → no EventBody::Wake either.
+        assert!(matches!(
+            rt.wake_each_kept_with(sid, Wake::Timer, &mut AlreadyBound),
+            Err(Error::Waiting(WaitReason::NoBinding))
+        ));
+        let log = session.events().unwrap();
+        assert_eq!(log.len(), before, "Timer claim Waiting appends nothing");
+        assert_eq!(wakes(&log), wake_before, "no Wake on claim Waiting");
+    }
+
     /// release_agent drops one recipe (and only its own lease); releasing
     /// the last kept Agent un-keeps the Session. A non-kept Agent on a kept
     /// Session is AgentNotKept.

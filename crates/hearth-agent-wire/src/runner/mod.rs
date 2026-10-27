@@ -4461,7 +4461,7 @@ mod tests {
     /// `parent_tool_call_id` quartet; remint resurfaces Permission with parent
     /// while the other three parents stay on the log; peer generic-ACP Agent
     /// strips (no cross-Agent leak). Drop-any-one / always-None mutants KILL.
-    /// SoftExpiring / fleet / #56 M7 Soft Should stay parked.
+    /// SoftExpiring / fleet stay parked.
     #[test]
     fn concurrent_nesting_through_host_wake_retains_axis4_parents_remint_and_strip() {
         let (rt, sid, uid, a, b, remint_a, remint_b, place) = shared_runtime_two_agents();
