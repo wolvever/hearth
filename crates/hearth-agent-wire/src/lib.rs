@@ -520,6 +520,11 @@ impl LoopbackAgent {
             session: None,
         }
     }
+
+    /// Enqueue an inbound event for Host drain tests (toy Loopback).
+    pub fn push_inbound(&mut self, ev: AgentEvent) {
+        self.out.push(ev);
+    }
 }
 
 impl CodingAgent for LoopbackAgent {
