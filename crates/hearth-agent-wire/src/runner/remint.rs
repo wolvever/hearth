@@ -3040,6 +3040,39 @@ mod tests {
         assert_eq!(peer.outcome("toolu_sub").unwrap()["optionId"], "allow-once");
         assert!(old.got.is_empty() && old.ignored.is_empty());
 
+        // Remint observe stream: PermissionRequested carries the parent for
+        // the original asks and the re-ask (not just the returned ref).
+        let requested: Vec<PermissionRef> = s
+            .observe()
+            .into_iter()
+            .filter_map(|e| match e.kind {
+                RemintEventKind::PermissionRequested(r) => Some(r),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(requested, [ctrl.clone(), sub.clone(), r.clone()]);
+        assert_eq!(
+            requested
+                .iter()
+                .map(|p| p.parent_tool_call_id.as_deref())
+                .collect::<Vec<_>>(),
+            [None, Some("toolu_task"), Some("toolu_task")]
+        );
+        // PermissionResolved (answer) after resolve_permission keeps the parent.
+        let resolved: Vec<PermissionRef> = s
+            .observe()
+            .into_iter()
+            .filter_map(|e| match e.kind {
+                RemintEventKind::PermissionResolved(p) if e.text == "allow-once" => Some(p),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(resolved, std::slice::from_ref(&r));
+        assert_eq!(
+            resolved[0].parent_tool_call_id.as_deref(),
+            Some("toolu_task")
+        );
+
         // Cancel drops the dead controller ask on the Host log only.
         let cmds = s.cancel_turn().unwrap();
         assert_eq!(cmds.len(), 1, "session/cancel only; dead id unanswered");
@@ -3048,6 +3081,88 @@ mod tests {
             RemintEventKind::PermissionResolved(r2) if *r2 == ctrl && e.text == "cancelled"
         )));
         assert_maps_empty(&s, "after re-ask + cancel");
+    }
+
+    /// Pep Must 2: the observe-stream `PermissionRequested` event (not just
+    /// the returned ref) carries the ask's parent, before and after remint.
+    #[test]
+    fn permission_requested_event_carries_parent_across_remint() {
+        let (s, _, bid1) = RemintSession::open("sess-1", "S-1", caps_resume());
+        s.begin_turn("work");
+        let requested = |s: &RemintSession| -> Vec<PermissionRef> {
+            s.observe()
+                .into_iter()
+                .filter_map(|e| match e.kind {
+                    RemintEventKind::PermissionRequested(r) => Some(r),
+                    _ => None,
+                })
+                .collect()
+        };
+        let a = s
+            .request_permission_under(
+                RpcId::Num(1),
+                Some("toolu_sub"),
+                Some("toolu_task"),
+                "npm test",
+                opts(),
+            )
+            .unwrap();
+        assert_eq!(a.binding, bid1);
+        let ev = requested(&s);
+        assert_eq!(ev, std::slice::from_ref(&a));
+        assert_eq!(ev[0].parent_tool_call_id.as_deref(), Some("toolu_task"));
+
+        let o = s.remint_and_attach().unwrap();
+        let b = s
+            .request_permission_under(
+                RpcId::Num(1),
+                Some("toolu_sub"),
+                Some("toolu_task"),
+                "npm test",
+                opts(),
+            )
+            .unwrap();
+        assert_eq!(b.binding, o.binding_id);
+        let ev = requested(&s);
+        assert_eq!(ev, [a, b]);
+        assert_eq!(
+            ev.iter()
+                .map(|p| p.parent_tool_call_id.as_deref())
+                .collect::<Vec<_>>(),
+            [Some("toolu_task"), Some("toolu_task")]
+        );
+    }
+
+    /// Pep Must 1: `PermissionResolved` emitted by `resolve_permission`
+    /// (an answer, not a cancel) carries the ask's parent.
+    #[test]
+    fn permission_resolved_answer_carries_parent() {
+        let (s, _, bid1) = RemintSession::open("sess-1", "S-1", caps_resume());
+        s.begin_turn("work");
+        let a = s
+            .request_permission_under(
+                RpcId::Num(7),
+                Some("toolu_sub"),
+                Some("toolu_task"),
+                "npm test",
+                opts(),
+            )
+            .unwrap();
+        s.resolve_permission(&bid1, &RpcId::Num(7), "allow-once")
+            .unwrap();
+        let resolved: Vec<(PermissionRef, String)> = s
+            .observe()
+            .into_iter()
+            .filter_map(|e| match e.kind {
+                RemintEventKind::PermissionResolved(r) => Some((r, e.text)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(resolved, [(a, "allow-once".to_string())]);
+        assert_eq!(
+            resolved[0].0.parent_tool_call_id.as_deref(),
+            Some("toolu_task")
+        );
     }
 
     /// After remint, a shared toolCallId (copilot-cli #989) is ambiguous:
