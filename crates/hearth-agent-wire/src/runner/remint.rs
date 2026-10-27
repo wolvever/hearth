@@ -3165,6 +3165,213 @@ mod tests {
         );
     }
 
+    /// Concurrent-remint-proof (#46–#53 lock floor): two kept Agents on one
+    /// Session, ParallelSafe on disjoint paths, both mid-turn with pending
+    /// permission asks (B's ask subagent-parented). Binding remint /
+    /// AttachResume resurfaces **both** asks with parents preserved; each
+    /// Agent keeps its own lease + fence; no cross-Agent lease or fence
+    /// steal. Soft Should from #53 absorbed: pin `turn_lease_of(B).fence`
+    /// after A's fence raise.
+    #[test]
+    fn concurrent_remint_two_agents_resurfaces_asks_independent_leases_fences() {
+        use hearth::{HolderId, Member, ParallelSafe, Runtime};
+
+        let rt = Runtime::new();
+        let user = rt.store().create_user("remint-user");
+        let a = rt.store().create_agent("agent-a", "");
+        let b = rt.store().create_agent("agent-b", "");
+        let session = rt.create_session();
+        let sid = session.id();
+        session.join(Member::User(user.id)).unwrap();
+        session.join(Member::Agent(a.id)).unwrap();
+        session.join(Member::Agent(b.id)).unwrap();
+
+        let host_a = Host::from_bind("acp", Some("S-a".into()), None);
+        let host_b = Host::from_bind("acp", Some("S-b".into()), None);
+        // Initial Bindings so RemintSession::on_host_session can wrap each;
+        // begin_turn below reuses / remints via Runtime keep recipe.
+        session.rebind(None, a.id, host_a.clone()).unwrap();
+        session.rebind(None, b.id, host_b.clone()).unwrap();
+        rt.keep(sid, a.id, host_a).unwrap();
+        rt.keep(sid, b.id, host_b).unwrap();
+        rt.set_parallel_safe(sid, a.id, Some(ParallelSafe::paths(["a"])))
+            .unwrap();
+        rt.set_parallel_safe(sid, b.id, Some(ParallelSafe::paths(["b"])))
+            .unwrap();
+
+        let (ta, fa, _) = rt.begin_turn(sid, a.id, "ha".into()).unwrap();
+        let (tb, fb, _) = rt.begin_turn(sid, b.id, "hb".into()).unwrap();
+        assert_ne!(ta, tb);
+        assert_eq!(session.turn_fence_of(a.id).unwrap(), fa);
+        assert_eq!(session.turn_fence_of(b.id).unwrap(), fb);
+
+        let pin_lease = |agent, holder: &str, turn, fence| {
+            let lease = rt.turn_lease_of(sid, agent).unwrap().expect("live lease");
+            assert_eq!(
+                (lease.agent, lease.holder, lease.turn_id, lease.fence),
+                (agent, HolderId::new(holder), turn, fence),
+                "raw turn_lease_of pin (not is_none)"
+            );
+        };
+        pin_lease(a.id, "ha", ta, fa);
+        pin_lease(b.id, "hb", tb, fb);
+
+        let remint_a =
+            RemintSession::on_host_session(session.clone(), a.id, user.id, "S-a", caps_resume())
+                .expect("remint A");
+        let remint_b =
+            RemintSession::on_host_session(session.clone(), b.id, user.id, "S-b", caps_resume())
+                .expect("remint B");
+
+        remint_a.begin_turn("work-a");
+        remint_b.begin_turn("work-b");
+        // A: controller ask (no parent). B: subagent-parented ask.
+        let ask_a = remint_a
+            .request_permission(RpcId::Num(1), Some("call_a"), "git log", opts())
+            .unwrap();
+        let ask_b = remint_b
+            .request_permission_under(
+                RpcId::Num(1),
+                Some("toolu_sub"),
+                Some("toolu_task"),
+                "npm test",
+                opts(),
+            )
+            .unwrap();
+        assert_eq!(ask_a.parent_tool_call_id, None);
+        assert_eq!(ask_b.parent_tool_call_id.as_deref(), Some("toolu_task"));
+        assert_eq!(remint_a.pending_permissions().len(), 1);
+        assert_eq!(remint_b.pending_permissions().len(), 1);
+
+        // Remint A first: A's ask resurfaces; B's lease + fence untouched.
+        let oa = remint_a.remint_and_attach().unwrap();
+        assert!(oa.permission_resurfaced && !oa.turn_interrupted);
+        assert!(oa.wire_actions.contains(&WireAction::AttachResume));
+        assert_eq!(
+            remint_a
+                .resurfaced_permissions()
+                .iter()
+                .map(|p| p.as_ref())
+                .collect::<Vec<_>>(),
+            std::slice::from_ref(&ask_a)
+        );
+        assert!(remint_a.observe().iter().any(|e| matches!(
+            &e.kind,
+            RemintEventKind::PermissionResurface(r)
+                if r == &ask_a && r.parent_tool_call_id.is_none()
+        )));
+        // B still pending (its own RemintSession); lease/fence pins.
+        assert_eq!(remint_b.pending_permissions().len(), 1);
+        assert!(remint_b.resurfaced_permissions().is_empty());
+        pin_lease(a.id, "ha", ta, fa);
+        pin_lease(b.id, "hb", tb, fb);
+        assert_eq!(session.turn_fence_of(a.id).unwrap(), fa);
+        assert_eq!(
+            session.turn_fence_of(b.id).unwrap(),
+            fb,
+            "A's remint must not move B's fence"
+        );
+
+        // Remint B: B's ask resurfaces with parent; A's resurfaced ask +
+        // lease/fence stay.
+        let ob = remint_b.remint_and_attach().unwrap();
+        assert!(ob.permission_resurfaced && !ob.turn_interrupted);
+        assert!(ob.wire_actions.contains(&WireAction::AttachResume));
+        // Remint Binding ids are local per RemintSession ("bind-2" on both);
+        // Host Binding lineage is what must stay independent.
+        let host_a = remint_a
+            .host_binding_of(&oa.binding_id)
+            .expect("A host bind");
+        let host_b = remint_b
+            .host_binding_of(&ob.binding_id)
+            .expect("B host bind");
+        assert_ne!(host_a, host_b, "no cross-Agent Host Binding steal");
+        assert_eq!(
+            remint_b
+                .resurfaced_permissions()
+                .iter()
+                .map(|p| p.as_ref())
+                .collect::<Vec<_>>(),
+            std::slice::from_ref(&ask_b)
+        );
+        assert!(remint_b.observe().iter().any(|e| matches!(
+            &e.kind,
+            RemintEventKind::PermissionResurface(r)
+                if r == &ask_b
+                    && r.parent_tool_call_id.as_deref() == Some("toolu_task")
+        )));
+        assert_eq!(
+            remint_a
+                .resurfaced_permissions()
+                .iter()
+                .map(|p| p.as_ref())
+                .collect::<Vec<_>>(),
+            std::slice::from_ref(&ask_a),
+            "A's resurfaced ask survives B's remint"
+        );
+        pin_lease(a.id, "ha", ta, fa);
+        pin_lease(b.id, "hb", tb, fb);
+        assert_eq!(session.turn_fence_of(a.id).unwrap(), fa);
+        assert_eq!(session.turn_fence_of(b.id).unwrap(), fb);
+
+        // Dead Binding refuse stays per-Agent (no cross answer).
+        assert_eq!(
+            remint_a.resolve_permission(&ask_a.binding, &ask_a.rpc_id, "allow-once"),
+            Err(RemintError::DeadBinding)
+        );
+        assert_eq!(
+            remint_b.resolve_permission(&ask_b.binding, &ask_b.rpc_id, "allow-once"),
+            Err(RemintError::DeadBinding)
+        );
+
+        // Soft Should (#53): pin turn_lease_of(B).fence after A's raise.
+        rt.end_turn(sid, "ha".into(), fa, true).unwrap();
+        let (ta2, fa2, _) = rt.resume_interrupted_turn(sid, a.id, "ha2".into()).unwrap();
+        assert_eq!(ta2, ta);
+        assert!(fa2 > fa, "A's own fence must rise on resume");
+        let lease_b = rt.turn_lease_of(sid, b.id).unwrap().expect("B live");
+        assert_eq!(
+            (
+                lease_b.agent,
+                lease_b.holder,
+                lease_b.turn_id,
+                lease_b.fence
+            ),
+            (b.id, HolderId::new("hb"), tb, fb),
+            "turn_lease_of(B).fence pinned after A's raise — no steal"
+        );
+        assert_eq!(session.turn_fence_of(b.id).unwrap(), fb);
+        // B still durable under own fence; A's old fence is TurnLeaseLost.
+        rt.durable_step(sid, "hb".into(), fb, tb, "b-ok", || Ok("b".into()))
+            .unwrap();
+        assert!(matches!(
+            rt.durable_step(sid, "ha2".into(), fa, ta, "zombie", || {
+                panic!("zombie must not run")
+            }),
+            Err(hearth::Error::TurnLeaseLost)
+        ));
+        rt.durable_step(sid, "ha2".into(), fa2, ta, "a-ok", || Ok("a".into()))
+            .unwrap();
+
+        // Parents still on resurfaced maps after the lease/fence dance.
+        assert_eq!(
+            remint_a
+                .resurfaced_permissions()
+                .iter()
+                .map(|p| p.parent_tool_call_id.as_deref())
+                .collect::<Vec<_>>(),
+            [None]
+        );
+        assert_eq!(
+            remint_b
+                .resurfaced_permissions()
+                .iter()
+                .map(|p| p.parent_tool_call_id.as_deref())
+                .collect::<Vec<_>>(),
+            [Some("toolu_task")]
+        );
+    }
+
     /// After remint, a shared toolCallId (copilot-cli #989) is ambiguous:
     /// do not adopt either resurfaced ask by toolCallId. Cancel clears
     /// resurfaced asks on the Host log only (no wire write to dead ids).
