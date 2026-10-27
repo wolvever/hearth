@@ -4137,14 +4137,17 @@ mod tests {
     }
 
     /// Peer Unknown wire: host_wake Waiting → skip; first Agent still wakes
-    /// (ReuseLive). Fan-out does not abort. Peer keeps its Binding but gets
-    /// no TurnStart only if we also drop it — here Unknown skips host_wake
-    /// while peer Binding from setup remains, so ParallelSafe would still
-    /// steer the peer via AlreadyBound. Use non-ParallelSafe + release peer
-    /// Binding so claim Waiting skips without abort.
+    /// (ReuseLive). Fan-out does not abort. Both Agents opt into disjoint
+    /// ParallelSafe so the gate does not skip B before claim — B reaches
+    /// AlreadyBound Waiting(NoBinding) after unbind + Unknown host_wake skip
+    /// (pins claim-Waiting; without ParallelSafe the gate would skip B first).
     #[test]
     fn wake_each_kept_through_host_wake_unknown_peer_skips_without_abort() {
         let (rt, sid, uid, a, b, remint_a, remint_b, place) = shared_runtime_two_agents();
+        for (ag, path) in [(a, "a"), (b, "b")] {
+            rt.set_parallel_safe(sid, ag, Some(hearth::ParallelSafe::paths([path])))
+                .expect("opt in");
+        }
         // Release B's Binding so classify(B) is PositivelyDead / needs claim;
         // without a successful host_wake, AlreadyBound Waiting(NoBinding) skips.
         let session = rt.store().session(sid).unwrap();
