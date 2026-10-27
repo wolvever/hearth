@@ -137,6 +137,7 @@ macro_rules! hosts {
                     native_resume_id,
                     sandbox_id,
                     agent,
+                    live_caps: None,
                 }
             }
         }
