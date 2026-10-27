@@ -87,10 +87,32 @@ pub struct Agent {
     pub config: HashMap<String, String>,
 }
 
+/// Resume-capability snapshot from a successful agent `initialize`.
+/// Field on [`Binding`] (like [`Binding::native_resume_id`]), not a seventh noun.
+/// Wake/remint consults this when there is no live wire to re-probe; never
+/// falls back to `session/load`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
+pub struct LiveCaps {
+    /// Agent advertises `session/resume`.
+    pub resume: bool,
+    /// Agent advertises `loadSession` / `session/load` (Copilot load-only shape).
+    pub load_session: bool,
+    pub cancel: bool,
+    pub close: bool,
+}
+
+impl LiveCaps {
+    /// Remint / AttachResume only when initialize advertised resume.
+    pub fn allows_resume(self) -> bool {
+        self.resume
+    }
+}
+
 /// Disposable runtime attachment. Native resume ids live here, never on `Session`.
 /// Optional [`Binding::agent`] names whose runtime this is so [`Session::leave`]
 /// can unbind only that agent's Binding. Shared place is `sandbox_id`, not a
-/// sixth type.
+/// sixth type. Optional [`Binding::live_caps`] is the initialize resume-capability
+/// snapshot (LiveCaps-on-Binding) — not a seventh noun.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Binding {
     pub id: BindingId,
@@ -98,6 +120,8 @@ pub struct Binding {
     pub native_resume_id: Option<String>,
     pub sandbox_id: Option<String>,
     pub agent: Option<AgentId>,
+    /// Snapshot from a successful initialize. `None` = never probed.
+    pub live_caps: Option<LiveCaps>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1596,6 +1620,24 @@ impl Session {
         self.read(|data| data.bindings.values().cloned().collect())
     }
 
+    /// Lookup one live [`Binding`] by id.
+    pub fn binding(&self, id: BindingId) -> Result<Option<Binding>> {
+        self.read(|data| data.bindings.get(&id).cloned())
+    }
+
+    /// Persist an initialize resume-capability snapshot on a live Binding
+    /// (LiveCaps-on-Binding). Field update only — no EventLog write, no remint.
+    pub fn set_binding_live_caps(&self, id: BindingId, caps: LiveCaps) -> Result<Binding> {
+        self.write(|data| {
+            let b = data
+                .bindings
+                .get_mut(&id)
+                .ok_or(Error::UnknownBinding(id))?;
+            b.live_caps = Some(caps);
+            Ok(b.clone())
+        })
+    }
+
     /// All attached [`Place`] locators. Survive unbind of all Bindings.
     pub fn places(&self) -> Result<Vec<Place>> {
         self.read(|data| data.places.values().cloned().collect())
@@ -1953,6 +1995,35 @@ mod tests {
         // Session.id is a hearth identity; it is not the native resume token.
         assert_ne!(format!("{:?}", session.id().0), "resume-xyz");
         assert!(session.bindings().unwrap()[0].native_resume_id.is_some());
+    }
+
+    #[test]
+    fn live_caps_lives_on_binding_like_native_resume_id() {
+        let store = InMemory::new();
+        let session = store.create_session();
+        let binding = session
+            .bind("acp", Some("resume-xyz".into()), None)
+            .unwrap();
+        assert!(binding.live_caps.is_none());
+        let caps = LiveCaps {
+            resume: false,
+            load_session: true,
+            cancel: false,
+            close: false,
+        };
+        let updated = session.set_binding_live_caps(binding.id, caps).unwrap();
+        assert_eq!(updated.live_caps, Some(caps));
+        assert!(!updated.live_caps.unwrap().allows_resume());
+        assert_eq!(
+            session.binding(binding.id).unwrap().unwrap().live_caps,
+            Some(caps)
+        );
+        // Unknown Binding refuses — nothing invented.
+        let missing = BindingId::new();
+        assert!(matches!(
+            session.set_binding_live_caps(missing, caps),
+            Err(Error::UnknownBinding(_))
+        ));
     }
 
     #[test]

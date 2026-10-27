@@ -55,59 +55,42 @@ use crate::adapters::acp::{self, ClientCapabilities, ClientRequestRoute};
 use crate::host::{option_allows, reply_permission};
 use crate::{AgentCommand, AgentEvent, BusError, PermissionOption, RpcId};
 
-/// Live agent capabilities from an ACP `initialize` result (not static
-/// catalog flags alone).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct LiveCaps {
-    /// Agent advertises `session/resume` (or `loadSession: false` with
-    /// an explicit resume capability).
-    pub resume: bool,
-    /// Agent advertises `loadSession` / `session/load`. Copilot shape:
-    /// load without resume — Hearth still fail-closes on remint.
-    pub load_session: bool,
-    pub cancel: bool,
-    pub close: bool,
+/// Live agent capabilities from an ACP `initialize` result — same snapshot
+/// type as [`hearth::LiveCaps`] on [`hearth::Binding`] (LiveCaps-on-Binding).
+pub use hearth::LiveCaps;
+
+/// Parse ACP `initialize` result into [`LiveCaps`]. Looks under
+/// `agentCapabilities` and top-level `capabilities` (both shapes appear
+/// in the wild).
+pub fn live_caps_from_initialize_result(result: &Value) -> LiveCaps {
+    let caps = result
+        .get("agentCapabilities")
+        .or_else(|| result.get("capabilities"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let load_session = flag(&caps, &["loadSession", "load_session", "sessionLoad"])
+        || method_listed(&caps, "session/load");
+    let resume = flag(&caps, &["sessionResume", "resume", "session_resume"])
+        || method_listed(&caps, "session/resume");
+    let cancel = flag(&caps, &["sessionCancel", "cancel", "promptCancel"])
+        || method_listed(&caps, "session/cancel");
+    let close = flag(&caps, &["sessionClose", "close"]) || method_listed(&caps, "session/close");
+    LiveCaps {
+        resume,
+        load_session,
+        cancel,
+        close,
+    }
 }
 
-impl LiveCaps {
-    /// Parse ACP `initialize` result. Looks under `agentCapabilities`
-    /// and top-level `capabilities` (both shapes appear in the wild).
-    pub fn from_initialize_result(result: &Value) -> Self {
-        let caps = result
-            .get("agentCapabilities")
-            .or_else(|| result.get("capabilities"))
-            .cloned()
-            .unwrap_or(Value::Null);
-        let load_session = flag(&caps, &["loadSession", "load_session", "sessionLoad"])
-            || method_listed(&caps, "session/load");
-        let resume = flag(&caps, &["sessionResume", "resume", "session_resume"])
-            || method_listed(&caps, "session/resume");
-        let cancel = flag(&caps, &["sessionCancel", "cancel", "promptCancel"])
-            || method_listed(&caps, "session/cancel");
-        let close =
-            flag(&caps, &["sessionClose", "close"]) || method_listed(&caps, "session/close");
-        Self {
-            resume,
-            load_session,
-            cancel,
-            close,
-        }
-    }
-
-    /// Remint may AttachResume only when live initialize advertised resume.
-    pub fn allows_resume(self) -> bool {
-        self.resume
-    }
-
-    /// Typed fail-closed when [`Self::allows_resume`] is false.
-    /// Copilot load-only (`load_session`) → [`RemintError::LoadFallbackBlocked`];
-    /// otherwise [`RemintError::ResumeNotSupported`]. Never suggests `session/load`.
-    pub fn refuse_without_resume(self) -> RemintError {
-        if self.load_session {
-            RemintError::LoadFallbackBlocked
-        } else {
-            RemintError::ResumeNotSupported
-        }
+/// Typed fail-closed when [`LiveCaps::allows_resume`] is false.
+/// Copilot load-only (`load_session`) → [`RemintError::LoadFallbackBlocked`];
+/// otherwise [`RemintError::ResumeNotSupported`]. Never suggests `session/load`.
+pub fn refuse_without_resume(caps: LiveCaps) -> RemintError {
+    if caps.load_session {
+        RemintError::LoadFallbackBlocked
+    } else {
+        RemintError::ResumeNotSupported
     }
 }
 
@@ -656,6 +639,11 @@ impl RemintSession {
             .ok_or_else(|| RemintError::HostLog("no live Binding for agent".into()))?;
         let session_id = host_session.id().0.to_string();
         let store = host_session.store().clone();
+        // LiveCaps-on-Binding: Binding snapshot wins when present (process
+        // restart / lost RemintSession memory) so wake fails closed before spawn.
+        // LiveCaps-on-Binding: Binding snapshot wins when present (process
+        // restart / lost RemintSession memory) so wake fails closed before spawn.
+        let live_caps = host_binding.live_caps.unwrap_or(live_caps);
         Ok(Self::from_host_parts(
             session_id,
             agent_session_id.into(),
@@ -685,7 +673,8 @@ impl RemintSession {
         let binding_id: BindingId = FIRST_BINDING.to_string();
         let mut host_bindings = HashMap::new();
         host_bindings.insert(binding_id.clone(), host_binding);
-        Self {
+        let caps_seed = live_caps;
+        let session = Self {
             inner: Mutex::new(Inner {
                 session_id,
                 binding_id: binding_id.clone(),
@@ -714,7 +703,22 @@ impl RemintSession {
                 #[cfg(test)]
                 before_claim: None,
             }),
+        };
+        // LiveCaps-on-Binding: seed Host Binding when unset (open path).
+        let g = session.inner.lock().unwrap();
+        if g.host_session
+            .binding(host_binding)
+            .ok()
+            .flatten()
+            .and_then(|b| b.live_caps)
+            .is_none()
+        {
+            let _ = g
+                .host_session
+                .set_binding_live_caps(host_binding, caps_seed);
         }
+        drop(g);
+        session
     }
 
     pub fn session_id(&self) -> SessionId {
@@ -734,7 +738,47 @@ impl RemintSession {
     }
 
     pub fn set_live_caps(&self, caps: LiveCaps) {
+        let mut g = self.inner.lock().unwrap();
+        g.live_caps = caps;
+        // LiveCaps-on-Binding: persist snapshot on the Host Binding so wake
+        // can fail closed after process death / wire loss without re-probe.
+        if let Some(host_bid) = g.host_bindings.get(&g.binding_id).copied() {
+            let _ = g.host_session.set_binding_live_caps(host_bid, caps);
+        }
+    }
+
+    /// Test seam: overwrite RemintSession memory only — Binding snapshot
+    /// unchanged. Simulates process-local loss of live_caps while Binding
+    /// still holds the initialize snapshot.
+    #[cfg(test)]
+    pub fn set_live_caps_memory_only_for_test(&self, caps: LiveCaps) {
         self.inner.lock().unwrap().live_caps = caps;
+    }
+
+    /// Resume-capability snapshot stored on the current Host Binding, if any.
+    pub fn binding_live_caps(&self) -> Option<LiveCaps> {
+        let g = self.inner.lock().unwrap();
+        let host_bid = g.host_bindings.get(&g.binding_id).copied()?;
+        g.host_session
+            .binding(host_bid)
+            .ok()
+            .flatten()
+            .and_then(|b| b.live_caps)
+    }
+
+    /// When the wire is gone (cannot re-probe): if Binding stored caps say
+    /// no resume, typed refuse. `None` = never probed (caller may spawn).
+    pub fn refuse_if_binding_caps_block_resume(&self) -> Result<(), RemintError> {
+        let Some(caps) = self.binding_live_caps() else {
+            return Ok(());
+        };
+        if caps.allows_resume() {
+            return Ok(());
+        }
+        let mut g = self.inner.lock().unwrap();
+        // Mirror Binding onto RemintSession so subsequent remint sees it.
+        g.live_caps = caps;
+        Err(Self::fail_closed_without_resume(&mut g))
     }
 
     /// After NEW-wire `initialize_host` + [`Self::set_live_caps`]: allow
@@ -964,7 +1008,7 @@ impl RemintSession {
 
     /// Push FailClosed + mark mid-turn interrupted when live caps refuse resume.
     fn fail_closed_without_resume(g: &mut Inner) -> RemintError {
-        let reason = g.live_caps.refuse_without_resume();
+        let reason = refuse_without_resume(g.live_caps);
         Self::push_event(g, RemintEventKind::FailClosed, reason.as_event_text());
         Self::mark_interrupted_if_in_flight(g, reason.as_event_text());
         reason
@@ -1501,6 +1545,11 @@ impl RemintSession {
         g.next_binding += 1;
         g.binding_id = new_binding.clone();
         g.host_bindings.insert(new_binding.clone(), host_binding.id);
+        // Carry LiveCaps onto the new Host Binding (field on Binding, like
+        // native_resume_id). NEW-wire initialize may refresh via set_live_caps.
+        let _ = g
+            .host_session
+            .set_binding_live_caps(host_binding.id, g.live_caps);
         g.transport_owner = TransportOwner::Binding(new_binding.clone());
         wire_actions.push(WireAction::AttachResume);
         let agent_sid = g.agent_session_id.clone();
@@ -1554,7 +1603,7 @@ impl RemintSession {
         match attempted {
             RemintWireMethod::SessionResume => {
                 if !g.live_caps.allows_resume() {
-                    let reason = g.live_caps.refuse_without_resume();
+                    let reason = refuse_without_resume(g.live_caps);
                     Self::push_event(&mut g, RemintEventKind::FailClosed, reason.as_event_text());
                     return Err(reason);
                 }
@@ -1932,7 +1981,7 @@ mod tests {
                 "promptCancel": true
             }
         });
-        let c = LiveCaps::from_initialize_result(&resume);
+        let c = live_caps_from_initialize_result(&resume);
         assert!(c.resume);
         assert!(c.close);
         assert!(c.cancel);
@@ -1941,7 +1990,7 @@ mod tests {
         let load_only = serde_json::json!({
             "agentCapabilities": { "loadSession": true }
         });
-        let c = LiveCaps::from_initialize_result(&load_only);
+        let c = live_caps_from_initialize_result(&load_only);
         assert!(!c.resume);
         assert!(c.load_session);
         assert!(!c.allows_resume());

@@ -24,9 +24,10 @@ use crate::{AgentCommand, BusError, RpcId};
 
 pub use remint::{
     encode_remint_rpc, flush_and_teardown_old_wire, flush_old_wire_replies,
-    write_new_wire_attach_resume, write_old_wire_teardown, LiveCaps, OldWireFlush, OldWireWrite,
-    PendingPermission, PermissionKey, PermissionRef, RemintError, RemintEvent, RemintEventKind,
-    RemintOutcome, RemintSession, RemintWireMethod, ReplaySlice, TeardownOutcome, TeardownSnapshot,
+    live_caps_from_initialize_result, refuse_without_resume, write_new_wire_attach_resume,
+    write_old_wire_teardown, LiveCaps, OldWireFlush, OldWireWrite, PendingPermission,
+    PermissionKey, PermissionRef, RemintError, RemintEvent, RemintEventKind, RemintOutcome,
+    RemintSession, RemintWireMethod, ReplaySlice, TeardownOutcome, TeardownSnapshot,
     TransportOwner, WireAction,
 };
 
@@ -398,7 +399,7 @@ impl AttachRunner {
         self.write_value_ungated(&init)?;
         let result = self.wait_rpc_result(transport, rpc_id)?;
         self.initialized = true;
-        Ok(LiveCaps::from_initialize_result(&result))
+        Ok(live_caps_from_initialize_result(&result))
     }
 
     /// After [`RemintSession::remint_and_attach`]: flush `old_wire_replies`
@@ -800,6 +801,10 @@ pub fn host_wake(
         OldWire::LiveIdle | OldWire::LiveInTurn => Ok(HostWake::ReuseLive),
         OldWire::Unknown => Ok(HostWake::Waiting(hearth::WaitReason::LivenessUnknown)),
         OldWire::Exited(_) | OldWire::StdoutEof | OldWire::TransportError(_) => {
+            // LiveCaps-on-Binding: wire is gone — cannot re-probe. If Binding
+            // stored caps say no resume, typed refuse with no spawn / mint /
+            // new-wire initialize (never session/load).
+            args.session.refuse_if_binding_caps_block_resume()?;
             // Place/cwd first: a resume we could never write must not kill
             // the old child, mint, cancel or touch either wire.
             remint::validate_resume_place(args.place)?;
@@ -3344,6 +3349,132 @@ mod tests {
         // Real runner has no stdin_log; only check new wire.
         let raw = std::str::from_utf8(new.stdin_log().unwrap()).unwrap();
         assert!(!raw.contains("session/load") && !raw.contains("session/new"));
+    }
+
+    // ---- LiveCaps-on-Binding ----
+
+    /// Must: initialize → store on Binding → drop wire → wake refuses without
+    /// spawn (new wire stdin empty; no mint). Never session/load.
+    #[test]
+    fn live_caps_on_binding_drop_wire_wake_refuses_without_spawn() {
+        let (session, _, _) = RemintSession::open(
+            "sess-livecaps",
+            "S-stable",
+            LiveCaps {
+                resume: true,
+                cancel: true,
+                close: true,
+                load_session: false,
+            },
+        );
+        // Successful initialize advertised no resume (and no loadSession).
+        let no_resume = LiveCaps {
+            resume: false,
+            load_session: false,
+            cancel: true,
+            close: true,
+        };
+        session.set_live_caps(no_resume);
+        assert_eq!(session.binding_live_caps(), Some(no_resume));
+        assert!(!session.binding_live_caps().unwrap().allows_resume());
+
+        // Simulate process death: RemintSession memory claims resume again,
+        // but Binding snapshot still says no — Binding wins.
+        session.set_live_caps_memory_only_for_test(LiveCaps {
+            resume: true,
+            cancel: true,
+            close: true,
+            load_session: false,
+        });
+        assert_eq!(
+            session.binding_live_caps(),
+            Some(no_resume),
+            "Binding snapshot must survive in-memory overwrite"
+        );
+
+        let before = mints(&session);
+        let mut old = initialized_fake(Vec::new());
+        let mut new = new_wire_fake();
+        let err = run_wake(&session, OldWire::StdoutEof, &mut old, &mut new).unwrap_err();
+        assert_eq!(err, RemintError::ResumeNotSupported);
+        assert_eq!(mints(&session), before, "no Binding mint on refuse");
+        assert!(
+            new.stdin_log().unwrap().is_empty(),
+            "no spawn/initialize on new wire: {:?}",
+            std::str::from_utf8(new.stdin_log().unwrap())
+        );
+        let old_raw = std::str::from_utf8(old.stdin_log().unwrap()).unwrap();
+        assert!(!old_raw.contains("session/load"));
+        assert!(!old_raw.contains("session/new"));
+        assert!(!old_raw.contains("session/resume"));
+    }
+
+    /// Must: resume-capable Binding remints after wire drop (compose #59 path).
+    #[test]
+    fn live_caps_on_binding_resume_capable_remints() {
+        let session = wake_session();
+        let caps = LiveCaps {
+            resume: true,
+            cancel: true,
+            close: true,
+            load_session: false,
+        };
+        session.set_live_caps(caps);
+        assert_eq!(session.binding_live_caps(), Some(caps));
+
+        let before = mints(&session);
+        let mut old = initialized_fake(Vec::new());
+        let mut new = new_wire_fake();
+        let HostWake::Reminted(full) =
+            run_wake(&session, OldWire::Exited(1), &mut old, &mut new).expect("remint")
+        else {
+            panic!("expected Reminted");
+        };
+        assert_eq!(mints(&session), before + 1);
+        assert!(full.outcome.resumed);
+        let raw = std::str::from_utf8(new.stdin_log().unwrap()).unwrap();
+        assert!(raw.contains("session/resume"));
+        assert!(!raw.contains("session/load"));
+        assert!(!raw.contains("session/new"));
+        assert!(session.binding_live_caps().unwrap().allows_resume());
+    }
+
+    /// Must: load-only advertise on Binding still refuses (existing LiveCaps rule).
+    #[test]
+    fn live_caps_on_binding_load_only_refuses_never_session_load() {
+        let (session, _, _) = RemintSession::open(
+            "sess-load-only",
+            "S-stable",
+            LiveCaps {
+                resume: true,
+                ..LiveCaps::default()
+            },
+        );
+        let load_only = LiveCaps {
+            resume: false,
+            load_session: true,
+            cancel: false,
+            close: false,
+        };
+        session.set_live_caps(load_only);
+        assert_eq!(session.binding_live_caps(), Some(load_only));
+
+        // Binding wins over stale in-memory resume:true.
+        session.set_live_caps_memory_only_for_test(LiveCaps {
+            resume: true,
+            ..LiveCaps::default()
+        });
+
+        let before = mints(&session);
+        let mut old = initialized_fake(Vec::new());
+        let mut new = new_wire_fake();
+        let err = run_wake(&session, OldWire::Exited(0), &mut old, &mut new).unwrap_err();
+        assert_eq!(err, RemintError::LoadFallbackBlocked);
+        assert_eq!(mints(&session), before);
+        assert!(new.stdin_log().unwrap().is_empty());
+        let raw = std::str::from_utf8(old.stdin_log().unwrap()).unwrap();
+        assert!(!raw.contains("session/load"));
+        assert!(!raw.contains("session/new"));
     }
 
     // ---- wake_through_host_wake (Runtime splice) ----
