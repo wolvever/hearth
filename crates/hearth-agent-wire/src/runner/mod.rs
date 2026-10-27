@@ -1154,6 +1154,123 @@ pub fn remint_through_host_wake(
     }
 }
 
+/// One kept Agent's wire for [`wake_each_kept_through_host_wake`].
+///
+/// Same shape as [`TickWire`]: Host supplies a wire per kept Agent for it
+/// to be addressed. Missing / mismatched Host Agent → skip that Agent.
+pub struct KeptWakeWire<'a> {
+    pub old: &'a mut AttachRunner,
+    pub new: &'a mut AttachRunner,
+    pub new_transport: &'a mut RunnerTransport,
+    pub old_wire: OldWire,
+    pub remint: HostRemintFullArgs<'a>,
+}
+
+/// Result of [`wake_each_kept_through_host_wake`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum WakeEachKeptThroughHost {
+    /// At least one Agent steered: per-Agent `host_wake` outcomes that were
+    /// Reminted / ReuseLive, plus Runtime fan-out from
+    /// [`hearth::Runtime::wake_each_kept_with`] [`hearth::AlreadyBound`].
+    Woke {
+        hosts: Vec<(hearth::AgentId, HostWake)>,
+        woke: Vec<(hearth::AgentId, Vec<hearth::Event>)>,
+    },
+    /// Every Agent skipped (no wire / Waiting / gate / classify) and Runtime
+    /// appended nothing.
+    Waiting(hearth::WaitReason),
+}
+
+/// Inputs for [`wake_each_kept_through_host_wake`] (Runtime + shared wake).
+pub struct WakeEachKeptThroughHostArgs<'a> {
+    pub runtime: &'a hearth::Runtime,
+    pub session_id: hearth::SessionId,
+    pub wake: hearth::Wake,
+}
+
+/// Production Host wake across **every** kept Agent on a Session.
+///
+/// Closes the #56 Soft residual (Host was per-Agent `wake_through_host_wake`
+/// / first-only). Order (load-bearing):
+/// 1. For each kept Agent in keep order:
+///    - No [`KeptWakeWire`] / Host Agent mismatch → skip (no wire evidence).
+///    - Read-only [`hearth::Runtime::classify`]: `LiveInTurn` / `Unknown` →
+///      skip (like [`tick_through_host_wake`]).
+///    - [`hearth::Runtime::check_turn_gate`] refused → skip, zero wire action.
+///    - [`host_wake`]: `Waiting` → skip; `Reminted` / `ReuseLive` → one mint
+///      max for that Agent (never a peer's Binding).
+/// 2. Once: [`hearth::Runtime::wake_each_kept_with`] [`hearth::AlreadyBound`] —
+///    one shared wake record; **never** `claim_binding`. Gate re-check after
+///    each `turn_start` stays #56 (non-ParallelSafe first-ready only without
+///    aborting the fan-out). Claim `Waiting` (e.g. no Binding after a skipped
+///    `host_wake`) skips that Agent.
+///
+/// Never `session/load` or `session/new`. [`ClientCapabilities::HOST`] stays
+/// all false. SoftExpiring / Flush / Stage / Evidence / EffectId / fleet
+/// parked. No new noun; no child Session/Binding.
+pub fn wake_each_kept_through_host_wake(
+    args: WakeEachKeptThroughHostArgs<'_>,
+    mut wires: std::collections::HashMap<hearth::AgentId, KeptWakeWire<'_>>,
+) -> Result<WakeEachKeptThroughHost, WakeThroughError> {
+    let WakeEachKeptThroughHostArgs {
+        runtime,
+        session_id,
+        wake,
+    } = args;
+    let agents = runtime.kept_agents(session_id);
+    if agents.is_empty() {
+        return Err(hearth::Error::NotKept(session_id).into());
+    }
+
+    let mut hosts: Vec<(hearth::AgentId, HostWake)> = Vec::new();
+    let mut first_wait: Option<hearth::WaitReason> = None;
+    for agent in agents {
+        let Some(w) = wires.remove(&agent) else {
+            first_wait.get_or_insert(hearth::WaitReason::LivenessUnknown);
+            continue;
+        };
+        // A wire for another Agent is not evidence for this one: skip.
+        if w.remint.session.host_agent_id() != agent {
+            first_wait.get_or_insert(hearth::WaitReason::LivenessUnknown);
+            continue;
+        }
+        match runtime.classify(session_id, agent)? {
+            hearth::Liveness::LiveInTurn => {
+                first_wait.get_or_insert(hearth::WaitReason::TurnOpen);
+                continue;
+            }
+            hearth::Liveness::Unknown => {
+                first_wait.get_or_insert(hearth::WaitReason::LivenessUnknown);
+                continue;
+            }
+            _ => {}
+        }
+        // Gate before any wire action (compose wake_through_host_wake).
+        match runtime.check_turn_gate(session_id, agent) {
+            Err(hearth::Error::Waiting(reason)) => {
+                first_wait.get_or_insert(reason);
+                continue;
+            }
+            r => r?,
+        }
+        let host = host_wake(w.old_wire, w.old, w.new, w.new_transport, w.remint)?;
+        match host {
+            HostWake::Waiting(reason) => {
+                first_wait.get_or_insert(reason);
+            }
+            host => hosts.push((agent, host)),
+        }
+    }
+
+    match runtime.wake_each_kept_with(session_id, wake, &mut hearth::AlreadyBound) {
+        Ok(woke) => Ok(WakeEachKeptThroughHost::Woke { hosts, woke }),
+        Err(hearth::Error::Waiting(reason)) => Ok(WakeEachKeptThroughHost::Waiting(
+            first_wait.unwrap_or(reason),
+        )),
+        Err(e) => Err(e.into()),
+    }
+}
+
 fn set_nonblocking(out: &ChildStdout) -> Result<(), BusError> {
     let fd = out.as_raw_fd();
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
@@ -3727,6 +3844,350 @@ mod tests {
         let session = rt.store().session(sid).unwrap();
         assert!(session.current_turn_of(b).unwrap().is_none());
         assert_eq!(rt.classify(sid, b).unwrap(), hearth::Liveness::NeverBound);
+    }
+
+    // ---- wake_each_kept_through_host_wake (Host fan-out splice) ----
+
+    /// Two ParallelSafe Agents on one Session, each with its own RemintSession
+    /// + Binding (Host path setup for wake_each_kept_through_host_wake).
+    fn shared_runtime_two_agents() -> (
+        hearth::Runtime,
+        hearth::SessionId,
+        hearth::UserId,
+        hearth::AgentId,
+        hearth::AgentId,
+        RemintSession,
+        RemintSession,
+        hearth::Place,
+    ) {
+        let rt = hearth::Runtime::new();
+        let user = rt.store().create_user("cheng");
+        let a = rt.store().create_agent("scribe-a", "");
+        let b = rt.store().create_agent("scribe-b", "");
+        let session = rt.create_session();
+        let sid = session.id();
+        session
+            .join(hearth::Member::User(user.id))
+            .expect("join user");
+        session.join(hearth::Member::Agent(a.id)).expect("join A");
+        session.join(hearth::Member::Agent(b.id)).expect("join B");
+        let host_a = hearth::Host::from_bind("acp", Some("S-a".into()), None);
+        let host_b = hearth::Host::from_bind("acp", Some("S-b".into()), None);
+        session.rebind(None, a.id, host_a.clone()).expect("bind A");
+        session.rebind(None, b.id, host_b.clone()).expect("bind B");
+        rt.keep(sid, a.id, host_a).expect("keep A");
+        rt.keep(sid, b.id, host_b).expect("keep B");
+        let caps = LiveCaps {
+            resume: true,
+            cancel: true,
+            close: true,
+            load_session: false,
+        };
+        let remint_a = RemintSession::on_host_session(session.clone(), a.id, user.id, "S-a", caps)
+            .expect("remint A");
+        let remint_b =
+            RemintSession::on_host_session(session, b.id, user.id, "S-b", caps).expect("remint B");
+        (rt, sid, user.id, a.id, b.id, remint_a, remint_b, ws_place())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_each_kept(
+        rt: &hearth::Runtime,
+        sid: hearth::SessionId,
+        wake: hearth::Wake,
+        remint_a: &RemintSession,
+        remint_b: &RemintSession,
+        place: &hearth::Place,
+        old_a: OldWire,
+        old_b: OldWire,
+        old_runner_a: &mut AttachRunner,
+        new_runner_a: &mut AttachRunner,
+        old_runner_b: &mut AttachRunner,
+        new_runner_b: &mut AttachRunner,
+    ) -> Result<WakeEachKeptThroughHost, WakeThroughError> {
+        let mut transport_a = transport_for_wire(WireKind::JsonlRpc);
+        let mut transport_b = transport_for_wire(WireKind::JsonlRpc);
+        let (mut old_next_a, mut new_next_a) = (10u64, 2u64);
+        let (mut old_next_b, mut new_next_b) = (20u64, 2u64);
+        let a = remint_a.host_agent_id();
+        let b = remint_b.host_agent_id();
+        let wires = [
+            (
+                a,
+                KeptWakeWire {
+                    old: old_runner_a,
+                    new: new_runner_a,
+                    new_transport: &mut transport_a,
+                    old_wire: old_a,
+                    remint: HostRemintFullArgs {
+                        session: remint_a,
+                        place: Some(place),
+                        mcp_servers: &[],
+                        init_rpc_id: &RpcId::Num(1),
+                        old_next_rpc_id: &mut old_next_a,
+                        new_next_rpc_id: &mut new_next_a,
+                    },
+                },
+            ),
+            (
+                b,
+                KeptWakeWire {
+                    old: old_runner_b,
+                    new: new_runner_b,
+                    new_transport: &mut transport_b,
+                    old_wire: old_b,
+                    remint: HostRemintFullArgs {
+                        session: remint_b,
+                        place: Some(place),
+                        mcp_servers: &[],
+                        init_rpc_id: &RpcId::Num(1),
+                        old_next_rpc_id: &mut old_next_b,
+                        new_next_rpc_id: &mut new_next_b,
+                    },
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+        wake_each_kept_through_host_wake(
+            WakeEachKeptThroughHostArgs {
+                runtime: rt,
+                session_id: sid,
+                wake,
+            },
+            wires,
+        )
+    }
+
+    /// Floor: two ParallelSafe kept Agents + UserQuery → both Host-live
+    /// Binding + TurnStart (one shared UserMessage). First-only mutant fails.
+    #[test]
+    fn wake_each_kept_through_host_wake_addresses_every_kept_agent() {
+        let (rt, sid, uid, a, b, remint_a, remint_b, place) = shared_runtime_two_agents();
+        for (ag, path) in [(a, "a"), (b, "b")] {
+            rt.set_parallel_safe(sid, ag, Some(hearth::ParallelSafe::paths([path])))
+                .expect("opt in");
+        }
+        let before = binding_attached_count(&rt, sid);
+        let mut old_a = initialized_fake(Vec::new());
+        let mut new_a = new_wire_fake();
+        let mut old_b = initialized_fake(Vec::new());
+        let mut new_b = new_wire_fake();
+        let r = run_each_kept(
+            &rt,
+            sid,
+            hearth::Wake::UserQuery {
+                user: uid,
+                text: "hi".into(),
+            },
+            &remint_a,
+            &remint_b,
+            &place,
+            OldWire::LiveIdle,
+            OldWire::LiveIdle,
+            &mut old_a,
+            &mut new_a,
+            &mut old_b,
+            &mut new_b,
+        )
+        .expect("through");
+        let WakeEachKeptThroughHost::Woke { hosts, woke } = r else {
+            panic!("expected Woke, got {r:?}");
+        };
+        assert_eq!(
+            hosts.iter().map(|(ag, _)| *ag).collect::<Vec<_>>(),
+            vec![a, b],
+            "host_wake keep order; first-only mutant fails"
+        );
+        assert!(hosts.iter().all(|(_, h)| *h == HostWake::ReuseLive));
+        let who: Vec<_> = woke.iter().map(|(ag, _)| *ag).collect();
+        assert_eq!(who, vec![a, b], "both Agents TurnStart; first-only fails");
+        assert_eq!(
+            binding_attached_count(&rt, sid),
+            before,
+            "ReuseLive: zero mints"
+        );
+        let session = rt.store().session(sid).unwrap();
+        assert!(session.current_turn_of(a).unwrap().is_some());
+        assert!(session.current_turn_of(b).unwrap().is_some());
+        let log = session.events().unwrap();
+        let ums: Vec<_> = log
+            .iter()
+            .filter(|e| matches!(e.body, hearth::EventBody::UserMessage { .. }))
+            .collect();
+        assert_eq!(ums.len(), 1, "one shared UserMessage");
+        assert!(matches!(
+            &ums[0].body,
+            hearth::EventBody::UserMessage { text, .. } if text == "hi"
+        ));
+        assert!(new_a.stdin_log().unwrap().is_empty());
+        assert!(new_b.stdin_log().unwrap().is_empty());
+    }
+
+    /// Floor: without ParallelSafe, first-ready only; peer skips without
+    /// aborting the fan-out (compose #56). Both wires ReuseLive so peer is
+    /// LiveIdle (Binding kept) with no TurnStart — not a first-only abort.
+    #[test]
+    fn wake_each_kept_through_host_wake_without_parallel_safe_fires_first_ready_only() {
+        let (rt, sid, uid, a, b, remint_a, remint_b, place) = shared_runtime_two_agents();
+        let mut old_a = initialized_fake(Vec::new());
+        let mut new_a = new_wire_fake();
+        let mut old_b = initialized_fake(Vec::new());
+        let mut new_b = new_wire_fake();
+        let r = run_each_kept(
+            &rt,
+            sid,
+            hearth::Wake::UserQuery {
+                user: uid,
+                text: "hi".into(),
+            },
+            &remint_a,
+            &remint_b,
+            &place,
+            OldWire::LiveIdle,
+            OldWire::LiveIdle,
+            &mut old_a,
+            &mut new_a,
+            &mut old_b,
+            &mut new_b,
+        )
+        .expect("through");
+        let WakeEachKeptThroughHost::Woke { hosts, woke } = r else {
+            panic!("expected Woke, got {r:?}");
+        };
+        // Both host_wake (no turns open yet during mint phase).
+        assert_eq!(
+            hosts.iter().map(|(ag, _)| *ag).collect::<Vec<_>>(),
+            vec![a, b]
+        );
+        assert_eq!(woke.len(), 1, "gate admits first ready only");
+        assert_eq!(woke[0].0, a);
+        let session = rt.store().session(sid).unwrap();
+        assert!(session.current_turn_of(a).unwrap().is_some());
+        assert!(session.current_turn_of(b).unwrap().is_none());
+        // Peer Binding intact (ReuseLive); skipped at gate, not aborted.
+        assert_eq!(rt.classify(sid, b).unwrap(), hearth::Liveness::LiveIdle);
+        assert_eq!(
+            rt.binding_for(sid, b).unwrap(),
+            remint_b
+                .host_binding_of(&remint_b.binding_id())
+                .expect("B host bind")
+        );
+    }
+
+    /// Floor: remint mid-fan-out — proven-lost Agent remints once; peer live
+    /// ReuseLive; no cross-Agent Binding steal.
+    #[test]
+    fn wake_each_kept_through_host_wake_remint_mid_fanout_no_cross_agent_steal() {
+        let (rt, sid, uid, a, b, remint_a, remint_b, place) = shared_runtime_two_agents();
+        for (ag, path) in [(a, "a"), (b, "b")] {
+            rt.set_parallel_safe(sid, ag, Some(hearth::ParallelSafe::paths([path])))
+                .expect("opt in");
+        }
+        let before = binding_attached_count(&rt, sid);
+        let bid_a_before = rt.binding_for(sid, a).unwrap();
+        let bid_b_before = rt.binding_for(sid, b).unwrap();
+        let mut old_a = initialized_fake(Vec::new());
+        let mut new_a = new_wire_fake();
+        let mut old_b = initialized_fake(Vec::new());
+        let mut new_b = new_wire_fake();
+        let r = run_each_kept(
+            &rt,
+            sid,
+            hearth::Wake::UserQuery {
+                user: uid,
+                text: "hi".into(),
+            },
+            &remint_a,
+            &remint_b,
+            &place,
+            OldWire::StdoutEof, // A proven lost → remint once
+            OldWire::LiveIdle,  // B live → ReuseLive
+            &mut old_a,
+            &mut new_a,
+            &mut old_b,
+            &mut new_b,
+        )
+        .expect("through");
+        let WakeEachKeptThroughHost::Woke { hosts, woke } = r else {
+            panic!("expected Woke, got {r:?}");
+        };
+        assert_eq!(hosts.len(), 2);
+        assert!(matches!(hosts[0], (ag, HostWake::Reminted(_)) if ag == a));
+        assert_eq!(hosts[1], (b, HostWake::ReuseLive));
+        let who: Vec<_> = woke.iter().map(|(ag, _)| *ag).collect();
+        assert_eq!(who, vec![a, b]);
+        assert_eq!(
+            binding_attached_count(&rt, sid),
+            before + 1,
+            "exactly one mint (A remint); B ReuseLive adds none"
+        );
+        let bid_a = rt.binding_for(sid, a).unwrap();
+        let bid_b = rt.binding_for(sid, b).unwrap();
+        assert_ne!(bid_a, bid_a_before, "A reminted to a new Host Binding");
+        assert_eq!(bid_b, bid_b_before, "B Binding unchanged (no steal)");
+        assert_ne!(bid_a, bid_b, "no cross-Agent Binding steal");
+        let raw = std::str::from_utf8(new_a.stdin_log().unwrap()).unwrap();
+        assert!(raw.contains("session/resume"));
+        assert!(!raw.contains("session/load") && !raw.contains("session/new"));
+        assert!(
+            new_b.stdin_log().unwrap().is_empty(),
+            "B ReuseLive: zero wire"
+        );
+    }
+
+    /// Peer Unknown wire: host_wake Waiting → skip; first Agent still wakes
+    /// (ReuseLive). Fan-out does not abort. Both Agents opt into disjoint
+    /// ParallelSafe so the gate does not skip B before claim — B reaches
+    /// AlreadyBound Waiting(NoBinding) after unbind + Unknown host_wake skip
+    /// (pins claim-Waiting; without ParallelSafe the gate would skip B first).
+    #[test]
+    fn wake_each_kept_through_host_wake_unknown_peer_skips_without_abort() {
+        let (rt, sid, uid, a, b, remint_a, remint_b, place) = shared_runtime_two_agents();
+        for (ag, path) in [(a, "a"), (b, "b")] {
+            rt.set_parallel_safe(sid, ag, Some(hearth::ParallelSafe::paths([path])))
+                .expect("opt in");
+        }
+        // Release B's Binding so classify(B) is PositivelyDead / needs claim;
+        // without a successful host_wake, AlreadyBound Waiting(NoBinding) skips.
+        let session = rt.store().session(sid).unwrap();
+        let bid_b = rt.binding_for(sid, b).unwrap();
+        session.unbind(bid_b).expect("unbind B");
+        assert!(matches!(
+            rt.classify(sid, b).unwrap(),
+            hearth::Liveness::PositivelyDead | hearth::Liveness::NeverBound
+        ));
+        let mut old_a = initialized_fake(Vec::new());
+        let mut new_a = new_wire_fake();
+        let mut old_b = initialized_fake(Vec::new());
+        let mut new_b = new_wire_fake();
+        let r = run_each_kept(
+            &rt,
+            sid,
+            hearth::Wake::UserQuery {
+                user: uid,
+                text: "hi".into(),
+            },
+            &remint_a,
+            &remint_b,
+            &place,
+            OldWire::LiveIdle,
+            OldWire::Unknown, // B: no evidence → host_wake Waiting
+            &mut old_a,
+            &mut new_a,
+            &mut old_b,
+            &mut new_b,
+        )
+        .expect("through");
+        let WakeEachKeptThroughHost::Woke { hosts, woke } = r else {
+            panic!("expected Woke, got {r:?}");
+        };
+        assert_eq!(hosts, vec![(a, HostWake::ReuseLive)]);
+        assert_eq!(woke.len(), 1);
+        assert_eq!(woke[0].0, a);
+        assert!(session.current_turn_of(a).unwrap().is_some());
+        assert!(session.current_turn_of(b).unwrap().is_none());
+        assert!(new_b.stdin_log().unwrap().is_empty());
     }
 
     /// tick_through_host_wake addresses each due (Session, Agent): A with a

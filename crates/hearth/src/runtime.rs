@@ -17,13 +17,14 @@
 //! Production Host with a live AttachRunner must **not** call [`Runtime::wake`],
 //! [`Runtime::remint`], or [`Runtime::begin_turn`] alone for remint: those paths
 //! use `claim_binding` and never talk to the wire. Route through the wire-side
-//! `wake_through_host_wake` / `tick_through_host_wake` /
-//! `begin_turn_through_host_wake` / `remint_through_host_wake` instead —
-//! `host_wake` / `host_remint_full_path` own the one Binding mint, then
-//! [`Runtime::wake_with`] / [`Runtime::begin_turn_with`] [`AlreadyBound`]
-//! record without a second claim; `remint_through_host_wake` only reads the
-//! fresh Binding via [`Runtime::binding_for`]. Kernel unit tests may keep
-//! using the default [`ClaimBinding`] entry points.
+//! `wake_through_host_wake` / `wake_each_kept_through_host_wake` /
+//! `tick_through_host_wake` / `begin_turn_through_host_wake` /
+//! `remint_through_host_wake` instead — `host_wake` / `host_remint_full_path`
+//! own the one Binding mint per Agent, then [`Runtime::wake_with`] /
+//! [`Runtime::wake_each_kept_with`] / [`Runtime::begin_turn_with`]
+//! [`AlreadyBound`] record without a second claim; `remint_through_host_wake`
+//! only reads the fresh Binding via [`Runtime::binding_for`]. Kernel unit
+//! tests may keep using the default [`ClaimBinding`] entry points.
 //!
 //! Intra-turn durable steps: [`Runtime::begin_turn`] / [`Runtime::end_turn`] hold a
 //! [`SessionTurnLease`] (holder + fence) **per kept Agent** on the Session. The
@@ -529,9 +530,11 @@ impl Runtime {
     /// leaves a UserMessage without turns. Parallel-safe declarations still
     /// gate concurrent turns; without them only the first ready Agent fires.
     ///
-    /// Production wire Host: ensure each Agent's Binding via `host_wake`, then
-    /// [`Self::wake_each_kept_with`] [`AlreadyBound`] — never [`ClaimBinding`]
-    /// on the same path as `host_wake`.
+    /// Production wire Host: `wake_each_kept_through_host_wake` runs
+    /// `host_wake` per kept Agent, then [`Self::wake_each_kept_with`]
+    /// [`AlreadyBound`] — never [`ClaimBinding`] on the same path as
+    /// `host_wake`. Claim [`Error::Waiting`] (e.g. no Binding after a
+    /// skipped host_wake) skips that Agent without aborting the fan-out.
     pub fn wake_each_kept(
         &self,
         session: SessionId,
@@ -590,7 +593,18 @@ impl Runtime {
 
             let agent_start = sess.events()?.len();
             if needs {
-                claim.claim(&sess, agent, host)?;
+                // AlreadyBound (Host path) may Waiting(NoBinding) when this
+                // Agent had no successful host_wake — skip like classify /
+                // gate, do not abort the fan-out. ClaimBinding rarely
+                // Waiting (AlreadyLive race); skipping matches tick.
+                match claim.claim(&sess, agent, host) {
+                    Ok(()) => {}
+                    Err(Error::Waiting(reason)) => {
+                        first_wait.get_or_insert(reason);
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
             }
             if !wake_recorded {
                 record_wake(&sess, &wake)?;
