@@ -612,6 +612,22 @@ pub fn unmatched_tool_calls(events: &[Event]) -> Vec<(AgentId, String, String)> 
     out
 }
 
+/// Outcome of [`Session::append_host_tool_result`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum HostToolResultAppend {
+    /// Fresh [`EventBody::ToolResult`] appended for an unmatched ToolCall.
+    Applied(Event),
+    /// `tool_call_id` already has ToolResult or ToolCallInterrupted — no-op.
+    AlreadyTerminal,
+}
+
+/// Refuse orphan Host ToolResult (no prior ToolCall for that Agent + id).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostToolResultError {
+    /// No prior [`EventBody::ToolCall`] for `(agent, tool_call_id)` on the log.
+    Orphan,
+}
+
 // --- store ---
 
 struct SessionData {
@@ -1596,6 +1612,81 @@ impl Session {
             }
             Ok(n)
         })
+    }
+
+    /// Whether the EventLog has a ToolCall for `(agent, tool_call_id)`.
+    /// Distinguishes orphan POST (4xx) from late/duplicate completion (no-op).
+    pub fn has_tool_call_of(&self, agent: AgentId, tool_call_id: &str) -> Result<bool> {
+        Ok(self.events()?.iter().any(|e| {
+            matches!(
+                &e.body,
+                EventBody::ToolCall {
+                    agent: a,
+                    tool_call_id: id,
+                    ..
+                } if *a == agent && id == tool_call_id
+            )
+        }))
+    }
+
+    /// Append a Host-owned [`EventBody::ToolResult`] for an unmatched ToolCall.
+    ///
+    /// - No prior ToolCall for `(agent, tool_call_id)` → [`HostToolResultError::Orphan`].
+    /// - Already terminal (ToolResult / ToolCallInterrupted) →
+    ///   [`HostToolResultAppend::AlreadyTerminal`] (idempotent; late-after-
+    ///   Interrupted drop).
+    /// - Else append ToolResult with name recovered from the matching ToolCall.
+    ///
+    /// Does **not** wake. Service-tool-completion-trigger callers append first,
+    /// then single-Agent `Wake::Trigger` (Claim-before-record on the wake step;
+    /// M8). Never invents an orphan Result.
+    pub fn append_host_tool_result(
+        &self,
+        agent: AgentId,
+        tool_call_id: &str,
+        output: impl Into<String>,
+    ) -> std::result::Result<HostToolResultAppend, HostToolResultError> {
+        let events = match self.events() {
+            Ok(e) => e,
+            Err(_) => return Err(HostToolResultError::Orphan),
+        };
+        if !events.iter().any(|e| {
+            matches!(
+                &e.body,
+                EventBody::ToolCall {
+                    agent: a,
+                    tool_call_id: id,
+                    ..
+                } if *a == agent && id == tool_call_id
+            )
+        }) {
+            return Err(HostToolResultError::Orphan);
+        }
+        if tool_call_is_terminal(&events, tool_call_id) {
+            return Ok(HostToolResultAppend::AlreadyTerminal);
+        }
+        let name = events
+            .iter()
+            .rev()
+            .find_map(|e| match &e.body {
+                EventBody::ToolCall {
+                    agent: a,
+                    tool_call_id: id,
+                    name,
+                    ..
+                } if *a == agent && id == tool_call_id => Some(name.clone()),
+                _ => None,
+            })
+            .expect("ToolCall present after has-check");
+        let ev = self
+            .append(EventBody::ToolResult {
+                agent,
+                tool_call_id: tool_call_id.into(),
+                name,
+                output: output.into(),
+            })
+            .expect("append ToolResult");
+        Ok(HostToolResultAppend::Applied(ev))
     }
 
     /// Memoized `StepCompleted` payload for `(turn_id, step_id)`, if present.
@@ -2669,6 +2760,77 @@ mod tests {
             unmatched_tool_calls(&log),
             vec![(a.id, "a-live".to_string(), "bash".to_string())]
         );
+    }
+
+    #[test]
+    fn append_host_tool_result_applies_idempotent_and_refuses_orphan() {
+        let store = InMemory::new();
+        let session = store.create_session();
+        let agent = store.create_agent("scribe", "");
+        session
+            .append(EventBody::ToolCall {
+                agent: agent.id,
+                tool_call_id: "h1".into(),
+                name: "host_fn".into(),
+                input: "{}".into(),
+                parent_tool_call_id: None,
+            })
+            .unwrap();
+        match session.append_host_tool_result(agent.id, "h1", "out") {
+            Ok(HostToolResultAppend::Applied(ev)) => match ev.body {
+                EventBody::ToolResult {
+                    tool_call_id,
+                    name,
+                    output,
+                    ..
+                } => {
+                    assert_eq!(tool_call_id, "h1");
+                    assert_eq!(name, "host_fn");
+                    assert_eq!(output, "out");
+                }
+                other => panic!("expected ToolResult, got {other:?}"),
+            },
+            other => panic!("expected Applied, got {other:?}"),
+        }
+        assert!(matches!(
+            session.append_host_tool_result(agent.id, "h1", "again"),
+            Ok(HostToolResultAppend::AlreadyTerminal)
+        ));
+        assert_eq!(
+            session.append_host_tool_result(agent.id, "nope", "x"),
+            Err(HostToolResultError::Orphan)
+        );
+    }
+
+    #[test]
+    fn append_host_tool_result_late_after_interrupted_is_terminal() {
+        let store = InMemory::new();
+        let session = store.create_session();
+        let agent = store.create_agent("scribe", "");
+        session
+            .append(EventBody::ToolCall {
+                agent: agent.id,
+                tool_call_id: "h2".into(),
+                name: "x".into(),
+                input: "{}".into(),
+                parent_tool_call_id: None,
+            })
+            .unwrap();
+        assert_eq!(
+            session.finalize_unmatched_tool_calls_of(agent.id).unwrap(),
+            1
+        );
+        assert!(matches!(
+            session.append_host_tool_result(agent.id, "h2", "late"),
+            Ok(HostToolResultAppend::AlreadyTerminal)
+        ));
+        let results = session
+            .events()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e.body, EventBody::ToolResult { .. }))
+            .count();
+        assert_eq!(results, 0);
     }
 
     /// Same Binding cannot open a second turn while one is open.

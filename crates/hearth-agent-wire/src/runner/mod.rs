@@ -939,6 +939,145 @@ pub fn wake_through_host_wake(
     }
 }
 
+/// Result of [`complete_host_tool`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum CompleteHostTool {
+    /// Fresh ToolResult appended; Trigger wake recorded + turn_start.
+    Applied {
+        tool_result: hearth::Event,
+        host: HostWake,
+        wake_events: Vec<hearth::Event>,
+    },
+    /// tool_call_id already terminal (duplicate ToolResult or ToolCallInterrupted).
+    /// Zero new Result / Wake. Idempotent.
+    NotApplied,
+    /// ToolResult freshly appended; wake step Waiting (gate / LiveInTurn /
+    /// Unknown / claim). M8 order: Result then wake — re-POST is NotApplied.
+    AppliedWakeWaiting {
+        tool_result: hearth::Event,
+        reason: hearth::WaitReason,
+    },
+}
+
+/// Error from [`complete_host_tool`] before any ToolResult append.
+#[derive(Debug)]
+pub enum CompleteHostToolError {
+    /// No prior Host ToolCall for `(agent, tool_call_id)` — refuse orphan.
+    Orphan,
+    Remint(RemintError),
+    Runtime(hearth::Error),
+}
+
+impl std::fmt::Display for CompleteHostToolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Orphan => write!(f, "orphan tool_call_id (no unmatched Host ToolCall)"),
+            Self::Remint(e) => write!(f, "{e:?}"),
+            Self::Runtime(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for CompleteHostToolError {}
+
+impl From<RemintError> for CompleteHostToolError {
+    fn from(e: RemintError) -> Self {
+        Self::Remint(e)
+    }
+}
+
+impl From<hearth::Error> for CompleteHostToolError {
+    fn from(e: hearth::Error) -> Self {
+        Self::Runtime(e)
+    }
+}
+
+/// Inputs for [`complete_host_tool`].
+pub struct CompleteHostToolArgs<'a> {
+    pub runtime: &'a hearth::Runtime,
+    pub session_id: hearth::SessionId,
+    pub agent: hearth::AgentId,
+    pub tool_call_id: &'a str,
+    pub output: &'a str,
+    pub old_wire: OldWire,
+    pub remint: HostRemintFullArgs<'a>,
+}
+
+/// Host-owned tool completion: append idempotent ToolResult, then single-Agent
+/// [`wake_through_host_wake`] with [`hearth::Wake::Trigger`] `{ name: "tool_result" }`.
+///
+/// Order (load-bearing, M8):
+/// 1. Refuse orphan (no prior ToolCall for this Agent + id) — no Result, no wake.
+/// 2. Already terminal → [`CompleteHostTool::NotApplied`] (duplicate / late after
+///    Interrupted) — no wake.
+/// 3. Append ToolResult (name from matching ToolCall).
+/// 4. [`wake_through_host_wake`] for **this Agent only** (never fan-out /
+///    `wake_each_kept`). Claim-before-record + conflict gate unchanged on wake.
+/// 5. Wake Waiting after Result → [`CompleteHostTool::AppliedWakeWaiting`].
+///
+/// Never `session/load` / `session/new`. MCP/ACP drain path untouched (RAP
+/// semantics, not RAP-replace). SoftExpiring / Flush / Stage / Evidence /
+/// EffectId / fleet / ToolResult parent parked.
+pub fn complete_host_tool(
+    old: &mut AttachRunner,
+    new: &mut AttachRunner,
+    new_transport: &mut RunnerTransport,
+    args: CompleteHostToolArgs<'_>,
+) -> Result<CompleteHostTool, CompleteHostToolError> {
+    let CompleteHostToolArgs {
+        runtime,
+        session_id,
+        agent,
+        tool_call_id,
+        output,
+        old_wire,
+        remint,
+    } = args;
+    // Wire's Host Agent must address this completion (no cross-Agent steal).
+    if remint.session.host_agent_id() != agent {
+        return Err(CompleteHostToolError::Orphan);
+    }
+    let sess = runtime.store().session(session_id)?;
+    let append = match sess.append_host_tool_result(agent, tool_call_id, output) {
+        Ok(a) => a,
+        Err(hearth::HostToolResultError::Orphan) => return Err(CompleteHostToolError::Orphan),
+    };
+    let tool_result = match append {
+        hearth::HostToolResultAppend::AlreadyTerminal => {
+            return Ok(CompleteHostTool::NotApplied);
+        }
+        hearth::HostToolResultAppend::Applied(ev) => ev,
+    };
+    let wake_args = WakeThroughHostArgs {
+        runtime,
+        session_id,
+        wake: hearth::Wake::Trigger {
+            name: "tool_result".into(),
+        },
+        old_wire,
+        remint,
+    };
+    match wake_through_host_wake(old, new, new_transport, wake_args) {
+        Ok(WakeThroughHost::Woke { host, events }) => Ok(CompleteHostTool::Applied {
+            tool_result,
+            host,
+            wake_events: events,
+        }),
+        Ok(WakeThroughHost::Waiting(reason)) => Ok(CompleteHostTool::AppliedWakeWaiting {
+            tool_result,
+            reason,
+        }),
+        Err(WakeThroughError::Runtime(hearth::Error::Waiting(reason))) => {
+            Ok(CompleteHostTool::AppliedWakeWaiting {
+                tool_result,
+                reason,
+            })
+        }
+        Err(WakeThroughError::Remint(e)) => Err(CompleteHostToolError::Remint(e)),
+        Err(WakeThroughError::Runtime(e)) => Err(CompleteHostToolError::Runtime(e)),
+    }
+}
+
 /// One due Session's wire for [`tick_through_host_wake`]: the
 /// [`wake_through_host_wake`] inputs minus Runtime / Session / Wake.
 pub struct TickWire<'a> {
