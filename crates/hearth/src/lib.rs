@@ -232,8 +232,11 @@ pub enum EventBody {
         turn_id: u64,
         fence: u64,
     },
+    /// `agent` is the Binding's owning Agent (`None` for agentless binds),
+    /// so Runtime can classify each kept Agent from the log alone.
     BindingAttached {
         binding: BindingId,
+        agent: Option<AgentId>,
     },
     BindingReleased {
         binding: BindingId,
@@ -289,6 +292,9 @@ pub enum Error {
     TopicMissing(String),
     #[error("session {0:?} is not kept")]
     NotKept(SessionId),
+    /// Session is kept, but not for this Agent.
+    #[error("agent {1:?} is not kept on session {0:?}")]
+    AgentNotKept(SessionId, AgentId),
     #[error("prompt waiting ({0:?})")]
     Waiting(WaitReason),
     #[error("turn lease lost")]
@@ -919,6 +925,7 @@ impl Session {
             data.bindings.insert(binding.id, binding.clone());
             data.push(EventBody::BindingAttached {
                 binding: binding.id,
+                agent: binding.agent,
             });
             Ok(binding)
         })
@@ -1079,6 +1086,7 @@ impl Session {
             data.bindings.insert(binding.id, binding.clone());
             data.push(EventBody::BindingAttached {
                 binding: binding.id,
+                agent: binding.agent,
             });
             if let Some(old) = expected {
                 // Remint keeps an open turn: it follows the Binding lineage.
@@ -2666,7 +2674,10 @@ mod environment {
             tail,
             vec![
                 EventBody::BindingReleased { binding: old.id },
-                EventBody::BindingAttached { binding: new.id },
+                EventBody::BindingAttached {
+                    binding: new.id,
+                    agent: Some(agent.id),
+                },
             ],
             "attached new, then released old"
         );

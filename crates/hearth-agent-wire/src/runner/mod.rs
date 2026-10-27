@@ -895,11 +895,13 @@ pub fn wake_through_host_wake(
         old_wire,
         remint,
     } = args;
+    // The wire's Host Agent picks the kept recipe: waking A never uses B's.
+    let agent = remint.session.host_agent_id();
     let host = host_wake(old_wire, old, new, new_transport, remint)?;
     match host {
         HostWake::Waiting(reason) => Ok(WakeThroughHost::Waiting(reason)),
         host => {
-            let events = runtime.wake_with(session_id, wake, &mut hearth::AlreadyBound)?;
+            let events = runtime.wake_with(session_id, agent, wake, &mut hearth::AlreadyBound)?;
             Ok(WakeThroughHost::Woke { host, events })
         }
     }
@@ -919,12 +921,15 @@ pub struct TickWire<'a> {
 /// Session's `Wake::Timer` runs [`wake_through_host_wake`] — same one-mint
 /// seam as explicit wake, never `claim_binding` on a timer.
 ///
-/// Per due Session, in order (each skip: zero wire action, nothing written,
-/// `next_due_ms` unchanged, retried on a later tick):
-/// 1. No [`TickWire`] in `wires` → skip (no wire evidence = liveness
-///    unknown). The Host must supply a wire for it to fire.
-/// 2. Read-only kernel [`hearth::Runtime::classify`]: `LiveInTurn` /
-///    `Unknown` → skip, so a timer never tears down a wire under an open turn.
+/// Per due `(Session, Agent)`, in order (each skip: zero wire action,
+/// nothing written, that Agent's `next_due_ms` unchanged, retried on a
+/// later tick):
+/// 1. No [`TickWire`] in `wires` for `(Session, Agent)`, or the wire's Host
+///    Agent is not that Agent → skip (no wire evidence = liveness unknown).
+///    The Host must supply a wire per kept Agent for it to fire.
+/// 2. Read-only kernel [`hearth::Runtime::classify`] of that Agent:
+///    `LiveInTurn` / `Unknown` → skip, so a timer never tears down a wire
+///    under an open turn.
 /// 3. [`wake_through_host_wake`]: `HostWake::Waiting` → skip. On a live
 ///    wire (`ReuseLive`, zero wire action) a Runtime `Error::Waiting` (e.g.
 ///    kernel PositivelyDead / NeverBound: no live Binding, never minted
@@ -935,14 +940,18 @@ pub struct TickWire<'a> {
 pub fn tick_through_host_wake(
     runtime: &hearth::Runtime,
     now_ms: Option<u64>,
-    mut wires: std::collections::HashMap<hearth::SessionId, TickWire<'_>>,
-) -> Result<Vec<(hearth::SessionId, WakeThroughHost)>, WakeThroughError> {
-    runtime.tick_with(now_ms, |session_id, wake| {
-        let Some(w) = wires.remove(&session_id) else {
+    mut wires: std::collections::HashMap<(hearth::SessionId, hearth::AgentId), TickWire<'_>>,
+) -> Result<Vec<(hearth::SessionId, hearth::AgentId, WakeThroughHost)>, WakeThroughError> {
+    runtime.tick_with(now_ms, |session_id, agent, wake| {
+        let Some(w) = wires.remove(&(session_id, agent)) else {
             return Ok(None);
         };
+        // A wire for another Agent is not evidence for this one: skip.
+        if w.remint.session.host_agent_id() != agent {
+            return Ok(None);
+        }
         if matches!(
-            runtime.classify(session_id)?,
+            runtime.classify(session_id, agent)?,
             hearth::Liveness::LiveInTurn | hearth::Liveness::Unknown
         ) {
             return Ok(None);
@@ -1020,7 +1029,8 @@ pub fn begin_turn_through_host_wake(
         old_wire,
         remint,
     } = args;
-    match runtime.classify(session_id)? {
+    let agent = remint.session.host_agent_id();
+    match runtime.classify(session_id, agent)? {
         hearth::Liveness::LiveInTurn => {
             return Ok(BeginTurnThroughHost::Waiting(hearth::WaitReason::TurnOpen));
         }
@@ -1036,7 +1046,7 @@ pub fn begin_turn_through_host_wake(
         HostWake::Waiting(reason) => Ok(BeginTurnThroughHost::Waiting(reason)),
         host => {
             let reuse = matches!(host, HostWake::ReuseLive);
-            match runtime.begin_turn_with(session_id, holder, &mut hearth::AlreadyBound) {
+            match runtime.begin_turn_with(session_id, agent, holder, &mut hearth::AlreadyBound) {
                 Ok((turn_id, fence, binding)) => Ok(BeginTurnThroughHost::Begun {
                     host,
                     turn_id,
@@ -1100,7 +1110,8 @@ pub fn remint_through_host_wake(
         old_wire,
         remint,
     } = args;
-    match runtime.classify(session_id)? {
+    let agent = remint.session.host_agent_id();
+    match runtime.classify(session_id, agent)? {
         hearth::Liveness::LiveInTurn => {
             return Ok(RemintThroughHost::Waiting(hearth::WaitReason::TurnOpen));
         }
@@ -1111,7 +1122,6 @@ pub fn remint_through_host_wake(
         }
         _ => {}
     }
-    let agent = remint.session.host_agent_id();
     let host = host_wake(old_wire, old, new, new_transport, remint)?;
     match host {
         HostWake::Waiting(reason) => Ok(RemintThroughHost::Waiting(reason)),
@@ -3471,8 +3481,9 @@ mod tests {
         old_wire: OldWire,
         old: &mut AttachRunner,
         new: &mut AttachRunner,
-    ) -> Result<Vec<(hearth::SessionId, WakeThroughHost)>, WakeThroughError> {
+    ) -> Result<Vec<(hearth::SessionId, hearth::AgentId, WakeThroughHost)>, WakeThroughError> {
         let mut transport = transport_for_wire(WireKind::JsonlRpc);
+        let agent = remint.host_agent_id();
         let (mut old_next, mut new_next) = (10u64, 2u64);
         let wire = TickWire {
             old,
@@ -3488,7 +3499,7 @@ mod tests {
                 new_next_rpc_id: &mut new_next,
             },
         };
-        tick_through_host_wake(rt, Some(now), [(sid, wire)].into_iter().collect())
+        tick_through_host_wake(rt, Some(now), [((sid, agent), wire)].into_iter().collect())
     }
 
     fn timed_runtime_remint() -> (
@@ -3499,7 +3510,8 @@ mod tests {
         u64,
     ) {
         let (rt, sid, _uid, remint, place) = shared_runtime_remint();
-        rt.schedule(sid, 1_000).expect("schedule");
+        rt.schedule(sid, remint.host_agent_id(), 1_000)
+            .expect("schedule");
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -3539,7 +3551,7 @@ mod tests {
         )
         .expect("tick");
         assert_eq!(fired.len(), 1);
-        let (fired_sid, WakeThroughHost::Woke { host, events }) = &fired[0] else {
+        let (fired_sid, _, WakeThroughHost::Woke { host, events }) = &fired[0] else {
             panic!("expected Woke, got {fired:?}");
         };
         assert_eq!(*fired_sid, sid);
@@ -3580,7 +3592,7 @@ mod tests {
         )
         .expect("tick");
         assert_eq!(fired.len(), 1);
-        let (_, WakeThroughHost::Woke { host, events }) = &fired[0] else {
+        let (_, _, WakeThroughHost::Woke { host, events }) = &fired[0] else {
             panic!("expected Woke, got {fired:?}");
         };
         assert_eq!(*host, HostWake::ReuseLive);
@@ -3588,6 +3600,83 @@ mod tests {
         assert_eq!(binding_attached_count(&rt, sid), before);
         assert_eq!(old.stdin_log().unwrap().len(), old_log);
         assert!(new.stdin_log().unwrap().is_empty());
+    }
+
+    /// Keep-by-(Session, Agent): a second Agent kept on the same Session
+    /// with another recipe. wake_through_host_wake addresses the wire's Host
+    /// Agent only — B gets no Binding and no turn.
+    #[test]
+    fn wake_through_host_wake_addresses_wire_agent_not_other_kept_agent() {
+        let (rt, sid, uid, remint, place) = shared_runtime_remint();
+        let a = remint.host_agent_id();
+        let b = rt.store().create_agent("other", "").id;
+        rt.keep(sid, b, hearth::HostKind::Codex.host(None, None))
+            .expect("keep B");
+        let before = binding_attached_count(&rt, sid);
+        let mut old = initialized_fake(Vec::new());
+        let mut new = new_wire_fake();
+        let r = run_through(
+            &rt,
+            sid,
+            hearth::Wake::UserQuery {
+                user: uid,
+                text: "hi".into(),
+            },
+            &remint,
+            &place,
+            OldWire::LiveIdle,
+            &mut old,
+            &mut new,
+        )
+        .expect("through");
+        let WakeThroughHost::Woke { host, events } = r else {
+            panic!("expected Woke, got {r:?}");
+        };
+        assert_eq!(host, HostWake::ReuseLive);
+        assert_eq!(binding_attached_count(&rt, sid), before, "zero mints");
+        assert!(events
+            .iter()
+            .any(|e| matches!(e.body, hearth::EventBody::TurnStart { agent } if agent == a)));
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e.body, hearth::EventBody::TurnStart { agent } if agent == b)));
+        let session = rt.store().session(sid).unwrap();
+        assert!(session.current_turn_of(b).unwrap().is_none());
+        assert_eq!(rt.classify(sid, b).unwrap(), hearth::Liveness::NeverBound);
+    }
+
+    /// tick_through_host_wake addresses each due (Session, Agent): A with a
+    /// wire fires; B kept + due with no wire is skipped (no wire evidence),
+    /// stays due, and gets nothing written.
+    #[test]
+    fn tick_through_host_wake_addresses_each_agent_wire() {
+        let (rt, sid, remint, place, now) = timed_runtime_remint();
+        let a = remint.host_agent_id();
+        let b = rt.store().create_agent("other", "").id;
+        rt.keep(sid, b, hearth::HostKind::Codex.host(None, None))
+            .expect("keep B");
+        rt.schedule(sid, b, 1_000).expect("schedule B");
+        let mut old = initialized_fake(Vec::new());
+        let mut new = new_wire_fake();
+        let fired = tick_through(
+            &rt,
+            sid,
+            now,
+            &remint,
+            &place,
+            OldWire::LiveIdle,
+            &mut old,
+            &mut new,
+        )
+        .expect("tick");
+        let who: Vec<_> = fired.iter().map(|(s, ag, _)| (*s, *ag)).collect();
+        assert_eq!(who, vec![(sid, a)]);
+        let session = rt.store().session(sid).unwrap();
+        assert!(session.current_turn_of(b).unwrap().is_none());
+        // B still due: the kernel tick (no wire seam) fires only B now.
+        let kernel = rt.tick(Some(now)).expect("kernel tick");
+        let who: Vec<_> = kernel.iter().map(|(_, ag, _)| *ag).collect();
+        assert_eq!(who, vec![b]);
     }
 
     /// Unknown wire on a due timer: skipped, nothing written, still due
@@ -3729,7 +3818,10 @@ mod tests {
             .unwrap()
             .id;
         session.unbind(bid).unwrap();
-        assert_eq!(rt.classify(sid).unwrap(), hearth::Liveness::PositivelyDead);
+        assert_eq!(
+            rt.classify(sid, agent).unwrap(),
+            hearth::Liveness::PositivelyDead
+        );
         let log_len = session.events().unwrap().len();
         let before = binding_attached_count(&rt, sid);
         // Unread stdout keeps the fake old child running.
@@ -3778,9 +3870,10 @@ mod tests {
         session
             .append(hearth::EventBody::BindingAttached {
                 binding: hearth::BindingId::new(),
+                agent: None,
             })
             .unwrap();
-        assert_eq!(rt.classify(sid).unwrap(), hearth::Liveness::Unknown);
+        assert_eq!(rt.classify(sid, agent).unwrap(), hearth::Liveness::Unknown);
         let log_len = session.events().unwrap().len();
         let before = binding_attached_count(&rt, sid);
         let mut old = initialized_fake(b"{}\n".to_vec());
@@ -3982,7 +4075,10 @@ mod tests {
         let agent = remint.host_agent_id();
         let bid = lease_binding(&rt, sid, agent);
         session.unbind(bid).unwrap();
-        assert_eq!(rt.classify(sid).unwrap(), hearth::Liveness::PositivelyDead);
+        assert_eq!(
+            rt.classify(sid, agent).unwrap(),
+            hearth::Liveness::PositivelyDead
+        );
         let before = binding_attached_count(&rt, sid);
         let mut old = initialized_fake(b"{}\n".to_vec());
         let old_log = old.stdin_log().unwrap().len();
@@ -4022,9 +4118,10 @@ mod tests {
         session
             .append(hearth::EventBody::BindingAttached {
                 binding: hearth::BindingId::new(),
+                agent: None,
             })
             .unwrap();
-        assert_eq!(rt.classify(sid).unwrap(), hearth::Liveness::Unknown);
+        assert_eq!(rt.classify(sid, agent).unwrap(), hearth::Liveness::Unknown);
         let before = binding_attached_count(&rt, sid);
         let mut old = initialized_fake(b"{}\n".to_vec());
         let old_log = old.stdin_log().unwrap().len();
@@ -4124,7 +4221,10 @@ mod tests {
         let agent = remint.host_agent_id();
         let bid = lease_binding(&rt, sid, agent);
         session.unbind(bid).unwrap();
-        assert_eq!(rt.classify(sid).unwrap(), hearth::Liveness::PositivelyDead);
+        assert_eq!(
+            rt.classify(sid, agent).unwrap(),
+            hearth::Liveness::PositivelyDead
+        );
         let before = binding_attached_count(&rt, sid);
         let mut old = initialized_fake(b"{}\n".to_vec());
         let old_log = old.stdin_log().unwrap().len();
@@ -4157,9 +4257,10 @@ mod tests {
         session
             .append(hearth::EventBody::BindingAttached {
                 binding: hearth::BindingId::new(),
+                agent: None,
             })
             .unwrap();
-        assert_eq!(rt.classify(sid).unwrap(), hearth::Liveness::Unknown);
+        assert_eq!(rt.classify(sid, agent).unwrap(), hearth::Liveness::Unknown);
         let before = binding_attached_count(&rt, sid);
         let mut old = initialized_fake(b"{}\n".to_vec());
         let old_log = old.stdin_log().unwrap().len();

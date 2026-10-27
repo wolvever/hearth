@@ -246,9 +246,11 @@ fn event_out(e: &Event) -> EventOut {
     }
 }
 
-fn ensure_kept(st: &AppState, id: SessionId) -> Result<(), StatusCode> {
-    if st.runtime.kept().contains(&id) {
-        return Ok(());
+/// Agent a user message wakes: the first kept Agent (keep order), else
+/// keep the first Agent member. No per-message Agent addressing yet.
+fn ensure_kept(st: &AppState, id: SessionId) -> Result<hearth::AgentId, StatusCode> {
+    if let Some(agent) = st.runtime.kept_agents(id).first() {
+        return Ok(*agent);
     }
     let session = st.store().session(id).map_err(|_| StatusCode::NOT_FOUND)?;
     let agent = session
@@ -262,7 +264,8 @@ fn ensure_kept(st: &AppState, id: SessionId) -> Result<(), StatusCode> {
     let Some(agent) = agent else {
         return Err(StatusCode::CONFLICT);
     };
-    keep_standin(st, id, agent)
+    keep_standin(st, id, agent)?;
+    Ok(agent)
 }
 
 /// Shared steer used by HTTP POST /events and WS `{"type":"message",...}`.
@@ -280,8 +283,11 @@ fn apply_user_message(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let uid = *names.users.get(&name).ok_or(StatusCode::NOT_FOUND)?;
     drop(names);
-    ensure_kept(st, id)?;
-    match st.runtime.wake(id, Wake::UserQuery { user: uid, text }) {
+    let agent = ensure_kept(st, id)?;
+    match st
+        .runtime
+        .wake(id, agent, Wake::UserQuery { user: uid, text })
+    {
         Ok(evs) => {
             for e in &evs {
                 st.publish(id, event_out(e));
@@ -294,9 +300,9 @@ fn apply_user_message(
                 .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
             Ok(event_out(um))
         }
-        Err(hearth::Error::Waiting(_)) | Err(hearth::Error::NotKept(_)) => {
-            Err(StatusCode::CONFLICT)
-        }
+        Err(hearth::Error::Waiting(_))
+        | Err(hearth::Error::NotKept(_))
+        | Err(hearth::Error::AgentNotKept(..)) => Err(StatusCode::CONFLICT),
         Err(hearth::Error::NotMember) | Err(hearth::Error::UnknownUser(_)) => {
             Err(StatusCode::FORBIDDEN)
         }

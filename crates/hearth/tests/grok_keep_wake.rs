@@ -27,6 +27,7 @@ fn keep_wake_then_optional_grok_chat_completion() {
     let evs = rt
         .wake(
             session.id(),
+            agent.id,
             Wake::UserQuery {
                 user: user.id,
                 text: prompt.into(),
