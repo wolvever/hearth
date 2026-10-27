@@ -25,9 +25,10 @@
 //! using the default [`ClaimBinding`] entry points.
 //!
 //! Intra-turn durable steps: [`Runtime::begin_turn`] / [`Runtime::end_turn`] hold a
-//! [`SessionTurnLease`] (holder + fence). The fence is stored on the Session
-//! ([`crate::EventBody::TurnFenced`], [`Session::turn_fence`]), not in the kept
-//! map, so re-keep raises it above every earlier one and an old-fence write is
+//! [`SessionTurnLease`] (holder + fence) **per kept Agent** on the Session. The
+//! fence stays shared on the Session ([`crate::EventBody::TurnFenced`],
+//! [`Session::turn_fence`]), not in the kept map, so re-keep / a later Agent's
+//! lease install raises it above every earlier one and an old-fence write is
 //! [`Error::TurnLeaseLost`]. [`Runtime::durable_step`] memoizes via
 //! [`crate::EventBody::StepCompleted`]. [`Runtime::resume_interrupted_turn`]
 //! and the open-turn re-keep adopt path in [`Runtime::begin_turn_with`] both
@@ -35,7 +36,7 @@
 //! [`crate::EventBody::ToolCallInterrupted`] (Indeterminate) via the same
 //! helper as wire remint; resume does **not** remint Binding. Both are
 //! Agent-scoped: they adopt only the kept Agent's own turn / interrupted
-//! lease and refuse another Agent's interrupted lease (`Waiting(TurnOpen)`).
+//! lease in **that Agent's** lease slot (no cross-Agent steal).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -179,13 +180,15 @@ struct KeptAgent {
 }
 
 /// Internal keep record for one Session: every kept Agent's recipe (keep
-/// order) plus the Session's one turn lease. The lease stays per Session
-/// because the fence is per Session ([`Session::turn_fence`]).
+/// order) plus a **per-Agent** turn lease map. The fence stays shared on the
+/// Session ([`Session::turn_fence`]); Soft residual: a later Agent's lease
+/// install raises it and can `TurnLeaseLost` an earlier live holder.
 struct Kept {
     agents: Vec<KeptAgent>,
-    /// Live or interrupted session-turn lease. `holder: None` after a crash.
+    /// Live or interrupted turn lease **per Agent**. `holder: None` after a
+    /// crash. Keyed by Agent so two ParallelSafe Agents can both hold leases.
     /// The fence is not here: it is stored on the Session ([`Session::turn_fence`]).
-    lease: Option<TurnLease>,
+    leases: HashMap<AgentId, TurnLease>,
 }
 
 impl Kept {
@@ -200,7 +203,7 @@ impl Kept {
 
 struct TurnLease {
     holder: Option<HolderId>,
-    /// Kept Agent whose turn this lease drives.
+    /// Kept Agent whose turn this lease drives (same as the map key).
     agent: AgentId,
     turn_id: u64,
 }
@@ -257,12 +260,14 @@ impl Runtime {
             .ok_or(Error::AgentNotKept(session, agent))
     }
 
-    /// Agent driving the Session's current lease (live or interrupted).
-    fn lease_agent(&self, session: SessionId) -> Result<AgentId> {
+    /// Agent driving a live lease held by `holder` (one of the Session's
+    /// per-Agent lease slots).
+    fn lease_agent_for_holder(&self, session: SessionId, holder: &HolderId) -> Result<AgentId> {
         let g = self.lock_kept()?;
         let kept = g.get(&session).ok_or(Error::NotKept(session))?;
-        kept.lease
-            .as_ref()
+        kept.leases
+            .values()
+            .find(|l| l.holder.as_ref() == Some(holder))
             .map(|l| l.agent)
             .ok_or(Error::SessionNotOwned)
     }
@@ -271,7 +276,7 @@ impl Runtime {
     /// exist. Joins `Member::Agent` if needed (occupancy so later turns are
     /// legal). Does **not** bind. Many Agents may be kept on one Session;
     /// overwriting keep for the same `(session, agent)` updates only that
-    /// Agent's recipe (other Agents' recipes, timers, and the lease stay).
+    /// Agent's recipe (other Agents' recipes, timers, and leases stay).
     pub fn keep(&self, session: SessionId, agent: AgentId, host: Host) -> Result<()> {
         let spec = KeepSpec { agent, host };
         let sess = self.store.session(session)?;
@@ -280,7 +285,7 @@ impl Runtime {
         let mut g = self.lock_kept()?;
         let kept = g.entry(session).or_insert_with(|| Kept {
             agents: Vec::new(),
-            lease: None,
+            leases: HashMap::new(),
         });
         match kept.agent_mut(spec.agent) {
             Some(existing) => existing.host = spec.host,
@@ -295,7 +300,7 @@ impl Runtime {
         Ok(())
     }
 
-    /// Stop keeping every Agent on `session` (and drop its lease). Does
+    /// Stop keeping every Agent on `session` (and drop every lease). Does
     /// **not** delete Session, log, Places, or Bindings.
     pub fn release(&self, session: SessionId) -> Result<()> {
         let mut g = self.lock_kept()?;
@@ -303,18 +308,16 @@ impl Runtime {
         Ok(())
     }
 
-    /// Stop keeping one Agent on `session`. Drops the Session's lease only
-    /// if that Agent drives it. Releasing the last kept Agent un-keeps the
-    /// Session. Not kept is a no-op (like [`Self::release`]).
+    /// Stop keeping one Agent on `session`. Drops that Agent's lease slot
+    /// only. Releasing the last kept Agent un-keeps the Session. Not kept
+    /// is a no-op (like [`Self::release`]).
     pub fn release_agent(&self, session: SessionId, agent: AgentId) -> Result<()> {
         let mut g = self.lock_kept()?;
         let Some(kept) = g.get_mut(&session) else {
             return Ok(());
         };
         kept.agents.retain(|k| k.agent != agent);
-        if kept.lease.as_ref().is_some_and(|l| l.agent == agent) {
-            kept.lease = None;
-        }
+        kept.leases.remove(&agent);
         if kept.agents.is_empty() {
             g.remove(&session);
         }
@@ -586,17 +589,50 @@ impl Runtime {
         Ok(out)
     }
 
-    /// Live lease, if a holder currently owns the session turn.
+    /// One live lease on `session`, if any holder currently owns a leased
+    /// turn. When several Agents hold live leases, returns the one with the
+    /// smallest [`AgentId`] (stable). Prefer [`Self::turn_lease_of`] when the
+    /// Agent is known.
     pub fn turn_lease(&self, session: SessionId) -> Result<Option<SessionTurnLease>> {
         let g = self.lock_kept()?;
         let kept = g.get(&session).ok_or(Error::NotKept(session))?;
-        let Some((holder, agent, turn_id)) = kept
-            .lease
-            .as_ref()
-            .and_then(|l| l.holder.clone().map(|h| (h, l.agent, l.turn_id)))
+        let Some(lease) = kept
+            .leases
+            .values()
+            .filter(|l| l.holder.is_some())
+            .min_by_key(|l| l.agent.0)
         else {
             return Ok(None);
         };
+        let holder = lease.holder.clone().expect("filtered live");
+        let agent = lease.agent;
+        let turn_id = lease.turn_id;
+        drop(g);
+        let fence = self.store.session(session)?.turn_fence()?;
+        Ok(Some(SessionTurnLease {
+            holder,
+            agent,
+            fence,
+            turn_id,
+        }))
+    }
+
+    /// Live lease for one kept Agent, if that Agent's slot has a holder.
+    pub fn turn_lease_of(
+        &self,
+        session: SessionId,
+        agent: AgentId,
+    ) -> Result<Option<SessionTurnLease>> {
+        let g = self.lock_kept()?;
+        let kept = g.get(&session).ok_or(Error::NotKept(session))?;
+        let Some(lease) = kept.leases.get(&agent) else {
+            return Ok(None);
+        };
+        let Some(holder) = lease.holder.clone() else {
+            return Ok(None);
+        };
+        let turn_id = lease.turn_id;
+        drop(g);
         let fence = self.store.session(session)?.turn_fence()?;
         Ok(Some(SessionTurnLease {
             holder,
@@ -621,10 +657,12 @@ impl Runtime {
     /// An interrupted turn (lease holder dropped while still kept) must use
     /// [`Self::resume_interrupted_turn`].
     ///
-    /// The lease (and fence) is per Session: while any Agent's lease is held,
-    /// another Agent's `begin_turn` is [`Error::LiveTurnOpen`] (live holder)
-    /// or `Waiting(TurnOpen)` (interrupted). Un-leased turns via [`Self::wake`]
-    /// are per Agent.
+    /// The lease is **per Agent** (within the Session); the fence stays shared
+    /// on the Session. An Agent's `begin_turn` only refuses on **its own**
+    /// lease slot ([`Error::LiveTurnOpen`] live holder, `Waiting(TurnOpen)`
+    /// interrupted). Another Agent's lease does not block at this layer —
+    /// the ParallelSafe conflict gate still serializes undeclared / overlapping
+    /// turns. Un-leased turns via [`Self::wake`] are per Agent.
     ///
     /// Kernel default ([`ClaimBinding`]) for tests without a wire. Production
     /// wire Host: route through `begin_turn_through_host_wake`
@@ -662,7 +700,9 @@ impl Runtime {
         {
             let g = self.lock_kept()?;
             let kept = g.get(&session).ok_or(Error::NotKept(session))?;
-            if let Some(lease) = &kept.lease {
+            // Per-Agent-lease: only this Agent's slot blocks. Another Agent's
+            // live / interrupted lease sits in its own slot and is not stolen.
+            if let Some(lease) = kept.leases.get(&agent) {
                 if lease.holder.is_some() {
                     return Err(Error::LiveTurnOpen);
                 }
@@ -698,9 +738,9 @@ impl Runtime {
         Ok((turn_id, fence, binding))
     }
 
-    /// End a leased turn (the lease's Agent). `interrupted: true` drops the
-    /// live holder without `TurnEnd` (host crash). `false` appends `TurnEnd`
-    /// and clears the lease.
+    /// End a leased turn (the holder's Agent slot). `interrupted: true` drops
+    /// the live holder without `TurnEnd` (host crash). `false` appends
+    /// `TurnEnd` and clears that Agent's lease slot.
     pub fn end_turn(
         &self,
         session: SessionId,
@@ -710,12 +750,12 @@ impl Runtime {
     ) -> Result<()> {
         let _gate = self.lock_durable()?;
         self.require_live_holder_fence(session, &holder, fence)?;
-        let agent = self.lease_agent(session)?;
+        let agent = self.lease_agent_for_holder(session, &holder)?;
 
         if interrupted {
             let mut g = self.lock_kept()?;
             let kept = g.get_mut(&session).ok_or(Error::NotKept(session))?;
-            if let Some(lease) = kept.lease.as_mut() {
+            if let Some(lease) = kept.leases.get_mut(&agent) {
                 lease.holder = None;
             }
             return Ok(());
@@ -725,7 +765,7 @@ impl Runtime {
         sess.turn_end(agent)?;
         let mut g = self.lock_kept()?;
         let kept = g.get_mut(&session).ok_or(Error::NotKept(session))?;
-        kept.lease = None;
+        kept.leases.remove(&agent);
         Ok(())
     }
 
@@ -752,7 +792,7 @@ impl Runtime {
         let _gate = self.lock_durable()?;
         let step_id = step_id.into();
         self.require_live_lease(session, &holder, fence, turn_id)?;
-        let agent = self.lease_agent(session)?;
+        let agent = self.lease_agent_for_holder(session, &holder)?;
 
         let sess = self.store.session(session)?;
         if sess.current_turn_of(agent)? != Some(turn_id) {
@@ -773,18 +813,17 @@ impl Runtime {
         Ok(StepOutcome::Executed(result))
     }
 
-    /// After host crash: reclaim the lease for a kept Agent, restore its open
+    /// After host crash: reclaim **this Agent's** lease slot, restore its open
     /// turn from the EventLog (`TurnStart` without `TurnEnd`), finalize
     /// unmatched tool calls as [`EventBody::ToolCallInterrupted`]
     /// ([`crate::ToolInterruptStatus::Indeterminate`]) via
     /// [`Session::finalize_unmatched_tool_calls_of`] (this Agent only) (same helper as wire remint),
     /// return `(turn_id, fence, binding_id)`.
-    /// Does **not** remint Binding. Refuses if a holder is still live
-    /// ([`Error::LiveTurnOpen`]). Resume-lease-by-Agent: an interrupted
-    /// lease driven by **another** Agent is refused
-    /// (`Waiting(TurnOpen)`, nothing written) — resume adopts only this
-    /// Agent's interrupted lease (or, with no lease, this Agent's own
-    /// log-open turn), never steals another's.
+    /// Does **not** remint Binding. Refuses if **this Agent's** holder is still
+    /// live ([`Error::LiveTurnOpen`]). Per-Agent-lease: another Agent's
+    /// interrupted lease sits in **its** slot and is never stolen — resume /
+    /// adopt write only this Agent's slot (or, with no slot, install one for
+    /// this Agent's own log-open turn).
     pub fn resume_interrupted_turn(
         &self,
         session: SessionId,
@@ -798,18 +837,14 @@ impl Runtime {
         {
             let g = self.lock_kept()?;
             let kept = g.get(&session).ok_or(Error::NotKept(session))?;
-            if let Some(lease) = &kept.lease {
+            // Per-Agent-lease: only this Agent's slot can block. Another
+            // Agent's interrupted lease is in its own slot and is not
+            // visible here — resume never clears or overwrites it.
+            if let Some(lease) = kept.leases.get(&agent) {
                 if lease.holder.is_some() {
                     return Err(Error::LiveTurnOpen);
                 }
-                // Resume-lease-by-Agent: an interrupted lease is resumable
-                // only by the Agent that drove it. Another Agent's
-                // interrupted lease is not this resume's to steal (same
-                // answer as that Agent's `begin_turn`); refuse before any
-                // restore / finalize / fence raise, so nothing is written.
-                if lease.agent != agent {
-                    return Err(Error::Waiting(WaitReason::TurnOpen));
-                }
+                // Own interrupted lease: proceed to reclaim below.
             }
         }
 
@@ -826,7 +861,8 @@ impl Runtime {
     }
 
     /// Every new lease (fresh turn, adopted open turn, crash resume) raises
-    /// the stored fence, so no two holders ever share one.
+    /// the shared Session fence and writes **this Agent's** lease slot only.
+    /// Other Agents' slots are untouched (no cross-Agent steal).
     fn install_lease(
         &self,
         sess: &Session,
@@ -837,11 +873,14 @@ impl Runtime {
         let mut g = self.lock_kept()?;
         let kept = g.get_mut(&sess.id()).ok_or(Error::NotKept(sess.id()))?;
         let fence = sess.raise_turn_fence(turn_id)?;
-        kept.lease = Some(TurnLease {
-            holder: Some(holder),
+        kept.leases.insert(
             agent,
-            turn_id,
-        });
+            TurnLease {
+                holder: Some(holder),
+                agent,
+                turn_id,
+            },
+        );
         Ok(fence)
     }
 
@@ -853,11 +892,10 @@ impl Runtime {
     ) -> Result<()> {
         let g = self.lock_kept()?;
         let kept = g.get(&session).ok_or(Error::NotKept(session))?;
-        let lease = kept.lease.as_ref().ok_or(Error::SessionNotOwned)?;
-        match &lease.holder {
-            Some(h) if h == holder => {}
-            Some(_) | None => return Err(Error::SessionNotOwned),
-        }
+        kept.leases
+            .values()
+            .find(|l| l.holder.as_ref() == Some(holder))
+            .ok_or(Error::SessionNotOwned)?;
         if self.store.session(session)?.turn_fence()? != fence {
             return Err(Error::TurnLeaseLost);
         }
@@ -874,7 +912,11 @@ impl Runtime {
         self.require_live_holder_fence(session, holder, fence)?;
         let g = self.lock_kept()?;
         let kept = g.get(&session).ok_or(Error::NotKept(session))?;
-        let lease = kept.lease.as_ref().ok_or(Error::SessionNotOwned)?;
+        let lease = kept
+            .leases
+            .values()
+            .find(|l| l.holder.as_ref() == Some(holder))
+            .ok_or(Error::SessionNotOwned)?;
         if lease.turn_id != turn_id {
             return Err(Error::TurnLeaseLost);
         }
@@ -1999,7 +2041,7 @@ mod tests {
                     next_due_ms: Some(0),
                     parallel_safe: None,
                 }],
-                lease: None,
+                leases: HashMap::new(),
             },
         );
         assert!(matches!(
@@ -2493,12 +2535,12 @@ mod tests {
         ));
     }
 
-    /// The lease and fence stay per Session: while A holds the lease B's
-    /// begin_turn is LiveTurnOpen, but B's un-leased wake proceeds. After A
-    /// ends, B leases its own turn under a raised fence; durable steps and
-    /// end_turn address the lease Agent.
+    /// Per-Agent-lease: two ParallelSafe Agents both `begin_turn` and each
+    /// holds its own lease slot. The Session fence stays shared (B's install
+    /// raises it; A's prior fence is then `TurnLeaseLost` — Soft residual).
+    /// Durable steps / end_turn address the holder's Agent slot.
     #[test]
-    fn begin_turn_lease_per_session_addresses_lease_agent() {
+    fn begin_turn_lease_per_agent_both_parallel_safe() {
         let rt = Runtime::new();
         let a = rt.store().create_agent("a", "");
         let b = rt.store().create_agent("b", "");
@@ -2508,30 +2550,80 @@ mod tests {
         rt.keep(sid, b.id, codex()).unwrap();
         opt_in(&rt, sid, &[a.id, b.id]);
         let (ta, fa, ba) = rt.begin_turn(sid, a.id, "ha".into()).unwrap();
-        let lease = rt.turn_lease(sid).unwrap().unwrap();
-        assert_eq!((lease.agent, lease.turn_id, lease.fence), (a.id, ta, fa));
+        let lease_a = rt.turn_lease_of(sid, a.id).unwrap().unwrap();
+        assert_eq!(
+            (lease_a.agent, lease_a.turn_id, lease_a.fence),
+            (a.id, ta, fa)
+        );
+
+        // B leases concurrently — no LiveTurnOpen / Waiting from A's slot.
+        let (tb, fb, bb) = rt.begin_turn(sid, b.id, "hb".into()).unwrap();
+        assert_ne!(ba, bb);
+        assert!(fb > fa, "shared fence raised on B's install");
+        let lease_b = rt.turn_lease_of(sid, b.id).unwrap().unwrap();
+        assert_eq!((lease_b.agent, lease_b.turn_id), (b.id, tb));
+        assert_eq!(
+            lease_slot_of(&rt, sid, a.id),
+            Some((a.id, Some(HolderId::new("ha")), ta)),
+            "A's live lease stays in A's slot"
+        );
+        assert_eq!(
+            lease_slot_of(&rt, sid, b.id),
+            Some((b.id, Some(HolderId::new("hb")), tb)),
+            "B's live lease in B's slot"
+        );
+
+        // Soft shared-fence: A's prior fence is stale after B raised it.
+        assert!(matches!(
+            rt.durable_step(sid, "ha".into(), fa, ta, "s", || Ok("a".into())),
+            Err(Error::TurnLeaseLost)
+        ));
+        // B's fence is current.
+        rt.durable_step(sid, "hb".into(), fb, tb, "s", || Ok("b".into()))
+            .unwrap();
+        rt.end_turn(sid, "hb".into(), fb, false).unwrap();
+        assert!(rt.turn_lease_of(sid, b.id).unwrap().is_none());
+        // A's slot still live (stale fence); release_agent drops only A's slot.
+        assert_eq!(
+            lease_slot_of(&rt, sid, a.id),
+            Some((a.id, Some(HolderId::new("ha")), ta))
+        );
+        rt.release_agent(sid, a.id).unwrap();
+        assert_eq!(lease_slot_of(&rt, sid, a.id), None);
+        assert!(session.current_turn_of(b.id).unwrap().is_none());
+    }
+
+    /// Without ParallelSafe opt-in, the conflict gate still serializes:
+    /// B's `begin_turn` is `Waiting(TurnOpen)` while A's turn is open — not
+    /// because of a Session-wide lease slot (gone), but because the gate
+    /// refuses. A's lease slot is untouched.
+    #[test]
+    fn begin_turn_without_parallel_safe_still_serializes() {
+        let rt = Runtime::new();
+        let a = rt.store().create_agent("a", "");
+        let b = rt.store().create_agent("b", "");
+        let session = rt.create_session();
+        let sid = session.id();
+        rt.keep(sid, a.id, goose()).unwrap();
+        rt.keep(sid, b.id, codex()).unwrap();
+        let (ta, fa, _) = rt.begin_turn(sid, a.id, "ha".into()).unwrap();
+        let before = session.events().unwrap().len();
         assert!(matches!(
             rt.begin_turn(sid, b.id, "hb".into()),
-            Err(Error::LiveTurnOpen)
+            Err(Error::Waiting(WaitReason::TurnOpen))
         ));
-        let evs = rt.wake(sid, b.id, Wake::Timer).unwrap();
-        assert_eq!(turn_starts_of(&evs, b.id), 1);
-        let tb_wake = session.current_turn_of(b.id).unwrap().unwrap();
-
-        rt.durable_step(sid, "ha".into(), fa, ta, "s", || Ok("a".into()))
-            .unwrap();
+        assert_eq!(session.events().unwrap().len(), before, "nothing written");
+        assert_eq!(session.bindings().unwrap().len(), 1, "B never claimed");
+        assert_eq!(
+            lease_slot_of(&rt, sid, a.id),
+            Some((a.id, Some(HolderId::new("ha")), ta)),
+            "A's lease intact"
+        );
+        assert_eq!(lease_slot_of(&rt, sid, b.id), None);
         rt.end_turn(sid, "ha".into(), fa, false).unwrap();
-        assert!(session.current_turn_of(a.id).unwrap().is_none());
-        assert_eq!(session.current_turn_of(b.id).unwrap(), Some(tb_wake));
-
-        // B adopts its wake-opened turn under a raised fence.
-        let (tb, fb, bb) = rt.begin_turn(sid, b.id, "hb".into()).unwrap();
-        assert_eq!(tb, tb_wake);
-        assert!(fb > fa);
-        assert_ne!(bb, ba);
-        assert_eq!(rt.turn_lease(sid).unwrap().unwrap().agent, b.id);
-        rt.end_turn(sid, "hb".into(), fb, false).unwrap();
-        assert!(session.current_turns().unwrap().is_empty());
+        let (tb, _, _) = rt.begin_turn(sid, b.id, "hb".into()).unwrap();
+        assert_ne!(tb, ta);
+        assert_eq!(rt.turn_lease_of(sid, b.id).unwrap().unwrap().agent, b.id);
     }
 
     /// resume_interrupted_turn takes the Agent: it reclaims that Agent's
@@ -2553,7 +2645,7 @@ mod tests {
         let (t, _, _) = rt.resume_interrupted_turn(sid, b.id, "h2".into()).unwrap();
         assert_eq!(t, tb);
         assert_ne!(t, ta);
-        assert_eq!(rt.turn_lease(sid).unwrap().unwrap().agent, b.id);
+        assert_eq!(rt.turn_lease_of(sid, b.id).unwrap().unwrap().agent, b.id);
     }
 
     /// Resume-lease-by-Agent fixture: A and B kept (parallel-safe, disjoint),
@@ -2603,131 +2695,116 @@ mod tests {
             .count()
     }
 
-    /// Raw lease slot (live or interrupted). `turn_lease()` hides interrupted
-    /// (`holder: None`) as `None`, so tests that pin "refuse keeps the slot"
-    /// must peek here.
-    fn lease_slot(rt: &Runtime, sid: SessionId) -> Option<(AgentId, Option<HolderId>, u64)> {
+    /// Raw per-Agent lease slot (live or interrupted). `turn_lease_of` hides
+    /// interrupted (`holder: None`) as `None`, so tests that pin "other
+    /// Agent's slot stays" must peek here — not `turn_lease().is_none()`.
+    fn lease_slot_of(
+        rt: &Runtime,
+        sid: SessionId,
+        agent: AgentId,
+    ) -> Option<(AgentId, Option<HolderId>, u64)> {
         rt.lock_kept().unwrap().get(&sid).and_then(|k| {
-            k.lease
-                .as_ref()
+            k.leases
+                .get(&agent)
                 .map(|l| (l.agent, l.holder.clone(), l.turn_id))
         })
     }
 
-    /// Resume-lease-by-Agent: under concurrent turns, A's
-    /// `resume_interrupted_turn` refuses B's interrupted lease
-    /// (`Waiting(TurnOpen)`) and writes nothing — no event, no fence raise,
-    /// no turn-map rewrite, no finalize of either Agent's ToolCall, and
-    /// B's interrupted lease stays in the slot. A second A resume and A's
-    /// `begin_turn` still refuse. B then resumes its own lease; once B's
-    /// lease clears, A resumes its own open turn.
+    /// Per-Agent-lease + #51: A's resume/begin while B holds an interrupted
+    /// lease in **B's** slot succeeds for A (own slot) and must leave B's
+    /// raw slot intact (`(agent=B, holder=None, turn_id=tb)`). A mutant that
+    /// clears B's slot on A's path fails these asserts. B then resumes its
+    /// own lease; A's ToolCall is untouched until A resumes.
     #[test]
-    fn resume_refuses_other_agents_interrupted_lease() {
+    fn resume_leaves_other_agents_interrupted_lease_in_its_slot() {
         let (rt, session, a, b, ta, tb, fb) = b_interrupted_lease_a_concurrent();
         let sid = session.id();
-        let before = session.events().unwrap().len();
         let fence_before = session.turn_fence().unwrap();
         let turns_before = session.current_turns().unwrap();
 
-        assert!(matches!(
-            rt.resume_interrupted_turn(sid, a.id, "steal".into()),
-            Err(Error::Waiting(WaitReason::TurnOpen))
-        ));
-        assert_eq!(session.events().unwrap().len(), before, "nothing written");
+        // A adopts its own open turn into A's slot — B's interrupted lease
+        // stays in B's slot (no cross-Agent steal).
+        let (t, fa, _) = rt.resume_interrupted_turn(sid, a.id, "ha".into()).unwrap();
+        assert_eq!(t, ta);
+        assert!(fa > fence_before);
         assert_eq!(
-            session.turn_fence().unwrap(),
-            fence_before,
-            "no fence raise"
-        );
-        assert_eq!(
-            session.current_turns().unwrap(),
-            turns_before,
-            "turn map unchanged"
-        );
-        // Pin the slot itself: `turn_lease().is_none()` also matches an empty
-        // slot, so a mutant that refuses but clears `kept.lease` would pass
-        // that check and reopen the #47 steal on A's next resume/begin_turn.
-        assert_eq!(
-            lease_slot(&rt, sid),
+            lease_slot_of(&rt, sid, b.id),
             Some((b.id, None, tb)),
-            "B's interrupted lease stays in the slot"
+            "B's interrupted lease stays in B's slot"
         );
-        assert!(
-            rt.turn_lease(sid).unwrap().is_none(),
-            "holder still dropped"
+        assert_eq!(
+            lease_slot_of(&rt, sid, a.id),
+            Some((a.id, Some(HolderId::new("ha")), ta)),
+            "A's live lease in A's slot"
         );
-        assert_eq!(interrupted_count(&session, "a-open"), 0);
+        assert_eq!(interrupted_count(&session, "a-open"), 1);
         assert_eq!(interrupted_count(&session, "b-open"), 0);
+        assert_eq!(session.current_turns().unwrap().len(), turns_before.len());
 
-        // Second A resume and A's begin_turn still refuse; slot untouched.
-        assert!(matches!(
-            rt.resume_interrupted_turn(sid, a.id, "steal2".into()),
-            Err(Error::Waiting(WaitReason::TurnOpen))
-        ));
-        assert!(matches!(
-            rt.begin_turn(sid, a.id, "steal3".into()),
-            Err(Error::Waiting(WaitReason::TurnOpen))
-        ));
-        assert_eq!(session.events().unwrap().len(), before);
-        assert_eq!(lease_slot(&rt, sid), Some((b.id, None, tb)));
-
-        // B's own resume still works: its turn, raised fence, B's orphan only.
+        // B's own resume still works; A's slot untouched.
         let (t, f2, _) = rt.resume_interrupted_turn(sid, b.id, "hb2".into()).unwrap();
         assert_eq!(t, tb);
+        assert!(f2 > fa);
         assert!(f2 > fb);
-        let lease = rt.turn_lease(sid).unwrap().unwrap();
-        assert_eq!((lease.agent, lease.holder), (b.id, HolderId::new("hb2")));
+        assert_eq!(
+            lease_slot_of(&rt, sid, a.id),
+            Some((a.id, Some(HolderId::new("ha")), ta)),
+            "A's slot intact across B resume"
+        );
         assert_eq!(interrupted_count(&session, "b-open"), 1);
-        assert_eq!(interrupted_count(&session, "a-open"), 0);
+        // Soft shared-fence: A's prior fence is stale after B raised it.
+        assert!(matches!(
+            rt.durable_step(sid, "ha".into(), fa, ta, "s", || Ok("a".into())),
+            Err(Error::TurnLeaseLost)
+        ));
         rt.durable_step(sid, "hb2".into(), f2, tb, "s", || Ok("b".into()))
             .unwrap();
         rt.end_turn(sid, "hb2".into(), f2, false).unwrap();
-
-        // No lease left: A resumes (adopts) its own open turn.
-        let (t, fa, _) = rt.resume_interrupted_turn(sid, a.id, "ha".into()).unwrap();
-        assert_eq!(t, ta);
-        assert!(fa > f2);
-        assert_eq!(rt.turn_lease(sid).unwrap().unwrap().agent, a.id);
-        assert_eq!(interrupted_count(&session, "a-open"), 1);
+        assert_eq!(lease_slot_of(&rt, sid, b.id), None);
     }
 
-    /// Resume-lease-by-Agent, adopt path: neither `begin_turn` nor a
-    /// re-keep (same Agent, new recipe) + `begin_turn` lets A adopt over
-    /// B's interrupted lease; nothing written. B's resume is unaffected.
+    /// Per-Agent-lease, adopt path: A's `begin_turn` adopts A's own open
+    /// turn while B's interrupted lease stays in B's slot. Host-restart
+    /// adopt (`release_agent` + keep + `begin_turn`) likewise leaves B's
+    /// raw slot intact. A mutant that clears B's slot on adopt fails the pin.
     #[test]
-    fn adopt_refuses_other_agents_interrupted_lease_after_rekeep() {
-        let (rt, session, a, b, _ta, tb, _fb) = b_interrupted_lease_a_concurrent();
+    fn adopt_leaves_other_agents_interrupted_lease_in_its_slot() {
+        let (rt, session, a, b, ta, tb, _fb) = b_interrupted_lease_a_concurrent();
         let sid = session.id();
-        let before = session.events().unwrap().len();
-        let fence_before = session.turn_fence().unwrap();
 
-        assert!(matches!(
-            rt.begin_turn(sid, a.id, "steal".into()),
-            Err(Error::Waiting(WaitReason::TurnOpen))
-        ));
+        let (t, fa, _) = rt.begin_turn(sid, a.id, "ha".into()).unwrap();
+        assert_eq!(t, ta);
+        assert_eq!(
+            lease_slot_of(&rt, sid, b.id),
+            Some((b.id, None, tb)),
+            "B's interrupted lease stays in B's slot"
+        );
+        rt.end_turn(sid, "ha".into(), fa, false).unwrap();
+        assert_eq!(lease_slot_of(&rt, sid, a.id), None);
+        assert_eq!(lease_slot_of(&rt, sid, b.id), Some((b.id, None, tb)));
+
+        // Host-restart adopt: release_agent drops A's (empty) slot only;
+        // re-keep + begin_turn would open a fresh turn (A's prior turn ended).
+        // Pin B across release_agent(A) + keep(A).
+        rt.release_agent(sid, a.id).unwrap();
+        assert_eq!(
+            lease_slot_of(&rt, sid, b.id),
+            Some((b.id, None, tb)),
+            "release_agent(A) does not clear B's slot"
+        );
         rt.keep(sid, a.id, codex()).unwrap();
-        assert!(matches!(
-            rt.begin_turn(sid, a.id, "steal".into()),
-            Err(Error::Waiting(WaitReason::TurnOpen))
-        ));
-        assert!(matches!(
-            rt.resume_interrupted_turn(sid, a.id, "steal".into()),
-            Err(Error::Waiting(WaitReason::TurnOpen))
-        ));
-        assert_eq!(session.events().unwrap().len(), before, "nothing written");
-        assert_eq!(session.turn_fence().unwrap(), fence_before);
-        assert_eq!(interrupted_count(&session, "a-open"), 0);
+        assert_eq!(lease_slot_of(&rt, sid, b.id), Some((b.id, None, tb)));
         assert_eq!(interrupted_count(&session, "b-open"), 0);
 
         let (t, _, _) = rt.resume_interrupted_turn(sid, b.id, "hb2".into()).unwrap();
         assert_eq!(t, tb);
-        assert_eq!(rt.turn_lease(sid).unwrap().unwrap().agent, b.id);
+        assert_eq!(rt.turn_lease_of(sid, b.id).unwrap().unwrap().agent, b.id);
     }
 
-    /// Resume-lease-by-Agent, own lease: A's interrupted lease is resumable
-    /// by A while B runs a concurrent (un-leased) turn; B cannot take it
-    /// (slot stays A's interrupted lease; second B resume / B begin_turn
-    /// still refuse), and A's resume finalizes only A's orphan.
+    /// Per-Agent-lease, own lease: A's interrupted lease is resumable by A
+    /// while B runs a concurrent turn. B's `begin_turn` installs B's own
+    /// slot alongside; A's raw interrupted slot stays. A's resume finalizes
+    /// only A's orphan; B's slot remains.
     #[test]
     fn resume_own_interrupted_lease_under_concurrent_turn() {
         let rt = Runtime::new();
@@ -2753,49 +2830,89 @@ mod tests {
                 .unwrap();
         }
         rt.end_turn(sid, "ha1".into(), fa, true).unwrap();
-        let before = session.events().unwrap().len();
         let turns_before = session.current_turns().unwrap();
 
-        assert!(matches!(
-            rt.resume_interrupted_turn(sid, b.id, "steal".into()),
-            Err(Error::Waiting(WaitReason::TurnOpen))
-        ));
+        // B begin_turn takes B's own slot; A's interrupted lease stays.
+        let (tb2, fb, _) = rt.begin_turn(sid, b.id, "hb".into()).unwrap();
+        assert_eq!(tb2, tb);
         assert_eq!(
-            lease_slot(&rt, sid),
+            lease_slot_of(&rt, sid, a.id),
             Some((a.id, None, ta)),
-            "A's interrupted lease stays in the slot"
+            "A's interrupted lease stays in A's slot"
         );
-        assert_eq!(session.events().unwrap().len(), before);
         assert_eq!(
-            session.current_turns().unwrap(),
-            turns_before,
-            "turn map unchanged"
+            lease_slot_of(&rt, sid, b.id),
+            Some((b.id, Some(HolderId::new("hb")), tb))
         );
+        assert_eq!(session.current_turns().unwrap().len(), turns_before.len());
         assert_eq!(interrupted_count(&session, "a-open"), 0);
-        // Second B resume and B's begin_turn still refuse over A's slot.
+
+        // Second B begin_turn is LiveTurnOpen on B's own slot; A's slot intact.
         assert!(matches!(
-            rt.resume_interrupted_turn(sid, b.id, "steal2".into()),
-            Err(Error::Waiting(WaitReason::TurnOpen))
+            rt.begin_turn(sid, b.id, "steal".into()),
+            Err(Error::LiveTurnOpen)
         ));
-        assert!(matches!(
-            rt.begin_turn(sid, b.id, "steal3".into()),
-            Err(Error::Waiting(WaitReason::TurnOpen))
-        ));
-        assert_eq!(lease_slot(&rt, sid), Some((a.id, None, ta)));
-        assert_eq!(session.events().unwrap().len(), before);
+        assert_eq!(lease_slot_of(&rt, sid, a.id), Some((a.id, None, ta)));
+
+        rt.end_turn(sid, "hb".into(), fb, true).unwrap();
+        assert_eq!(
+            lease_slot_of(&rt, sid, b.id),
+            Some((b.id, None, tb)),
+            "B interrupted in B's slot"
+        );
 
         let (t, f2, _) = rt.resume_interrupted_turn(sid, a.id, "ha2".into()).unwrap();
         assert_eq!(t, ta);
         assert!(f2 > fa);
-        assert_eq!(rt.turn_lease(sid).unwrap().unwrap().agent, a.id);
+        assert_eq!(rt.turn_lease_of(sid, a.id).unwrap().unwrap().agent, a.id);
         assert_eq!(interrupted_count(&session, "a-open"), 1);
-        assert_eq!(interrupted_count(&session, "b-live"), 0);
+        assert_eq!(
+            lease_slot_of(&rt, sid, b.id),
+            Some((b.id, None, tb)),
+            "B's interrupted lease intact across A's resume"
+        );
         assert_eq!(session.current_turn_of(b.id).unwrap(), Some(tb));
-        // The old holder's fence is dead.
+        // The old holder's fence/holder is dead.
         assert!(matches!(
             rt.durable_step(sid, "ha1".into(), fa, ta, "s", || Ok("x".into())),
             Err(Error::SessionNotOwned)
         ));
+    }
+
+    /// Refuse (LiveTurnOpen on own live lease) must not clear another Agent's
+    /// interrupted lease slot — mutant-kill with raw `lease_slot_of`, not
+    /// `turn_lease().is_none()` alone.
+    #[test]
+    fn refuse_live_turn_leaves_other_agents_interrupted_lease() {
+        let (rt, session, a, b, ta, tb, _fb) = b_interrupted_lease_a_concurrent();
+        let sid = session.id();
+        let (_t, _fa, _) = rt.begin_turn(sid, a.id, "ha".into()).unwrap();
+        assert_eq!(lease_slot_of(&rt, sid, b.id), Some((b.id, None, tb)));
+        assert_eq!(
+            lease_slot_of(&rt, sid, a.id),
+            Some((a.id, Some(HolderId::new("ha")), ta))
+        );
+        let before = session.events().unwrap().len();
+        let fence_before = session.turn_fence().unwrap();
+        assert!(matches!(
+            rt.resume_interrupted_turn(sid, a.id, "steal".into()),
+            Err(Error::LiveTurnOpen)
+        ));
+        assert!(matches!(
+            rt.begin_turn(sid, a.id, "steal2".into()),
+            Err(Error::LiveTurnOpen)
+        ));
+        assert_eq!(session.events().unwrap().len(), before, "nothing written");
+        assert_eq!(session.turn_fence().unwrap(), fence_before);
+        assert_eq!(
+            lease_slot_of(&rt, sid, b.id),
+            Some((b.id, None, tb)),
+            "B's interrupted lease stays in B's slot across A's refuse"
+        );
+        assert_eq!(
+            lease_slot_of(&rt, sid, a.id),
+            Some((a.id, Some(HolderId::new("ha")), ta))
+        );
     }
 
     /// Fail-closed default: two kept Agents without a parallel-safe
