@@ -2603,17 +2603,31 @@ mod tests {
             .count()
     }
 
+    /// Raw lease slot (live or interrupted). `turn_lease()` hides interrupted
+    /// (`holder: None`) as `None`, so tests that pin "refuse keeps the slot"
+    /// must peek here.
+    fn lease_slot(rt: &Runtime, sid: SessionId) -> Option<(AgentId, Option<HolderId>, u64)> {
+        rt.lock_kept().unwrap().get(&sid).and_then(|k| {
+            k.lease
+                .as_ref()
+                .map(|l| (l.agent, l.holder.clone(), l.turn_id))
+        })
+    }
+
     /// Resume-lease-by-Agent: under concurrent turns, A's
     /// `resume_interrupted_turn` refuses B's interrupted lease
     /// (`Waiting(TurnOpen)`) and writes nothing — no event, no fence raise,
-    /// no finalize of either Agent's ToolCall. B then resumes its own
-    /// lease; once B's lease clears, A resumes its own open turn.
+    /// no turn-map rewrite, no finalize of either Agent's ToolCall, and
+    /// B's interrupted lease stays in the slot. A second A resume and A's
+    /// `begin_turn` still refuse. B then resumes its own lease; once B's
+    /// lease clears, A resumes its own open turn.
     #[test]
     fn resume_refuses_other_agents_interrupted_lease() {
         let (rt, session, a, b, ta, tb, fb) = b_interrupted_lease_a_concurrent();
         let sid = session.id();
         let before = session.events().unwrap().len();
         let fence_before = session.turn_fence().unwrap();
+        let turns_before = session.current_turns().unwrap();
 
         assert!(matches!(
             rt.resume_interrupted_turn(sid, a.id, "steal".into()),
@@ -2625,12 +2639,37 @@ mod tests {
             fence_before,
             "no fence raise"
         );
+        assert_eq!(
+            session.current_turns().unwrap(),
+            turns_before,
+            "turn map unchanged"
+        );
+        // Pin the slot itself: `turn_lease().is_none()` also matches an empty
+        // slot, so a mutant that refuses but clears `kept.lease` would pass
+        // that check and reopen the #47 steal on A's next resume/begin_turn.
+        assert_eq!(
+            lease_slot(&rt, sid),
+            Some((b.id, None, tb)),
+            "B's interrupted lease stays in the slot"
+        );
         assert!(
             rt.turn_lease(sid).unwrap().is_none(),
-            "B's lease stays interrupted"
+            "holder still dropped"
         );
         assert_eq!(interrupted_count(&session, "a-open"), 0);
         assert_eq!(interrupted_count(&session, "b-open"), 0);
+
+        // Second A resume and A's begin_turn still refuse; slot untouched.
+        assert!(matches!(
+            rt.resume_interrupted_turn(sid, a.id, "steal2".into()),
+            Err(Error::Waiting(WaitReason::TurnOpen))
+        ));
+        assert!(matches!(
+            rt.begin_turn(sid, a.id, "steal3".into()),
+            Err(Error::Waiting(WaitReason::TurnOpen))
+        ));
+        assert_eq!(session.events().unwrap().len(), before);
+        assert_eq!(lease_slot(&rt, sid), Some((b.id, None, tb)));
 
         // B's own resume still works: its turn, raised fence, B's orphan only.
         let (t, f2, _) = rt.resume_interrupted_turn(sid, b.id, "hb2".into()).unwrap();
@@ -2686,8 +2725,9 @@ mod tests {
     }
 
     /// Resume-lease-by-Agent, own lease: A's interrupted lease is resumable
-    /// by A while B runs a concurrent (un-leased) turn; B cannot take it,
-    /// and A's resume finalizes only A's orphan.
+    /// by A while B runs a concurrent (un-leased) turn; B cannot take it
+    /// (slot stays A's interrupted lease; second B resume / B begin_turn
+    /// still refuse), and A's resume finalizes only A's orphan.
     #[test]
     fn resume_own_interrupted_lease_under_concurrent_turn() {
         let rt = Runtime::new();
@@ -2713,12 +2753,36 @@ mod tests {
                 .unwrap();
         }
         rt.end_turn(sid, "ha1".into(), fa, true).unwrap();
+        let before = session.events().unwrap().len();
+        let turns_before = session.current_turns().unwrap();
 
         assert!(matches!(
             rt.resume_interrupted_turn(sid, b.id, "steal".into()),
             Err(Error::Waiting(WaitReason::TurnOpen))
         ));
+        assert_eq!(
+            lease_slot(&rt, sid),
+            Some((a.id, None, ta)),
+            "A's interrupted lease stays in the slot"
+        );
+        assert_eq!(session.events().unwrap().len(), before);
+        assert_eq!(
+            session.current_turns().unwrap(),
+            turns_before,
+            "turn map unchanged"
+        );
         assert_eq!(interrupted_count(&session, "a-open"), 0);
+        // Second B resume and B's begin_turn still refuse over A's slot.
+        assert!(matches!(
+            rt.resume_interrupted_turn(sid, b.id, "steal2".into()),
+            Err(Error::Waiting(WaitReason::TurnOpen))
+        ));
+        assert!(matches!(
+            rt.begin_turn(sid, b.id, "steal3".into()),
+            Err(Error::Waiting(WaitReason::TurnOpen))
+        ));
+        assert_eq!(lease_slot(&rt, sid), Some((a.id, None, ta)));
+        assert_eq!(session.events().unwrap().len(), before);
 
         let (t, f2, _) = rt.resume_interrupted_turn(sid, a.id, "ha2".into()).unwrap();
         assert_eq!(t, ta);
