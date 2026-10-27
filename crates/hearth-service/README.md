@@ -7,7 +7,7 @@ Local HTTP + WebSocket on 0.0.0.0:8787. Bind address only; no public URL is clai
 - POST /sessions {"folder":"/optional/existing/path"}
 - GET /sessions/:id
 - POST /sessions/:id/join {"user":"cheng"} or {"agent":"tag"}
-- POST /sessions/:id/events {"user":"cheng","message":"..."} (text is an alias). Goes through Runtime::wake_each_kept (every kept Agent; one UserMessage). 409 if every Agent waits; the log is unchanged.
+- POST /sessions/:id/events {"user":"cheng","message":"..."} (text is an alias). When Host wires are installed for the Session, steers through wake_each_kept_through_host_wake (per-Agent host_wake + one shared UserMessage; Service-host-wake-each). Otherwise Goose stand-in uses Runtime::wake_each_kept. 409 if every Agent waits; the log is unchanged.
 - GET /sessions/:id/events
 - GET /agents/local PATH lookup only. --version only if the binary exists. Missing CLIs have path null. No session CLI is spawned.
 

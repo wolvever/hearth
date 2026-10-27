@@ -17,7 +17,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
+mod host_steer;
 mod probe;
+pub use host_steer::{AgentHostWire, HostWireMap, SteerError, SteerOutcome};
 pub use probe::{probe_local, CliStatus};
 
 #[derive(Clone)]
@@ -28,10 +30,13 @@ struct LiveEvent {
 
 #[derive(Clone)]
 pub struct AppState {
-    runtime: Runtime,
+    pub(crate) runtime: Runtime,
     names: Arc<Mutex<NameMap>>,
     clis: Vec<CliStatus>,
     live: broadcast::Sender<LiveEvent>,
+    /// Host wires keyed by `(Session, Agent)` for
+    /// [`wake_each_kept_through_host_wake`] steer (Service-host-wake-each).
+    pub(crate) host_wires: Arc<Mutex<HostWireMap>>,
 }
 
 #[derive(Default)]
@@ -48,7 +53,39 @@ impl AppState {
             names: Arc::new(Mutex::new(NameMap::default())),
             clis,
             live,
+            host_wires: Arc::new(Mutex::new(HostWireMap::default())),
         }
+    }
+
+    /// Install a Host wire for `(session, agent)` so HTTP/WS steer routes
+    /// through [`hearth_agent_wire::wake_each_kept_through_host_wake`].
+    pub fn install_host_wire(
+        &self,
+        session: SessionId,
+        agent: hearth::AgentId,
+        wire: AgentHostWire,
+    ) -> Result<(), StatusCode> {
+        self.host_wires
+            .lock()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .insert(session, agent, wire);
+        Ok(())
+    }
+
+    /// Override `OldWire` evidence on an installed Host wire (Must remint floors).
+    pub fn set_host_old_wire(
+        &self,
+        session: SessionId,
+        agent: hearth::AgentId,
+        old_wire: hearth_agent_wire::OldWire,
+    ) -> Result<(), StatusCode> {
+        let mut g = self
+            .host_wires
+            .lock()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let w = g.get_mut(session, agent).ok_or(StatusCode::NOT_FOUND)?;
+        w.old_wire = old_wire;
+        Ok(())
     }
 
     fn store(&self) -> &InMemory {
@@ -271,8 +308,12 @@ fn ensure_kept_agents(st: &AppState, id: SessionId) -> Result<Vec<hearth::AgentI
 }
 
 /// Shared steer used by HTTP POST /events and WS `{"type":"message",...}`.
-/// Admit only through [`Runtime::wake_each_kept`]: every kept Agent is
-/// addressed (one shared UserMessage). Wait is 409. Do not append on wait.
+///
+/// When Host wires are installed for the Session, admit through
+/// [`hearth_agent_wire::wake_each_kept_through_host_wake`] (one shared
+/// UserMessage; per-Agent `host_wake`; Waiting skips peers). Otherwise the
+/// Goose stand-in uses [`Runtime::wake_each_kept`] (ClaimBinding). Wait is
+/// 409. Do not append on wait.
 fn apply_user_message(
     st: &AppState,
     id: SessionId,
@@ -287,13 +328,11 @@ fn apply_user_message(
     let uid = *names.users.get(&name).ok_or(StatusCode::NOT_FOUND)?;
     drop(names);
     let _agents = ensure_kept_agents(st, id)?;
-    match st
-        .runtime
-        .wake_each_kept(id, Wake::UserQuery { user: uid, text })
-    {
-        Ok(per_agent) => {
+    match host_steer::steer_each_kept(st, id, Wake::UserQuery { user: uid, text }) {
+        Ok(outcome) => {
+            let per_agent = outcome.woke();
             let mut um: Option<EventOut> = None;
-            for (_agent, evs) in &per_agent {
+            for (_agent, evs) in per_agent {
                 for e in evs {
                     let out = event_out(e);
                     if matches!(e.body, EventBody::UserMessage { .. }) {
@@ -310,13 +349,15 @@ fn apply_user_message(
             })
             .ok_or(StatusCode::INTERNAL_SERVER_ERROR)
         }
-        Err(hearth::Error::Waiting(_))
-        | Err(hearth::Error::NotKept(_))
-        | Err(hearth::Error::AgentNotKept(..)) => Err(StatusCode::CONFLICT),
-        Err(hearth::Error::NotMember) | Err(hearth::Error::UnknownUser(_)) => {
-            Err(StatusCode::FORBIDDEN)
+        Err(SteerError::Waiting(_)) => Err(StatusCode::CONFLICT),
+        Err(SteerError::Runtime(hearth::Error::Waiting(_)))
+        | Err(SteerError::Runtime(hearth::Error::NotKept(_)))
+        | Err(SteerError::Runtime(hearth::Error::AgentNotKept(..))) => Err(StatusCode::CONFLICT),
+        Err(SteerError::Runtime(hearth::Error::NotMember))
+        | Err(SteerError::Runtime(hearth::Error::UnknownUser(_))) => Err(StatusCode::FORBIDDEN),
+        Err(SteerError::Lock) | Err(SteerError::Runtime(_)) | Err(SteerError::Remint(_)) => {
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
-        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
 
@@ -752,6 +793,277 @@ mod tests {
 
         let _ = a.close(None).await;
         let _ = b.close(None).await;
+    }
+
+    /// Service-host-wake-each Must floor helper: two ParallelSafe Agents with
+    /// Host Bindings + RemintSession + Fake wires installed on AppState.
+    fn install_two_parallel_safe_host_wires(
+        st: &AppState,
+        sid: SessionId,
+        lost: Option<hearth_agent_wire::OldWire>,
+    ) -> (hearth::AgentId, hearth::AgentId, hearth::Place) {
+        use hearth::{Host, ParallelSafe, PlaceAttach};
+        use hearth_agent_wire::{LiveCaps as WireCaps, RemintSession};
+
+        apply_join(st, sid, Some("cheng".into()), None).unwrap();
+        apply_join(st, sid, None, Some("alpha".into())).unwrap();
+        apply_join(st, sid, None, Some("beta".into())).unwrap();
+        let agents = st.runtime.kept_agents(sid);
+        assert_eq!(agents.len(), 2);
+        let (a, b) = (agents[0], agents[1]);
+        for (i, ag) in [a, b].into_iter().enumerate() {
+            st.runtime
+                .set_parallel_safe(sid, ag, Some(ParallelSafe::paths([format!("agent-{i}")])))
+                .unwrap();
+        }
+
+        let session = st.store().session(sid).unwrap();
+        let place = hearth::Place::local_dir(
+            std::env::temp_dir().to_string_lossy().as_ref(),
+            PlaceAttach::MustExist,
+        );
+        session.attach_place(place.clone()).unwrap();
+
+        let names = st.names.lock().unwrap();
+        let uid = *names.users.get("cheng").unwrap();
+        drop(names);
+
+        let caps = WireCaps {
+            resume: true,
+            cancel: true,
+            close: true,
+            load_session: false,
+        };
+        for (ag, resume_id) in [(a, "S-a"), (b, "S-b")] {
+            let host = Host::from_bind("acp", Some(resume_id.into()), None);
+            session.rebind(None, ag, host).unwrap();
+            let remint = RemintSession::on_host_session(session.clone(), ag, uid, resume_id, caps)
+                .expect("remint session");
+            let wire = match &lost {
+                Some(w) => AgentHostWire::fake_lost(remint, Some(place.clone()), w.clone()),
+                None => AgentHostWire::fake_live(remint, Some(place.clone())),
+            };
+            st.install_host_wire(sid, ag, wire).unwrap();
+        }
+        (a, b, place)
+    }
+
+    /// Must: HTTP steer through host_wake fan-out → both ParallelSafe Agents
+    /// LiveInTurn; one shared UserMessage. First-only mutant fails.
+    #[tokio::test]
+    async fn http_steer_through_host_wake_both_parallel_safe_live_in_turn() {
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let id = sid.0.to_string();
+        let (a, b, _) = install_two_parallel_safe_host_wires(&st, sid, None);
+
+        let app = router(st.clone());
+        let (code, body) = call(
+            app,
+            Request::post(format!("/sessions/{id}/events"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"user":"cheng","message":"hi-host"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert!(body.contains("hi-host"));
+
+        let session = st.store().session(sid).unwrap();
+        assert!(
+            session.current_turn_of(a).unwrap().is_some(),
+            "Agent A LiveInTurn (first-only mutant fails)"
+        );
+        assert!(
+            session.current_turn_of(b).unwrap().is_some(),
+            "Agent B LiveInTurn (first-only mutant fails)"
+        );
+        assert_eq!(
+            st.runtime.classify(sid, a).unwrap(),
+            hearth::Liveness::LiveInTurn
+        );
+        assert_eq!(
+            st.runtime.classify(sid, b).unwrap(),
+            hearth::Liveness::LiveInTurn
+        );
+        let ums = session
+            .events()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e.body, EventBody::UserMessage { .. }))
+            .count();
+        assert_eq!(ums, 1, "one shared UserMessage");
+    }
+
+    /// Must: Fake proven-lost wires → HTTP steer remints both Agents
+    /// (mint+1 + session/resume each); no load/new; independent lease/fence;
+    /// no cross-Agent Binding steal.
+    #[tokio::test]
+    async fn http_steer_through_host_wake_remints_both_independent_leases_fences() {
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let id = sid.0.to_string();
+        let (a, b, _) = install_two_parallel_safe_host_wires(
+            &st,
+            sid,
+            Some(hearth_agent_wire::OldWire::Exited(1)),
+        );
+
+        let bid_a_before = st.runtime.binding_for(sid, a).unwrap();
+        let bid_b_before = st.runtime.binding_for(sid, b).unwrap();
+        let before_mints = st
+            .store()
+            .session(sid)
+            .unwrap()
+            .events()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e.body, EventBody::BindingAttached { .. }))
+            .count();
+
+        let app = router(st.clone());
+        let (code, body) = call(
+            app,
+            Request::post(format!("/sessions/{id}/events"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"user":"cheng","message":"remint-both"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "body={body}");
+        assert!(body.contains("remint-both"));
+
+        let session = st.store().session(sid).unwrap();
+        assert!(session.current_turn_of(a).unwrap().is_some());
+        assert!(session.current_turn_of(b).unwrap().is_some());
+        let after_mints = session
+            .events()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e.body, EventBody::BindingAttached { .. }))
+            .count();
+        assert_eq!(
+            after_mints,
+            before_mints + 2,
+            "exactly one mint per Agent (remint)"
+        );
+
+        let bid_a = st.runtime.binding_for(sid, a).unwrap();
+        let bid_b = st.runtime.binding_for(sid, b).unwrap();
+        assert_ne!(bid_a, bid_a_before, "A reminted");
+        assert_ne!(bid_b, bid_b_before, "B reminted");
+        assert_ne!(bid_a, bid_b, "no cross-Agent Binding steal");
+
+        // Attach per-Agent leases onto wake-opened turns (compose begin_turn
+        // after wake — same as Concurrent-*-remint floors).
+        let (ta, fa, _) = st
+            .runtime
+            .begin_turn(sid, a, hearth::HolderId::new("ha"))
+            .expect("lease A");
+        let (tb, fb, _) = st
+            .runtime
+            .begin_turn(sid, b, hearth::HolderId::new("hb"))
+            .expect("lease B");
+        assert_ne!(ta, tb);
+        assert_eq!(session.turn_fence_of(a).unwrap(), fa);
+        assert_eq!(session.turn_fence_of(b).unwrap(), fb);
+        for (agent, holder, turn, fence) in [(a, "ha", ta, fa), (b, "hb", tb, fb)] {
+            let lease = st
+                .runtime
+                .turn_lease_of(sid, agent)
+                .unwrap()
+                .expect("live lease");
+            assert_eq!(
+                (lease.agent, lease.holder, lease.turn_id, lease.fence),
+                (agent, hearth::HolderId::new(holder), turn, fence),
+                "raw turn_lease_of pin (not is_none)"
+            );
+        }
+        // A's fence raise must not steal B's lease/fence.
+        st.runtime.end_turn(sid, "ha".into(), fa, true).unwrap();
+        let (ta2, fa2, _) = st
+            .runtime
+            .resume_interrupted_turn(sid, a, "ha2".into())
+            .unwrap();
+        assert_eq!(ta2, ta);
+        assert!(fa2 > fa, "A's own fence must rise on resume");
+        let lease_b = st.runtime.turn_lease_of(sid, b).unwrap().expect("B live");
+        assert_eq!(
+            (
+                lease_b.agent,
+                lease_b.holder,
+                lease_b.turn_id,
+                lease_b.fence
+            ),
+            (b, hearth::HolderId::new("hb"), tb, fb),
+            "turn_lease_of(B).fence pinned after A's raise — no steal"
+        );
+
+        // session/resume each; never load/new
+        let mut wires = st.host_wires.lock().unwrap();
+        for agent in [a, b] {
+            let w = wires.get_mut(sid, agent).unwrap();
+            let raw = std::str::from_utf8(w.new.stdin_log().unwrap()).unwrap();
+            assert!(
+                raw.contains("session/resume"),
+                "Agent {agent:?} must session/resume; got {raw}"
+            );
+            assert!(
+                !raw.contains("session/load") && !raw.contains("session/new"),
+                "no load/new on {agent:?}: {raw}"
+            );
+        }
+    }
+
+    /// Must: Waiting / Unknown peer skips without aborting the other Agent
+    /// (tick semantics). Claim-before-record preserved (shared wake only for
+    /// the Agent that host_wake'd).
+    #[tokio::test]
+    async fn http_steer_through_host_wake_unknown_peer_skips_without_abort() {
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let id = sid.0.to_string();
+        let (a, b, _) = install_two_parallel_safe_host_wires(&st, sid, None);
+
+        // B: release Binding so classify needs claim; Unknown host_wake skips
+        // → AlreadyBound Waiting(NoBinding). A still ReuseLive + TurnStart.
+        let session = st.store().session(sid).unwrap();
+        let bid_b = st.runtime.binding_for(sid, b).unwrap();
+        session.unbind(bid_b).unwrap();
+        st.set_host_old_wire(sid, b, hearth_agent_wire::OldWire::Unknown)
+            .unwrap();
+
+        let app = router(st.clone());
+        let (code, body) = call(
+            app,
+            Request::post(format!("/sessions/{id}/events"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"user":"cheng","message":"skip-b"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "body={body}");
+        assert!(body.contains("skip-b"));
+
+        let session = st.store().session(sid).unwrap();
+        assert!(
+            session.current_turn_of(a).unwrap().is_some(),
+            "A still wakes"
+        );
+        assert!(
+            session.current_turn_of(b).unwrap().is_none(),
+            "B skipped (Unknown / NoBinding)"
+        );
+        let ums = session
+            .events()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e.body, EventBody::UserMessage { .. }))
+            .count();
+        assert_eq!(ums, 1, "Claim-before-record: one shared wake for A");
     }
 
     #[allow(clippy::result_large_err)] // tungstenite::Error is upstream; test-only helper

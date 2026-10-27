@@ -278,6 +278,7 @@ dependencies = [
  "axum",
  "futures-util",
  "hearth",
+ "hearth-agent-wire",
  "serde",
  "serde_json",
  "tokio",
