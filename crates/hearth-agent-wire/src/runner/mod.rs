@@ -5194,8 +5194,8 @@ mod tests {
     /// each (stable sessionId); no `session/load` / `session/new`; healthy HITL
     /// skips cancel-before-reattach (rehydrate-pending-permission); raw
     /// per-Agent `turn_lease_of` / `turn_fence_of` independent; no cross-Agent
-    /// Binding / ask steal. SoftExpiring / fleet / StdoutEof+permission twin
-    /// stay parked.
+    /// Binding / ask steal. SoftExpiring / fleet stay parked (StdoutEof+permission
+    /// Soft twin closed by Real-stdout-eof-concurrent-permission-remint).
     #[test]
     fn concurrent_real_cli_exit_through_host_wake_resurfaces_asks_independent_leases_fences() {
         let (rt, sid, uid, a, b, remint_a, remint_b, place) = shared_runtime_two_agents();
@@ -5421,6 +5421,314 @@ mod tests {
         assert!(matches!(
             &ums[0].body,
             hearth::EventBody::UserMessage { text, .. } if text == "hi-both-real-perm"
+        ));
+
+        // Attach per-Agent leases onto wake-opened turns; raw pins (not is_none).
+        let (ta, fa, _) = rt
+            .begin_turn(sid, a, hearth::HolderId::new("ha"))
+            .expect("lease A");
+        let (tb, fb, _) = rt
+            .begin_turn(sid, b, hearth::HolderId::new("hb"))
+            .expect("lease B");
+        assert_ne!(ta, tb);
+        assert_eq!(session.turn_fence_of(a).unwrap(), fa);
+        assert_eq!(session.turn_fence_of(b).unwrap(), fb);
+        let pin_lease = |agent, holder: &str, turn, fence| {
+            let lease = rt.turn_lease_of(sid, agent).unwrap().expect("live lease");
+            assert_eq!(
+                (lease.agent, lease.holder, lease.turn_id, lease.fence),
+                (agent, hearth::HolderId::new(holder), turn, fence),
+                "raw turn_lease_of pin (not is_none)"
+            );
+        };
+        pin_lease(a, "ha", ta, fa);
+        pin_lease(b, "hb", tb, fb);
+
+        // Parent pins survive lease attach / fence raise.
+        assert_eq!(
+            remint_a
+                .resurfaced_permissions()
+                .iter()
+                .map(|p| p.parent_tool_call_id.as_deref())
+                .collect::<Vec<_>>(),
+            [None]
+        );
+        assert_eq!(
+            remint_b
+                .resurfaced_permissions()
+                .iter()
+                .map(|p| p.parent_tool_call_id.as_deref())
+                .collect::<Vec<_>>(),
+            [Some("toolu_task")]
+        );
+
+        // A's fence raise must not steal B's lease/fence.
+        rt.end_turn(sid, "ha".into(), fa, true).unwrap();
+        let (ta2, fa2, _) = rt.resume_interrupted_turn(sid, a, "ha2".into()).unwrap();
+        assert_eq!(ta2, ta);
+        assert!(fa2 > fa, "A's own fence must rise on resume");
+        let lease_b = rt.turn_lease_of(sid, b).unwrap().expect("B live");
+        assert_eq!(
+            (
+                lease_b.agent,
+                lease_b.holder,
+                lease_b.turn_id,
+                lease_b.fence
+            ),
+            (b, hearth::HolderId::new("hb"), tb, fb),
+            "turn_lease_of(B).fence pinned after A's raise — no steal"
+        );
+        assert_eq!(session.turn_fence_of(b).unwrap(), fb);
+        rt.durable_step(sid, "hb".into(), fb, tb, "b-ok", || Ok("b".into()))
+            .unwrap();
+        assert!(matches!(
+            rt.durable_step(sid, "ha2".into(), fa, ta, "zombie", || {
+                panic!("zombie must not run")
+            }),
+            Err(hearth::Error::TurnLeaseLost)
+        ));
+        rt.durable_step(sid, "ha2".into(), fa2, ta, "a-ok", || Ok("a".into()))
+            .unwrap();
+    }
+
+    /// Real-stdout-eof-concurrent-permission-remint (#46–#66 Soft twin close):
+    /// extend #66 Real Exited + PermissionResurface floor + #65 Real StdoutEof
+    /// probe so **two** ParallelSafe Agents each carry mid-turn pending
+    /// permission asks (A controller unparented; B `parent_tool_call_id` via
+    /// Session/Host ask helpers — not Real CLI emitting asks), Real-probe
+    /// `OldWire::StdoutEof` (no Fake StdoutEof), then Host remint via
+    /// `wake_each_kept_through_host_wake` remints **both** → each
+    /// `PermissionResurface` + `AttachResume`; B parent preserved; A's
+    /// resurfaced ask survives B's remint; `session/resume` each (stable
+    /// sessionId); no `session/load` / `session/new`; healthy HITL skips
+    /// cancel-before-reattach (rehydrate-pending-permission); raw per-Agent
+    /// `turn_lease_of` / `turn_fence_of` independent; no cross-Agent Binding /
+    /// ask steal. SoftExpiring / fleet stay parked.
+    #[test]
+    fn concurrent_real_stdout_eof_through_host_wake_resurfaces_asks_independent_leases_fences() {
+        let (rt, sid, uid, a, b, remint_a, remint_b, place) = shared_runtime_two_agents();
+        for (ag, path) in [(a, "a"), (b, "b")] {
+            rt.set_parallel_safe(sid, ag, Some(hearth::ParallelSafe::paths([path])))
+                .expect("opt in");
+        }
+        let session = rt.store().session(sid).unwrap();
+        let before = binding_attached_count(&rt, sid);
+        let bid_a_before = rt.binding_for(sid, a).unwrap();
+        let bid_b_before = rt.binding_for(sid, b).unwrap();
+
+        // Mid-turn on RemintSession + pending asks (Session/Host helpers).
+        remint_a.begin_turn("mid-a");
+        remint_b.begin_turn("mid-b");
+        let ask_a = remint_a
+            .request_permission(RpcId::Num(1), Some("call_a"), "git log", perm_opts())
+            .unwrap();
+        let ask_b = remint_b
+            .request_permission_under(
+                RpcId::Num(1),
+                Some("toolu_sub"),
+                Some("toolu_task"),
+                "npm test",
+                perm_opts(),
+            )
+            .unwrap();
+        assert_eq!(ask_a.parent_tool_call_id, None);
+        assert_eq!(ask_b.parent_tool_call_id.as_deref(), Some("toolu_task"));
+        assert_eq!(remint_a.pending_permissions().len(), 1);
+        assert_eq!(remint_b.pending_permissions().len(), 1);
+        let sid_a = remint_a.agent_session_id();
+        let sid_b = remint_b.agent_session_id();
+
+        // Real stdout-EOF on each Agent (Must: no Fake StdoutEof injection).
+        let (mut old_a, wire_a) = spawn_and_probe_real_stdout_eof();
+        let (mut old_b, wire_b) = spawn_and_probe_real_stdout_eof();
+        let mut new_a = new_wire_fake();
+        let mut new_b = new_wire_fake();
+
+        let r = run_each_kept(
+            &rt,
+            sid,
+            hearth::Wake::UserQuery {
+                user: uid,
+                text: "hi-both-real-eof-perm".into(),
+            },
+            &remint_a,
+            &remint_b,
+            &place,
+            wire_a,
+            wire_b,
+            &mut old_a,
+            &mut new_a,
+            &mut old_b,
+            &mut new_b,
+        )
+        .expect("host wake each kept");
+        let WakeEachKeptThroughHost::Woke { hosts, woke } = r else {
+            panic!("expected Woke, got {r:?}");
+        };
+        assert_eq!(
+            hosts.iter().map(|(ag, _)| *ag).collect::<Vec<_>>(),
+            vec![a, b],
+            "host_wake keep order; first-only mutant fails"
+        );
+
+        let full_a = match &hosts[0] {
+            (ag, HostWake::Reminted(full)) if *ag == a => full,
+            other => panic!("expected A Reminted on Real StdoutEof, got {other:?}"),
+        };
+        let full_b = match &hosts[1] {
+            (ag, HostWake::Reminted(full)) if *ag == b => full,
+            other => panic!("expected B Reminted on Real StdoutEof, got {other:?}"),
+        };
+        assert!(
+            full_a.outcome.permission_resurfaced && !full_a.outcome.turn_interrupted,
+            "A PermissionResurface; healthy HITL no turn_interrupted"
+        );
+        assert!(
+            full_b.outcome.permission_resurfaced && !full_b.outcome.turn_interrupted,
+            "B PermissionResurface; healthy HITL no turn_interrupted"
+        );
+        assert!(
+            full_a
+                .outcome
+                .wire_actions
+                .contains(&WireAction::AttachResume),
+            "A AttachResume"
+        );
+        assert!(
+            full_b
+                .outcome
+                .wire_actions
+                .contains(&WireAction::AttachResume),
+            "B AttachResume"
+        );
+        // Rehydrate-pending-permission: do NOT cancel healthy HITL mid-ask
+        // (cancel-before-reattach orphan path stays #64/#65 floor).
+        for (label, full) in [("A", full_a.as_ref()), ("B", full_b.as_ref())] {
+            let w = &full.outcome.wire_actions;
+            assert!(
+                !w.contains(&WireAction::SessionCancel) && !w.contains(&WireAction::SessionClose),
+                "{label} must not cancel healthy HITL: {w:?}"
+            );
+        }
+
+        assert_eq!(
+            binding_attached_count(&rt, sid),
+            before + 2,
+            "mint +1 per Agent"
+        );
+        let bid_a = rt.binding_for(sid, a).unwrap();
+        let bid_b = rt.binding_for(sid, b).unwrap();
+        assert_ne!(bid_a, bid_a_before, "A reminted to a new Host Binding");
+        assert_ne!(bid_b, bid_b_before, "B reminted to a new Host Binding");
+        assert_ne!(bid_a, bid_b, "no cross-Agent Binding steal");
+        let host_a = remint_a
+            .host_binding_of(&full_a.outcome.binding_id)
+            .expect("A host bind");
+        let host_b = remint_b
+            .host_binding_of(&full_b.outcome.binding_id)
+            .expect("B host bind");
+        assert_ne!(host_a, host_b, "no cross-Agent Host Binding steal");
+
+        // PermissionResurface both; B parent preserved; A's ask survives B.
+        assert_eq!(
+            remint_a
+                .resurfaced_permissions()
+                .iter()
+                .map(|p| p.as_ref())
+                .collect::<Vec<_>>(),
+            std::slice::from_ref(&ask_a)
+        );
+        assert!(remint_a.observe().iter().any(|e| matches!(
+            &e.kind,
+            RemintEventKind::PermissionResurface(r)
+                if r == &ask_a && r.parent_tool_call_id.is_none()
+        )));
+        assert_eq!(
+            remint_b
+                .resurfaced_permissions()
+                .iter()
+                .map(|p| p.as_ref())
+                .collect::<Vec<_>>(),
+            std::slice::from_ref(&ask_b),
+            "B resurfaced with parent"
+        );
+        assert!(remint_b.observe().iter().any(|e| matches!(
+            &e.kind,
+            RemintEventKind::PermissionResurface(r)
+                if r == &ask_b
+                    && r.parent_tool_call_id.as_deref() == Some("toolu_task")
+        )));
+        assert_eq!(
+            remint_a
+                .resurfaced_permissions()
+                .iter()
+                .map(|p| p.as_ref())
+                .collect::<Vec<_>>(),
+            std::slice::from_ref(&ask_a),
+            "A's resurfaced ask survives B's remint"
+        );
+        assert!(remint_a.pending_permissions().is_empty());
+        assert!(remint_b.pending_permissions().is_empty());
+        assert!(
+            remint_a.turn_in_flight(),
+            "A turn stays in-flight under healthy HITL"
+        );
+        assert!(
+            remint_b.turn_in_flight(),
+            "B turn stays in-flight under healthy HITL"
+        );
+
+        // Dead Binding refuse stays per-Agent (no cross answer / ask steal).
+        assert_eq!(
+            remint_a.resolve_permission(&ask_a.binding, &ask_a.rpc_id, "allow-once"),
+            Err(RemintError::DeadBinding)
+        );
+        assert_eq!(
+            remint_b.resolve_permission(&ask_b.binding, &ask_b.rpc_id, "allow-once"),
+            Err(RemintError::DeadBinding)
+        );
+
+        // New wires: initialize (HOST false) + session/resume stable id; never load/new.
+        for (label, new, expected_sid) in [("A", &new_a, &sid_a), ("B", &new_b, &sid_b)] {
+            let raw = std::str::from_utf8(new.stdin_log().unwrap()).unwrap();
+            let frames: Vec<serde_json::Value> = raw
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+            assert_eq!(frames[0]["method"], "initialize", "{label}");
+            assert_eq!(
+                frames[0]["params"]["clientCapabilities"],
+                ClientCapabilities::HOST.to_json(),
+                "{label}"
+            );
+            assert_eq!(frames[1]["method"], "session/resume", "{label}");
+            assert_eq!(
+                frames[1]["params"]["sessionId"], *expected_sid,
+                "{label} stable sessionId"
+            );
+            assert!(
+                !raw.contains("session/load") && !raw.contains("session/new"),
+                "{label}: must not session/load or session/new"
+            );
+        }
+
+        let who: Vec<_> = woke.iter().map(|(ag, _)| *ag).collect();
+        assert_eq!(
+            who,
+            vec![a, b],
+            "both Agents TurnStart via wake fan-out; first-only fails"
+        );
+        assert_eq!(rt.classify(sid, a).unwrap(), hearth::Liveness::LiveInTurn);
+        assert_eq!(rt.classify(sid, b).unwrap(), hearth::Liveness::LiveInTurn);
+        let log = session.events().unwrap();
+        let ums: Vec<_> = log
+            .iter()
+            .filter(|e| matches!(e.body, hearth::EventBody::UserMessage { .. }))
+            .collect();
+        assert_eq!(ums.len(), 1, "one shared UserMessage");
+        assert!(matches!(
+            &ums[0].body,
+            hearth::EventBody::UserMessage { text, .. } if text == "hi-both-real-eof-perm"
         ));
 
         // Attach per-Agent leases onto wake-opened turns; raw pins (not is_none).
