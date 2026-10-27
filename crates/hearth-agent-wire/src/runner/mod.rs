@@ -3852,6 +3852,33 @@ mod tests {
 
     // ---- wake_each_kept_through_host_wake (Host fan-out splice) ----
 
+    /// Spawn a Real CLI that exits with `code` and probe until `OldWire::Exited`.
+    /// Must path for Real-cli-concurrent-remint — no Fake Exited injection.
+    fn spawn_and_probe_real_exit(code: i32) -> (AttachRunner, OldWire) {
+        let spec = LaunchSpec {
+            program: "sh".into(),
+            args: vec!["-c".into(), format!("exit {code}")],
+            cwd: None,
+            env: Vec::new(),
+            wire: WireKind::JsonlRpc,
+        };
+        let mut old = AttachRunner::spawn(spec).expect("spawn real CLI");
+        let mut old_wire = OldWire::Unknown;
+        for _ in 0..50 {
+            old_wire = old.probe_exit();
+            if matches!(old_wire, OldWire::Exited(_)) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            old_wire,
+            OldWire::Exited(code),
+            "Real probe must observe Exited"
+        );
+        (old, old_wire)
+    }
+
     /// Two ParallelSafe Agents on one Session, each with its own RemintSession
     /// + Binding (Host path setup for wake_each_kept_through_host_wake).
     fn shared_runtime_two_agents() -> (
@@ -4718,6 +4745,209 @@ mod tests {
             "A+B Bindings present; nesting minted no child Session"
         );
         let _ = (remint_b, place);
+    }
+
+    /// Real-cli-concurrent-remint (#46–#63 axis-5 proof): extend #43 Real CLI
+    /// exit remint + Concurrent-wake-remint scaffolding so **two** ParallelSafe
+    /// Agents each have a Real `AttachRunner` (`sh -c 'exit N'`), probe
+    /// `OldWire::Exited` (no Fake Exited injection), then Host remint via
+    /// `wake_each_kept_through_host_wake` remints **both**: mint +1 +
+    /// `session/resume` each (stable sessionId); cancel-before-reattach; no
+    /// `session/load` / `session/new`; raw per-Agent `turn_lease_of` /
+    /// `turn_fence_of` stay independent; no cross-Agent Binding steal.
+    /// SoftExpiring / fleet stay parked.
+    #[test]
+    fn concurrent_real_cli_exit_through_host_wake_remints_both_independent_leases_fences() {
+        let (rt, sid, uid, a, b, remint_a, remint_b, place) = shared_runtime_two_agents();
+        for (ag, path) in [(a, "a"), (b, "b")] {
+            rt.set_parallel_safe(sid, ag, Some(hearth::ParallelSafe::paths([path])))
+                .expect("opt in");
+        }
+        let session = rt.store().session(sid).unwrap();
+        let before = binding_attached_count(&rt, sid);
+        let bid_a_before = rt.binding_for(sid, a).unwrap();
+        let bid_b_before = rt.binding_for(sid, b).unwrap();
+
+        // Mid-turn on RemintSession so cancel-before-reattach fires (#43).
+        remint_a.begin_turn("mid-a");
+        remint_b.begin_turn("mid-b");
+        let sid_a = remint_a.agent_session_id();
+        let sid_b = remint_b.agent_session_id();
+
+        // Real CLI exit on each Agent (Must: no Fake Exited injection).
+        let (mut old_a, wire_a) = spawn_and_probe_real_exit(7);
+        let (mut old_b, wire_b) = spawn_and_probe_real_exit(8);
+        let mut new_a = new_wire_fake();
+        let mut new_b = new_wire_fake();
+
+        let r = run_each_kept(
+            &rt,
+            sid,
+            hearth::Wake::UserQuery {
+                user: uid,
+                text: "hi-both-real".into(),
+            },
+            &remint_a,
+            &remint_b,
+            &place,
+            wire_a,
+            wire_b,
+            &mut old_a,
+            &mut new_a,
+            &mut old_b,
+            &mut new_b,
+        )
+        .expect("host wake each kept");
+        let WakeEachKeptThroughHost::Woke { hosts, woke } = r else {
+            panic!("expected Woke, got {r:?}");
+        };
+        assert_eq!(
+            hosts.iter().map(|(ag, _)| *ag).collect::<Vec<_>>(),
+            vec![a, b],
+            "host_wake keep order; first-only mutant fails"
+        );
+
+        let full_a = match &hosts[0] {
+            (ag, HostWake::Reminted(full)) if *ag == a => full,
+            other => panic!("expected A Reminted on Real Exited, got {other:?}"),
+        };
+        let full_b = match &hosts[1] {
+            (ag, HostWake::Reminted(full)) if *ag == b => full,
+            other => panic!("expected B Reminted on Real Exited, got {other:?}"),
+        };
+        assert!(
+            full_a
+                .outcome
+                .wire_actions
+                .contains(&WireAction::AttachResume),
+            "A AttachResume"
+        );
+        assert!(
+            full_b
+                .outcome
+                .wire_actions
+                .contains(&WireAction::AttachResume),
+            "B AttachResume"
+        );
+        for (label, full) in [("A", full_a.as_ref()), ("B", full_b.as_ref())] {
+            let w = &full.outcome.wire_actions;
+            assert!(
+                w.contains(&WireAction::SessionCancel) || w.contains(&WireAction::SessionClose),
+                "{label} cancel-before-reattach: {w:?}"
+            );
+        }
+
+        assert_eq!(
+            binding_attached_count(&rt, sid),
+            before + 2,
+            "mint +1 per Agent"
+        );
+        let bid_a = rt.binding_for(sid, a).unwrap();
+        let bid_b = rt.binding_for(sid, b).unwrap();
+        assert_ne!(bid_a, bid_a_before, "A reminted to a new Host Binding");
+        assert_ne!(bid_b, bid_b_before, "B reminted to a new Host Binding");
+        assert_ne!(bid_a, bid_b, "no cross-Agent Binding steal");
+        let host_a = remint_a
+            .host_binding_of(&full_a.outcome.binding_id)
+            .expect("A host bind");
+        let host_b = remint_b
+            .host_binding_of(&full_b.outcome.binding_id)
+            .expect("B host bind");
+        assert_ne!(host_a, host_b, "no cross-Agent Host Binding steal");
+
+        // New wires: initialize (HOST false) + session/resume stable id; never load/new.
+        for (label, new, expected_sid) in [("A", &new_a, &sid_a), ("B", &new_b, &sid_b)] {
+            let raw = std::str::from_utf8(new.stdin_log().unwrap()).unwrap();
+            let frames: Vec<serde_json::Value> = raw
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+            assert_eq!(frames[0]["method"], "initialize", "{label}");
+            assert_eq!(
+                frames[0]["params"]["clientCapabilities"],
+                ClientCapabilities::HOST.to_json(),
+                "{label}"
+            );
+            assert_eq!(frames[1]["method"], "session/resume", "{label}");
+            assert_eq!(
+                frames[1]["params"]["sessionId"], *expected_sid,
+                "{label} stable sessionId"
+            );
+            assert!(
+                !raw.contains("session/load") && !raw.contains("session/new"),
+                "{label}: must not session/load or session/new"
+            );
+        }
+        assert!(!remint_a.turn_in_flight(), "A turn cleared after remint");
+        assert!(!remint_b.turn_in_flight(), "B turn cleared after remint");
+
+        let who: Vec<_> = woke.iter().map(|(ag, _)| *ag).collect();
+        assert_eq!(
+            who,
+            vec![a, b],
+            "both Agents TurnStart via wake fan-out; first-only fails"
+        );
+        assert_eq!(rt.classify(sid, a).unwrap(), hearth::Liveness::LiveInTurn);
+        assert_eq!(rt.classify(sid, b).unwrap(), hearth::Liveness::LiveInTurn);
+        let log = session.events().unwrap();
+        let ums: Vec<_> = log
+            .iter()
+            .filter(|e| matches!(e.body, hearth::EventBody::UserMessage { .. }))
+            .collect();
+        assert_eq!(ums.len(), 1, "one shared UserMessage");
+        assert!(matches!(
+            &ums[0].body,
+            hearth::EventBody::UserMessage { text, .. } if text == "hi-both-real"
+        ));
+
+        // Attach per-Agent leases onto wake-opened turns; raw pins (not is_none).
+        let (ta, fa, _) = rt
+            .begin_turn(sid, a, hearth::HolderId::new("ha"))
+            .expect("lease A");
+        let (tb, fb, _) = rt
+            .begin_turn(sid, b, hearth::HolderId::new("hb"))
+            .expect("lease B");
+        assert_ne!(ta, tb);
+        assert_eq!(session.turn_fence_of(a).unwrap(), fa);
+        assert_eq!(session.turn_fence_of(b).unwrap(), fb);
+        let pin_lease = |agent, holder: &str, turn, fence| {
+            let lease = rt.turn_lease_of(sid, agent).unwrap().expect("live lease");
+            assert_eq!(
+                (lease.agent, lease.holder, lease.turn_id, lease.fence),
+                (agent, hearth::HolderId::new(holder), turn, fence),
+                "raw turn_lease_of pin (not is_none)"
+            );
+        };
+        pin_lease(a, "ha", ta, fa);
+        pin_lease(b, "hb", tb, fb);
+
+        // A's fence raise must not steal B's lease/fence.
+        rt.end_turn(sid, "ha".into(), fa, true).unwrap();
+        let (ta2, fa2, _) = rt.resume_interrupted_turn(sid, a, "ha2".into()).unwrap();
+        assert_eq!(ta2, ta);
+        assert!(fa2 > fa, "A's own fence must rise on resume");
+        let lease_b = rt.turn_lease_of(sid, b).unwrap().expect("B live");
+        assert_eq!(
+            (
+                lease_b.agent,
+                lease_b.holder,
+                lease_b.turn_id,
+                lease_b.fence
+            ),
+            (b, hearth::HolderId::new("hb"), tb, fb),
+            "turn_lease_of(B).fence pinned after A's raise — no steal"
+        );
+        assert_eq!(session.turn_fence_of(b).unwrap(), fb);
+        rt.durable_step(sid, "hb".into(), fb, tb, "b-ok", || Ok("b".into()))
+            .unwrap();
+        assert!(matches!(
+            rt.durable_step(sid, "ha2".into(), fa, ta, "zombie", || {
+                panic!("zombie must not run")
+            }),
+            Err(hearth::Error::TurnLeaseLost)
+        ));
+        rt.durable_step(sid, "ha2".into(), fa2, ta, "a-ok", || Ok("a".into()))
+            .unwrap();
     }
 
     /// tick_through_host_wake addresses each due (Session, Agent): A with a
