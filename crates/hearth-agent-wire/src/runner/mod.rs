@@ -1328,7 +1328,11 @@ mod tests {
     use crate::catalog::{lookup_profile, LaunchSpec};
     use crate::transport::{Transport, WireFrame};
     use crate::RpcId;
-    use crate::{AgentEvent, CodingAgent, FramedAgent, PermissionOption};
+    use crate::{
+        AgentEvent, CapabilityFlags, CodingAgent, FramedAgent, HostAttach, JsonlRpcTransport,
+        PermissionOption,
+    };
+    use hearth::EventBody;
     use remint::{
         flush_and_teardown_old_wire, write_new_wire_attach_resume, LiveCaps, OldWireWrite,
         RemintError, RemintEventKind, RemintSession, RemintWireMethod, WireAction,
@@ -4449,6 +4453,271 @@ mod tests {
                 .collect::<Vec<_>>(),
             [Some("toolu_task")]
         );
+    }
+
+    /// Concurrent-nesting-proof (#46–#61 join): extend Concurrent-wake-remint
+    /// so a kept CLAUDE_ACP Agent drains nested frames mid-turn (Nesting-proof
+    /// Host path) under wake fan-out. EventLog retains the axis-4
+    /// `parent_tool_call_id` quartet; remint resurfaces Permission with parent
+    /// while the other three parents stay on the log; peer generic-ACP Agent
+    /// strips (no cross-Agent leak). Drop-any-one / always-None mutants KILL.
+    /// SoftExpiring / fleet / #56 M7 Soft Should stay parked.
+    #[test]
+    fn concurrent_nesting_through_host_wake_retains_axis4_parents_remint_and_strip() {
+        let (rt, sid, uid, a, b, remint_a, remint_b, place) = shared_runtime_two_agents();
+        for (ag, path) in [(a, "a"), (b, "b")] {
+            rt.set_parallel_safe(sid, ag, Some(hearth::ParallelSafe::paths([path])))
+                .expect("opt in");
+        }
+        let session = rt.store().session(sid).unwrap();
+
+        // Wake fan-out (Host path): both LiveInTurn + one shared UserMessage.
+        let mut old_a = initialized_fake(Vec::new());
+        let mut new_a = new_wire_fake();
+        let mut old_b = initialized_fake(Vec::new());
+        let mut new_b = new_wire_fake();
+        let r = run_each_kept(
+            &rt,
+            sid,
+            hearth::Wake::UserQuery {
+                user: uid,
+                text: "hi-both".into(),
+            },
+            &remint_a,
+            &remint_b,
+            &place,
+            OldWire::LiveIdle,
+            OldWire::LiveIdle,
+            &mut old_a,
+            &mut new_a,
+            &mut old_b,
+            &mut new_b,
+        )
+        .expect("host wake each kept");
+        let WakeEachKeptThroughHost::Woke { hosts, woke } = r else {
+            panic!("expected Woke, got {r:?}");
+        };
+        assert_eq!(
+            hosts.iter().map(|(ag, _)| *ag).collect::<Vec<_>>(),
+            vec![a, b],
+            "host_wake keep order; first-only mutant fails"
+        );
+        assert!(hosts.iter().all(|(_, h)| *h == HostWake::ReuseLive));
+        assert_eq!(
+            woke.iter().map(|(ag, _)| *ag).collect::<Vec<_>>(),
+            vec![a, b],
+            "both Agents TurnStart via wake fan-out"
+        );
+        assert_eq!(rt.classify(sid, a).unwrap(), hearth::Liveness::LiveInTurn);
+        assert_eq!(rt.classify(sid, b).unwrap(), hearth::Liveness::LiveInTurn);
+
+        // Nested Host-drain on CLAUDE_ACP Agent A (Nesting-proof frames).
+        let nested = crate::adapters::fixture("acp", "claude_subagent_nested.json");
+        let ask = serde_json::json!({"jsonrpc": "2.0", "id": 7, "method": "session/request_permission",
+            "params": {"sessionId": "s1", "toolCall": {
+                "toolCallId": "toolu_grandchild_read", "title": "Read /spec.md",
+                "_meta": {"claudeCode": {"toolName": "Read", "parentToolUseId": "toolu_inner"}}},
+                "options": [{"optionId": "allow", "name": "Allow", "kind": "allow_once"}]}});
+        let thought = serde_json::json!({"jsonrpc": "2.0", "method": "session/update",
+            "params": {"sessionId": "s1", "update": {
+                "sessionUpdate": "agent_thought_chunk",
+                "content": {"type": "text", "text": "axis4 nested think"},
+                "_meta": {"claudeCode": {"parentToolUseId": "toolu_outer"}}}}});
+        let push_quartet = |io: &mut FramedAgent<JsonlRpcTransport, AcpCodec>| {
+            for f in nested.as_array().unwrap() {
+                io.transport_mut().push_decoded(f.clone());
+            }
+            io.transport_mut().push_decoded(ask.clone());
+            io.transport_mut().push_decoded(thought.clone());
+        };
+        let binding_of = |agent| {
+            session
+                .bindings()
+                .unwrap()
+                .into_iter()
+                .find(|b| b.agent == Some(agent))
+                .unwrap_or_else(|| panic!("live Binding for {agent:?}"))
+        };
+
+        let caps_retain = CapabilityFlags::CLAUDE_ACP;
+        assert!(caps_retain.subagent);
+        let mut io_a = FramedAgent::new(JsonlRpcTransport::without_rpc_chunks(), AcpCodec);
+        push_quartet(&mut io_a);
+        let mut attach_a = HostAttach::attach(binding_of(a), a, io_a).with_agent_caps(caps_retain);
+        assert!(attach_a.agent_caps().subagent);
+        attach_a.drain(&session).unwrap();
+        // Same Binding; drain mints no child Session (native id stays Binding's).
+        assert_eq!(attach_a.binding().id, binding_of(a).id);
+        assert_eq!(attach_a.native_session(), Some("S-a"));
+
+        // Named fields kill drop-any-one: omit a match arm → None → panic.
+        struct Axis4Parents {
+            tool: Option<Option<String>>,
+            msg: Option<Option<String>>,
+            ask: Option<Option<String>>,
+            think: Option<Option<String>>,
+        }
+        fn axis4_parents(log: &[hearth::Event], agent: hearth::AgentId) -> Axis4Parents {
+            let mut out = Axis4Parents {
+                tool: None,
+                msg: None,
+                ask: None,
+                think: None,
+            };
+            for e in log {
+                match &e.body {
+                    EventBody::ToolCall {
+                        agent: ag,
+                        tool_call_id,
+                        parent_tool_call_id,
+                        ..
+                    } if *ag == agent && tool_call_id == "toolu_inner" && out.tool.is_none() => {
+                        out.tool = Some(parent_tool_call_id.clone());
+                    }
+                    EventBody::AgentMessage {
+                        agent: ag,
+                        text,
+                        parent_tool_call_id,
+                        ..
+                    } if *ag == agent && text == "Reading the spec first." && out.msg.is_none() => {
+                        out.msg = Some(parent_tool_call_id.clone());
+                    }
+                    EventBody::PermissionAsked {
+                        agent: ag,
+                        rpc: Some(rpc),
+                        parent_tool_call_id,
+                        ..
+                    } if *ag == agent
+                        && rpc.tool_call_id.as_deref() == Some("toolu_grandchild_read")
+                        && out.ask.is_none() =>
+                    {
+                        out.ask = Some(parent_tool_call_id.clone());
+                    }
+                    EventBody::AgentThink {
+                        agent: ag,
+                        text,
+                        parent_tool_call_id,
+                        ..
+                    } if *ag == agent && text == "axis4 nested think" && out.think.is_none() => {
+                        out.think = Some(parent_tool_call_id.clone());
+                    }
+                    _ => {}
+                }
+            }
+            out
+        }
+        let assert_retain = |label: &str, log: &[hearth::Event], agent: hearth::AgentId| {
+            let q = axis4_parents(log, agent);
+            let tool = q
+                .tool
+                .unwrap_or_else(|| panic!("{label}: missing ToolCall toolu_inner"));
+            let msg = q.msg.unwrap_or_else(|| {
+                panic!("{label}: missing AgentMessage 'Reading the spec first.'")
+            });
+            let asked = q.ask.unwrap_or_else(|| {
+                panic!("{label}: missing PermissionAsked toolu_grandchild_read")
+            });
+            let think = q
+                .think
+                .unwrap_or_else(|| panic!("{label}: missing AgentThink 'axis4 nested think'"));
+            assert_eq!(
+                tool.as_deref(),
+                Some("toolu_outer"),
+                "{label}: ToolCall parent"
+            );
+            assert_eq!(
+                msg.as_deref(),
+                Some("toolu_outer"),
+                "{label}: AgentMessage parent"
+            );
+            assert_eq!(
+                asked.as_deref(),
+                Some("toolu_inner"),
+                "{label}: PermissionAsked parent"
+            );
+            assert_eq!(
+                think.as_deref(),
+                Some("toolu_outer"),
+                "{label}: AgentThink parent"
+            );
+        };
+        assert_retain("CLAUDE_ACP-A pre-remint", &session.events().unwrap(), a);
+
+        // Remint tracks a mid-turn ask with parent (Concurrent-wake-remint path).
+        remint_a.begin_turn("work-a");
+        let ask_a = remint_a
+            .request_permission_under(
+                RpcId::Num(1),
+                Some("toolu_remint"),
+                Some("toolu_inner"),
+                "nested remint ask",
+                perm_opts(),
+            )
+            .unwrap();
+        assert_eq!(ask_a.parent_tool_call_id.as_deref(), Some("toolu_inner"));
+        assert_eq!(remint_a.pending_permissions().len(), 1);
+
+        let oa = remint_a.remint_and_attach().unwrap();
+        assert!(oa.permission_resurfaced && !oa.turn_interrupted);
+        assert!(oa.wire_actions.contains(&WireAction::AttachResume));
+        assert_eq!(
+            remint_a
+                .resurfaced_permissions()
+                .iter()
+                .map(|p| p.as_ref())
+                .collect::<Vec<_>>(),
+            std::slice::from_ref(&ask_a)
+        );
+        assert!(remint_a.observe().iter().any(|e| matches!(
+            &e.kind,
+            RemintEventKind::PermissionResurface(r)
+                if r == &ask_a
+                    && r.parent_tool_call_id.as_deref() == Some("toolu_inner")
+        )));
+
+        // EventLog still holds the axis-4 drain parents after remint
+        // (ToolCall / Message / PermissionAsked / Think — remint does not wipe).
+        assert_retain("CLAUDE_ACP-A post-remint", &session.events().unwrap(), a);
+
+        // Peer Agent B is generic ACP: same wire `_meta`, strip all four —
+        // no cross-Agent / peer leak onto B's EventLog rows.
+        let caps_strip = CapabilityFlags::ACP;
+        assert!(!caps_strip.subagent);
+        let mut io_b = FramedAgent::new(JsonlRpcTransport::without_rpc_chunks(), AcpCodec);
+        push_quartet(&mut io_b);
+        let mut attach_b = HostAttach::attach(binding_of(b), b, io_b).with_agent_caps(caps_strip);
+        assert!(!attach_b.agent_caps().subagent);
+        attach_b.drain(&session).unwrap();
+
+        let log = session.events().unwrap();
+        let qb = axis4_parents(&log, b);
+        let tool_b = qb
+            .tool
+            .unwrap_or_else(|| panic!("peer-B: missing ToolCall toolu_inner"));
+        let msg_b = qb
+            .msg
+            .unwrap_or_else(|| panic!("peer-B: missing AgentMessage 'Reading the spec first.'"));
+        let asked_b = qb
+            .ask
+            .unwrap_or_else(|| panic!("peer-B: missing PermissionAsked toolu_grandchild_read"));
+        let think_b = qb
+            .think
+            .unwrap_or_else(|| panic!("peer-B: missing AgentThink 'axis4 nested think'"));
+        assert_eq!(tool_b, None, "peer-B: ToolCall must strip");
+        assert_eq!(msg_b, None, "peer-B: AgentMessage must strip");
+        assert_eq!(asked_b, None, "peer-B: PermissionAsked must strip");
+        assert_eq!(think_b, None, "peer-B: AgentThink must strip");
+
+        // A's retained quartet survives peer strip drain (no cross-Agent wipe).
+        assert_retain("CLAUDE_ACP-A after peer strip", &log, a);
+
+        // Binding count: wake binds A+B; remint A mints a new Binding; B drain
+        // reuses B's live Binding — no child Session from nesting.
+        assert!(
+            session.bindings().unwrap().len() >= 2,
+            "A+B Bindings present; nesting minted no child Session"
+        );
+        let _ = (remint_b, place);
     }
 
     /// tick_through_host_wake addresses each due (Session, Agent): A with a
