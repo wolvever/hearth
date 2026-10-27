@@ -35,7 +35,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use crate::{
-    now_ts, open_turn_of, step_result_of, AgentId, BindingId, Error, Event, EventBody, Host,
+    now_ts, open_turn_of_agent, step_result_of, AgentId, BindingId, Error, Event, EventBody, Host,
     InMemory, Member, Result, Session, SessionId, WaitReason, WakeSource,
 };
 
@@ -516,7 +516,7 @@ impl Runtime {
             }
         }
 
-        if let Some((turn_id, _)) = open_turn_of(&sess.events()?) {
+        if let Some(turn_id) = open_turn_of_agent(&sess.events()?, agent) {
             sess.restore_open_turn()?;
             // Re-keep adopt is the documented host-restart path (release +
             // keep + begin_turn). Same Indeterminate finalize as
@@ -596,9 +596,10 @@ impl Runtime {
         let _gate = self.lock_durable()?;
         let step_id = step_id.into();
         self.require_live_lease(session, &holder, fence, turn_id)?;
+        let (agent, _) = self.kept_recipe(session)?;
 
         let sess = self.store.session(session)?;
-        if sess.current_turn()? != Some(turn_id) {
+        if sess.current_turn_of(agent)? != Some(turn_id) {
             return Err(Error::TurnLeaseLost);
         }
         if let Some(result) = step_result_of(&sess.events()?, turn_id, &step_id) {
@@ -645,7 +646,7 @@ impl Runtime {
             }
         }
 
-        let (turn_id, _) = open_turn_of(&sess.events()?).ok_or(Error::TurnNotOpen)?;
+        let turn_id = open_turn_of_agent(&sess.events()?, agent).ok_or(Error::TurnNotOpen)?;
         sess.restore_open_turn()?;
         // Crash reclaim must not leave ToolCalls looking live (tempt a
         // re-run). Same Indeterminate finalize as wire remint — never
@@ -719,7 +720,8 @@ fn record_wake(session: &Session, wake: &Wake) -> Result<Event> {
 fn classify_session(session: &Session, agent: AgentId) -> Result<Liveness> {
     let bindings = session.bindings()?;
     if bindings.iter().any(|b| b.agent == Some(agent)) {
-        return Ok(if session.current_turn()?.is_some() {
+        // Per-Binding turn map: only this Agent's own open turn counts.
+        return Ok(if session.current_turn_of(agent)?.is_some() {
             Liveness::LiveInTurn
         } else {
             Liveness::LiveIdle
@@ -797,6 +799,59 @@ mod tests {
         let agent = rt.store().create_agent("scribe", "");
         rt.keep(session.id(), agent.id, goose()).unwrap();
         assert!(rt.kept().contains(&session.id()));
+    }
+
+    /// Per-Binding turn map: another Agent's open turn on the same Session
+    /// does not make the kept Agent `LiveInTurn`; the kept Agent's leased
+    /// turn and durable steps run concurrently with correct turn stamps.
+    /// (No path-conflict gate in the kernel yet.)
+    #[test]
+    fn other_agent_open_turn_does_not_block_kept_agent() {
+        let rt = Runtime::new();
+        let kept = rt.store().create_agent("kept", "");
+        let other = rt.store().create_agent("other", "");
+        let session = rt.create_session();
+        rt.keep(session.id(), kept.id, goose()).unwrap();
+        let (t_kept, fence, kb) = rt.begin_turn(session.id(), "h".into()).unwrap();
+
+        // Other Agent opens its own turn while the kept turn is live.
+        session.join(Member::Agent(other.id)).unwrap();
+        let ob = session.bind_agent(other.id, "cli", None, None).unwrap();
+        let t_other = session.turn_start(other.id).unwrap().turn.unwrap();
+        assert_ne!(t_kept, t_other);
+        assert_ne!(kb, ob.id);
+        assert_eq!(rt.classify(session.id()).unwrap(), Liveness::LiveInTurn);
+        assert_eq!(session.current_turn_on(kb).unwrap(), Some(t_kept));
+        assert_eq!(session.current_turn_on(ob.id).unwrap(), Some(t_other));
+
+        let step = rt
+            .durable_step(session.id(), "h".into(), fence, t_kept, "s1", || {
+                Ok("done".into())
+            })
+            .unwrap();
+        assert!(!step.was_memoized());
+        let msg = |agent, text: &str| {
+            session
+                .append(EventBody::AgentMessage {
+                    agent,
+                    text: text.into(),
+                })
+                .unwrap()
+                .turn
+        };
+        assert_eq!(msg(kept.id, "k"), Some(t_kept));
+        assert_eq!(msg(other.id, "o"), Some(t_other));
+
+        rt.end_turn(session.id(), "h".into(), fence, false).unwrap();
+        assert_eq!(rt.classify(session.id()).unwrap(), Liveness::LiveIdle);
+        assert_eq!(session.current_turn_of(other.id).unwrap(), Some(t_other));
+        // Kept Agent idle while the other Agent is still in its turn: a
+        // fresh begin_turn proceeds (no Waiting(TurnOpen) for another owner).
+        let (t2, f2, _) = rt.begin_turn(session.id(), "h".into()).unwrap();
+        assert!(t2 > t_other);
+        rt.end_turn(session.id(), "h".into(), f2, false).unwrap();
+        session.turn_end(other.id).unwrap();
+        assert!(session.current_turns().unwrap().is_empty());
     }
 
     #[test]
