@@ -1014,6 +1014,15 @@ impl RemintSession {
         reason
     }
 
+    /// Record a typed FailClosed observe for fan-out skip after exhausted
+    /// remint retry (Service-wake-fanout-skip-retry). Caps-refuse paths use
+    /// [`Self::refuse_if_binding_caps_block_resume`] instead (already records).
+    pub fn record_fail_closed(&self, err: &RemintError) {
+        let mut g = self.inner.lock().unwrap();
+        Self::push_event(&mut g, RemintEventKind::FailClosed, err.as_event_text());
+        Self::mark_interrupted_if_in_flight(&mut g, err.as_event_text());
+    }
+
     /// On fail-closed remint that abandons an in-flight turn, mark it
     /// interrupted before returning — never leave `turn_in_flight` sticky.
     fn mark_interrupted_if_in_flight(g: &mut Inner, why: &str) {

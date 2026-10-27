@@ -93,6 +93,9 @@ enum ChildIo {
         stdin_log: Vec<u8>,
         alive: bool,
         exit_code: Option<i32>,
+        /// Test inject: next N ungated stdin writes fail, then succeed.
+        /// Used by limited remint-retry floors (fail-then-succeed Fake).
+        fail_stdin_writes: usize,
     },
 }
 
@@ -140,6 +143,17 @@ impl AttachRunner {
 
     /// Fake child for fixture tests. `stdout` is the raw framed byte stream.
     pub fn spawn_fake(wire: WireKind, stdout: Vec<u8>) -> Self {
+        Self::spawn_fake_with_stdin_failures(wire, stdout, 0)
+    }
+
+    /// Fake child that fails the next `fail_stdin_writes` ungated stdin
+    /// writes (then succeeds). Limited remint-retry floors: first remint
+    /// `initialize_host` fails with [`RemintError::NewWire`], retry succeeds.
+    pub fn spawn_fake_with_stdin_failures(
+        wire: WireKind,
+        stdout: Vec<u8>,
+        fail_stdin_writes: usize,
+    ) -> Self {
         Self {
             io: ChildIo::Fake {
                 stdout,
@@ -147,6 +161,7 @@ impl AttachRunner {
                 stdin_log: Vec::new(),
                 alive: true,
                 exit_code: None,
+                fail_stdin_writes,
             },
             wire,
             initialized: false,
@@ -226,10 +241,17 @@ impl AttachRunner {
                 Ok(())
             }
             ChildIo::Fake {
-                stdin_log, alive, ..
+                stdin_log,
+                alive,
+                fail_stdin_writes,
+                ..
             } => {
                 if !*alive {
                     return Err(BusError::Transport("fake child exited".into()));
+                }
+                if *fail_stdin_writes > 0 {
+                    *fail_stdin_writes -= 1;
+                    return Err(BusError::Transport("fake stdin injected failure".into()));
                 }
                 stdin_log.extend_from_slice(bytes);
                 Ok(())
@@ -1193,6 +1215,107 @@ pub struct WakeEachKeptThroughHostArgs<'a> {
     pub wake: hearth::Wake,
 }
 
+/// Default remint retry budget on a resume-capable Binding (Cheng product
+/// call 2026-10-27): three attempts, then FailClosed-skip. Caps no-resume /
+/// load-only never retry. Soft: tunable via config parked.
+pub const HOST_WAKE_REMINT_RETRY_BUDGET: u32 = 3;
+
+/// Short fixed backoff between remint retries (tests use the same constant;
+/// Soft exponential / config parked).
+pub const HOST_WAKE_REMINT_RETRY_BACKOFF: Duration = Duration::from_millis(50);
+
+/// Caps-refuse RemintErrors that FailClosed-skip the Agent and **continue**
+/// fan-out (Service-wake-fanout-skip-retry). Soft taxonomy expansion parked.
+fn is_caps_refuse_fanout_skip(err: &RemintError) -> bool {
+    matches!(
+        err,
+        RemintError::ResumeNotSupported | RemintError::LoadFallbackBlocked
+    )
+}
+
+/// Transient remint failures eligible for limited resume retry when Binding
+/// live_caps allow resume. Soft expansion beyond [`RemintError::NewWire`] parked.
+fn is_remint_retryable(err: &RemintError) -> bool {
+    matches!(err, RemintError::NewWire(_))
+}
+
+fn binding_allows_resume(session: &RemintSession) -> bool {
+    match session.binding_live_caps() {
+        Some(caps) => caps.allows_resume(),
+        // Never probed: refuse_if allows the spawn path; retry stays open.
+        None => true,
+    }
+}
+
+/// Unbind so [`hearth::AlreadyBound`] claim Waiting(NoBinding) skips turn —
+/// FailClosed-skip Agents must not turn_start on a dead / refused Binding.
+fn unbind_after_fail_closed_skip(
+    runtime: &hearth::Runtime,
+    session_id: hearth::SessionId,
+    agent: hearth::AgentId,
+) {
+    let Ok(bid) = runtime.binding_for(session_id, agent) else {
+        return;
+    };
+    let Ok(session) = runtime.store().session(session_id) else {
+        return;
+    };
+    let _ = session.unbind(bid);
+}
+
+/// [`host_wake`] with limited remint retry on resume-capable Bindings.
+///
+/// - Caps refuse ([`RemintError::ResumeNotSupported`] /
+///   [`RemintError::LoadFallbackBlocked`]): one attempt, no retry (FailClosed
+///   already recorded by [`RemintSession::refuse_if_binding_caps_block_resume`]).
+/// - [`RemintError::NewWire`] while Binding allows resume: retry up to
+///   [`HOST_WAKE_REMINT_RETRY_BUDGET`] with [`HOST_WAKE_REMINT_RETRY_BACKOFF`];
+///   on exhaust record FailClosed and return the error for fan-out skip.
+/// - Other RemintErrors: return immediately (fan-out still aborts — Soft
+///   taxonomy expansion parked).
+fn host_wake_with_limited_remint_retry(
+    old_wire: OldWire,
+    old: &mut AttachRunner,
+    new: &mut AttachRunner,
+    new_transport: &mut RunnerTransport,
+    remint: HostRemintFullArgs<'_>,
+) -> Result<HostWake, RemintError> {
+    let HostRemintFullArgs {
+        session,
+        place,
+        mcp_servers,
+        init_rpc_id,
+        old_next_rpc_id,
+        new_next_rpc_id,
+    } = remint;
+    let mut last_retryable: Option<RemintError> = None;
+    for attempt in 0..HOST_WAKE_REMINT_RETRY_BUDGET {
+        let args = HostRemintFullArgs {
+            session,
+            place,
+            mcp_servers,
+            init_rpc_id,
+            old_next_rpc_id,
+            new_next_rpc_id,
+        };
+        match host_wake(old_wire.clone(), old, new, new_transport, args) {
+            Ok(host) => return Ok(host),
+            Err(e) if is_caps_refuse_fanout_skip(&e) => return Err(e),
+            Err(e) if is_remint_retryable(&e) && binding_allows_resume(session) => {
+                last_retryable = Some(e);
+                if attempt + 1 < HOST_WAKE_REMINT_RETRY_BUDGET {
+                    std::thread::sleep(HOST_WAKE_REMINT_RETRY_BACKOFF);
+                    continue;
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    let err = last_retryable.expect("retry loop sets last_retryable before exhaust");
+    session.record_fail_closed(&err);
+    Err(err)
+}
+
 /// Production Host wake across **every** kept Agent on a Session.
 ///
 /// Closes the #56 Soft residual (Host was per-Agent `wake_through_host_wake`
@@ -1202,13 +1325,19 @@ pub struct WakeEachKeptThroughHostArgs<'a> {
 ///    - Read-only [`hearth::Runtime::classify`]: `LiveInTurn` / `Unknown` →
 ///      skip (like [`tick_through_host_wake`]).
 ///    - [`hearth::Runtime::check_turn_gate`] refused → skip, zero wire action.
-///    - [`host_wake`]: `Waiting` → skip; `Reminted` / `ReuseLive` → one mint
-///      max for that Agent (never a peer's Binding).
+///    - [`host_wake`] (with limited remint retry): `Waiting` → skip;
+///      `Reminted` / `ReuseLive` → one mint max for that Agent (never a peer's
+///      Binding). Caps-refuse / exhausted remint retry → Host FailClosed for
+///      that Agent, unbind, **continue** peers (Service-wake-fanout-skip-retry;
+///      tip abort-on-first mutant fails).
 /// 2. Once: [`hearth::Runtime::wake_each_kept_with`] [`hearth::AlreadyBound`] —
 ///    one shared wake record; **never** `claim_binding`. Gate re-check after
 ///    each `turn_start` stays #56 (non-ParallelSafe first-ready only without
 ///    aborting the fan-out). Claim `Waiting` (e.g. no Binding after a skipped
-///    `host_wake`) skips that Agent.
+///    / FailClosed `host_wake`) skips that Agent.
+/// 3. If every kept Agent caps-refuse / exhaust-retry-skip → typed
+///    [`WakeThroughError::Remint`] (HTTP 500). If at least one peer remints /
+///    reuses → [`WakeEachKeptThroughHost::Woke`] (no Session-wide Remint abort).
 ///
 /// Never `session/load` or `session/new`. [`ClientCapabilities::HOST`] stays
 /// all false. SoftExpiring / Flush / Stage / Evidence / EffectId / fleet
@@ -1229,6 +1358,7 @@ pub fn wake_each_kept_through_host_wake(
 
     let mut hosts: Vec<(hearth::AgentId, HostWake)> = Vec::new();
     let mut first_wait: Option<hearth::WaitReason> = None;
+    let mut fanout_skip_refuse: Option<RemintError> = None;
     for agent in agents {
         let Some(w) = wires.remove(&agent) else {
             first_wait.get_or_insert(hearth::WaitReason::LivenessUnknown);
@@ -1258,12 +1388,33 @@ pub fn wake_each_kept_through_host_wake(
             }
             r => r?,
         }
-        let host = host_wake(w.old_wire, w.old, w.new, w.new_transport, w.remint)?;
-        match host {
-            HostWake::Waiting(reason) => {
+        match host_wake_with_limited_remint_retry(
+            w.old_wire,
+            w.old,
+            w.new,
+            w.new_transport,
+            w.remint,
+        ) {
+            Ok(HostWake::Waiting(reason)) => {
                 first_wait.get_or_insert(reason);
             }
-            host => hosts.push((agent, host)),
+            Ok(host) => hosts.push((agent, host)),
+            Err(e) if is_caps_refuse_fanout_skip(&e) || is_remint_retryable(&e) => {
+                // FailClosed recorded (caps path inside refuse_if; NewWire
+                // exhaust inside host_wake_with_limited_remint_retry). Unbind
+                // so AlreadyBound skips turn; continue peers.
+                unbind_after_fail_closed_skip(runtime, session_id, agent);
+                fanout_skip_refuse.get_or_insert(e);
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+
+    // All kept Agents caps-refuse / exhaust-retry → typed Remint (HTTP 500).
+    // Do not demote to Waiting/409.
+    if hosts.is_empty() {
+        if let Some(e) = fanout_skip_refuse {
+            return Err(WakeThroughError::Remint(e));
         }
     }
 
@@ -4051,6 +4202,30 @@ mod tests {
         RemintSession,
         hearth::Place,
     ) {
+        let caps = LiveCaps {
+            resume: true,
+            cancel: true,
+            close: true,
+            load_session: false,
+        };
+        shared_runtime_two_agents_with_caps(caps, caps)
+    }
+
+    /// Same as [`shared_runtime_two_agents`] with per-Agent Binding.live_caps
+    /// (Service-wake-fanout-skip-retry mixed no-resume + resume-capable floor).
+    fn shared_runtime_two_agents_with_caps(
+        caps_a: LiveCaps,
+        caps_b: LiveCaps,
+    ) -> (
+        hearth::Runtime,
+        hearth::SessionId,
+        hearth::UserId,
+        hearth::AgentId,
+        hearth::AgentId,
+        RemintSession,
+        RemintSession,
+        hearth::Place,
+    ) {
         let rt = hearth::Runtime::new();
         let user = rt.store().create_user("cheng");
         let a = rt.store().create_agent("scribe-a", "");
@@ -4068,17 +4243,25 @@ mod tests {
         session.rebind(None, b.id, host_b.clone()).expect("bind B");
         rt.keep(sid, a.id, host_a).expect("keep A");
         rt.keep(sid, b.id, host_b).expect("keep B");
-        let caps = LiveCaps {
-            resume: true,
-            cancel: true,
-            close: true,
-            load_session: false,
-        };
-        let remint_a = RemintSession::on_host_session(session.clone(), a.id, user.id, "S-a", caps)
-            .expect("remint A");
-        let remint_b =
-            RemintSession::on_host_session(session, b.id, user.id, "S-b", caps).expect("remint B");
+        let remint_a =
+            RemintSession::on_host_session(session.clone(), a.id, user.id, "S-a", caps_a)
+                .expect("remint A");
+        let remint_b = RemintSession::on_host_session(session, b.id, user.id, "S-b", caps_b)
+            .expect("remint B");
         (rt, sid, user.id, a.id, b.id, remint_a, remint_b, ws_place())
+    }
+
+    fn new_wire_fake_with_stdin_failures(fail_stdin_writes: usize) -> AttachRunner {
+        let init = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": { "protocolVersion": 1,
+                "agentCapabilities": { "session": { "resume": true, "cancel": true, "close": true } } }
+        });
+        AttachRunner::spawn_fake_with_stdin_failures(
+            WireKind::JsonlRpc,
+            JsonlRpcTransport::encode_jsonl(&init).expect("encode"),
+            fail_stdin_writes,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4379,6 +4562,290 @@ mod tests {
         assert!(session.current_turn_of(a).unwrap().is_some());
         assert!(session.current_turn_of(b).unwrap().is_none());
         assert!(new_b.stdin_log().unwrap().is_empty());
+    }
+
+    /// Must (Service-wake-fanout-skip-retry): A Binding.live_caps no-resume +
+    /// Fake lost; B resume-capable + Fake lost; one wake → A FailClosed-skip
+    /// (no mint/spawn/load); B remints mint+1 + session/resume; independent
+    /// lease/fence; tip abort-on-first mutant fails (B would never remint).
+    #[test]
+    fn wake_each_kept_caps_refuse_skips_peer_still_remints() {
+        let no_resume = LiveCaps {
+            resume: false,
+            load_session: false,
+            cancel: true,
+            close: true,
+        };
+        let resume = LiveCaps {
+            resume: true,
+            load_session: false,
+            cancel: true,
+            close: true,
+        };
+        let (rt, sid, uid, a, b, remint_a, remint_b, place) =
+            shared_runtime_two_agents_with_caps(no_resume, resume);
+        for (ag, path) in [(a, "a"), (b, "b")] {
+            rt.set_parallel_safe(sid, ag, Some(hearth::ParallelSafe::paths([path])))
+                .expect("opt in");
+        }
+        let before = binding_attached_count(&rt, sid);
+        let bid_b_before = rt.binding_for(sid, b).unwrap();
+        let mut old_a = initialized_fake(Vec::new());
+        let mut new_a = new_wire_fake();
+        let mut old_b = initialized_fake(Vec::new());
+        let mut new_b = new_wire_fake();
+        let r = run_each_kept(
+            &rt,
+            sid,
+            hearth::Wake::UserQuery {
+                user: uid,
+                text: "skip-refuse".into(),
+            },
+            &remint_a,
+            &remint_b,
+            &place,
+            OldWire::Exited(1),
+            OldWire::Exited(1),
+            &mut old_a,
+            &mut new_a,
+            &mut old_b,
+            &mut new_b,
+        )
+        .expect("peer remint must not abort on A caps-refuse");
+        let WakeEachKeptThroughHost::Woke { hosts, woke } = r else {
+            panic!("expected Woke, got {r:?}");
+        };
+        assert!(
+            hosts.iter().all(|(ag, _)| *ag == b),
+            "only B host_wake Reminted; tip abort-on-first mutant fails: {hosts:?}"
+        );
+        assert!(matches!(hosts[0].1, HostWake::Reminted(_)));
+        assert_eq!(woke.iter().map(|(ag, _)| *ag).collect::<Vec<_>>(), vec![b]);
+        assert!(
+            remint_a
+                .observe()
+                .iter()
+                .any(|e| e.kind == RemintEventKind::FailClosed && e.text == "ResumeNotSupported"),
+            "A FailClosed ResumeNotSupported"
+        );
+        assert!(
+            new_a.stdin_log().unwrap().is_empty(),
+            "A: no spawn/initialize"
+        );
+        let raw_b = std::str::from_utf8(new_b.stdin_log().unwrap()).unwrap();
+        assert!(
+            raw_b.contains("session/resume"),
+            "B remints resume: {raw_b}"
+        );
+        assert!(!raw_b.contains("session/load") && !raw_b.contains("session/new"));
+        assert_eq!(
+            binding_attached_count(&rt, sid),
+            before + 1,
+            "exactly one mint (B); A refuse adds none"
+        );
+        let bid_b = rt.binding_for(sid, b).unwrap();
+        assert_ne!(bid_b, bid_b_before, "B reminted");
+        assert!(
+            rt.binding_for(sid, a).is_err(),
+            "A unbound after FailClosed-skip (no turn on dead Binding)"
+        );
+        let session = rt.store().session(sid).unwrap();
+        assert!(session.current_turn_of(a).unwrap().is_none());
+        assert!(session.current_turn_of(b).unwrap().is_some());
+        // Independent B fence pin (A has no turn / no Binding steal).
+        let _fence_b = session.turn_fence_of(b).unwrap();
+        assert!(
+            session.current_turn_of(a).unwrap().is_none(),
+            "A must not steal B's turn"
+        );
+        let log = session.events().unwrap();
+        let ums: Vec<_> = log
+            .iter()
+            .filter(|e| matches!(e.body, hearth::EventBody::UserMessage { .. }))
+            .collect();
+        assert_eq!(
+            ums.len(),
+            1,
+            "one shared UserMessage; A skip does not break claim-before-record"
+        );
+    }
+
+    /// Must: resume-capable Fake fails first remint stdin then succeeds on
+    /// retry → remints. Caps no-resume peer still FailClosed once (no retry
+    /// spawn). Exhausted-budget twin below.
+    #[test]
+    fn wake_each_kept_remint_retries_then_succeeds() {
+        let resume = LiveCaps {
+            resume: true,
+            load_session: false,
+            cancel: true,
+            close: true,
+        };
+        let (rt, sid, uid, a, b, remint_a, remint_b, place) =
+            shared_runtime_two_agents_with_caps(resume, resume);
+        for (ag, path) in [(a, "a"), (b, "b")] {
+            rt.set_parallel_safe(sid, ag, Some(hearth::ParallelSafe::paths([path])))
+                .expect("opt in");
+        }
+        let before = binding_attached_count(&rt, sid);
+        let mut old_a = initialized_fake(Vec::new());
+        // First initialize_host write fails → NewWire; retry succeeds.
+        let mut new_a = new_wire_fake_with_stdin_failures(1);
+        let mut old_b = initialized_fake(Vec::new());
+        let mut new_b = new_wire_fake();
+        let r = run_each_kept(
+            &rt,
+            sid,
+            hearth::Wake::UserQuery {
+                user: uid,
+                text: "retry-ok".into(),
+            },
+            &remint_a,
+            &remint_b,
+            &place,
+            OldWire::StdoutEof,
+            OldWire::LiveIdle,
+            &mut old_a,
+            &mut new_a,
+            &mut old_b,
+            &mut new_b,
+        )
+        .expect("retry then remint");
+        let WakeEachKeptThroughHost::Woke { hosts, woke } = r else {
+            panic!("expected Woke, got {r:?}");
+        };
+        assert!(matches!(hosts[0], (ag, HostWake::Reminted(_)) if ag == a));
+        assert_eq!(hosts[1], (b, HostWake::ReuseLive));
+        assert_eq!(woke.len(), 2);
+        let raw = std::str::from_utf8(new_a.stdin_log().unwrap()).unwrap();
+        assert!(raw.contains("session/resume"), "retry reminted: {raw}");
+        assert!(!raw.contains("session/load") && !raw.contains("session/new"));
+        assert!(
+            binding_attached_count(&rt, sid) > before,
+            "A reminted at least once"
+        );
+    }
+
+    /// Must: resume-capable Fake exhausts remint retry budget → FailClosed-skip;
+    /// peer still remints / reuses. Caps no-resume: refuse once, no retry.
+    #[test]
+    fn wake_each_kept_remint_retry_exhausted_skips_peers_continue() {
+        let resume = LiveCaps {
+            resume: true,
+            load_session: false,
+            cancel: true,
+            close: true,
+        };
+        let (rt, sid, uid, a, b, remint_a, remint_b, place) =
+            shared_runtime_two_agents_with_caps(resume, resume);
+        for (ag, path) in [(a, "a"), (b, "b")] {
+            rt.set_parallel_safe(sid, ag, Some(hearth::ParallelSafe::paths([path])))
+                .expect("opt in");
+        }
+        let bid_b_before = rt.binding_for(sid, b).unwrap();
+        let mut old_a = initialized_fake(Vec::new());
+        // Fail every attempt in the budget (and one extra).
+        let mut new_a =
+            new_wire_fake_with_stdin_failures(HOST_WAKE_REMINT_RETRY_BUDGET as usize + 1);
+        let mut old_b = initialized_fake(Vec::new());
+        let mut new_b = new_wire_fake();
+        let r = run_each_kept(
+            &rt,
+            sid,
+            hearth::Wake::UserQuery {
+                user: uid,
+                text: "retry-exhaust".into(),
+            },
+            &remint_a,
+            &remint_b,
+            &place,
+            OldWire::Exited(1),
+            OldWire::LiveIdle,
+            &mut old_a,
+            &mut new_a,
+            &mut old_b,
+            &mut new_b,
+        )
+        .expect("exhausted A must not abort B");
+        let WakeEachKeptThroughHost::Woke { hosts, woke } = r else {
+            panic!("expected Woke, got {r:?}");
+        };
+        assert_eq!(hosts, vec![(b, HostWake::ReuseLive)]);
+        assert_eq!(woke.iter().map(|(ag, _)| *ag).collect::<Vec<_>>(), vec![b]);
+        assert!(
+            remint_a
+                .observe()
+                .iter()
+                .any(|e| e.kind == RemintEventKind::FailClosed && e.text == "NewWire"),
+            "A FailClosed NewWire after exhaust: {:?}",
+            remint_a.observe()
+        );
+        assert!(
+            !std::str::from_utf8(new_a.stdin_log().unwrap())
+                .unwrap()
+                .contains("session/resume"),
+            "exhausted: no successful resume"
+        );
+        assert_eq!(rt.binding_for(sid, b).unwrap(), bid_b_before);
+        let session = rt.store().session(sid).unwrap();
+        assert!(session.current_turn_of(a).unwrap().is_none());
+        assert!(session.current_turn_of(b).unwrap().is_some());
+    }
+
+    /// Must: caps no-resume never retries (FailClosed once); all-refuse →
+    /// typed Remint (not Waiting).
+    #[test]
+    fn wake_each_kept_caps_refuse_no_retry_all_refuse_typed_remint() {
+        let no_resume = LiveCaps {
+            resume: false,
+            load_session: false,
+            cancel: true,
+            close: true,
+        };
+        let (rt, sid, uid, a, b, remint_a, remint_b, place) =
+            shared_runtime_two_agents_with_caps(no_resume, no_resume);
+        for (ag, path) in [(a, "a"), (b, "b")] {
+            rt.set_parallel_safe(sid, ag, Some(hearth::ParallelSafe::paths([path])))
+                .expect("opt in");
+        }
+        let mut old_a = initialized_fake(Vec::new());
+        let mut new_a = new_wire_fake();
+        let mut old_b = initialized_fake(Vec::new());
+        let mut new_b = new_wire_fake();
+        let err = run_each_kept(
+            &rt,
+            sid,
+            hearth::Wake::UserQuery {
+                user: uid,
+                text: "all-refuse".into(),
+            },
+            &remint_a,
+            &remint_b,
+            &place,
+            OldWire::Exited(1),
+            OldWire::Exited(1),
+            &mut old_a,
+            &mut new_a,
+            &mut old_b,
+            &mut new_b,
+        )
+        .expect_err("all caps-refuse → typed Remint");
+        assert!(
+            matches!(
+                err,
+                WakeThroughError::Remint(RemintError::ResumeNotSupported)
+            ),
+            "typed ResumeNotSupported; got {err}"
+        );
+        for (remint, new) in [(&remint_a, &new_a), (&remint_b, &new_b)] {
+            assert!(
+                remint.observe().iter().any(
+                    |e| e.kind == RemintEventKind::FailClosed && e.text == "ResumeNotSupported"
+                ),
+                "each Agent FailClosed once"
+            );
+            assert!(new.stdin_log().unwrap().is_empty(), "no retry spawn");
+        }
     }
 
     fn perm_opts() -> Vec<PermissionOption> {

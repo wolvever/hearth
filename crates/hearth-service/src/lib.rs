@@ -839,6 +839,19 @@ mod tests {
         paths_b: Option<Vec<String>>,
         caps: hearth_agent_wire::LiveCaps,
     ) -> (hearth::AgentId, hearth::AgentId, hearth::Place) {
+        install_two_host_wires_with_declare_caps(st, sid, lost, paths_a, paths_b, caps, caps)
+    }
+
+    /// Per-Agent Binding.live_caps (Service-wake-fanout-skip-retry mixed floor).
+    fn install_two_host_wires_with_declare_caps(
+        st: &AppState,
+        sid: SessionId,
+        lost: Option<hearth_agent_wire::OldWire>,
+        paths_a: Option<Vec<String>>,
+        paths_b: Option<Vec<String>>,
+        caps_a: hearth_agent_wire::LiveCaps,
+        caps_b: hearth_agent_wire::LiveCaps,
+    ) -> (hearth::AgentId, hearth::AgentId, hearth::Place) {
         use hearth::{Host, PlaceAttach};
         use hearth_agent_wire::RemintSession;
 
@@ -862,7 +875,7 @@ mod tests {
         let uid = *names.users.get("cheng").unwrap();
         drop(names);
 
-        for (ag, resume_id) in [(a, "S-a"), (b, "S-b")] {
+        for (ag, resume_id, caps) in [(a, "S-a", caps_a), (b, "S-b", caps_b)] {
             let host = Host::from_bind("acp", Some(resume_id.into()), None);
             session.rebind(None, ag, host).unwrap();
             let remint = RemintSession::on_host_session(session.clone(), ag, uid, resume_id, caps)
@@ -900,13 +913,25 @@ mod tests {
         lost: Option<hearth_agent_wire::OldWire>,
         caps: hearth_agent_wire::LiveCaps,
     ) -> (hearth::AgentId, hearth::AgentId, hearth::Place) {
-        install_two_host_wires_with_declare(
+        install_two_parallel_safe_host_wires_with_per_agent_caps(st, sid, lost, caps, caps)
+    }
+
+    /// Service-wake-fanout-skip-retry: per-Agent caps (A no-resume, B resume).
+    fn install_two_parallel_safe_host_wires_with_per_agent_caps(
+        st: &AppState,
+        sid: SessionId,
+        lost: Option<hearth_agent_wire::OldWire>,
+        caps_a: hearth_agent_wire::LiveCaps,
+        caps_b: hearth_agent_wire::LiveCaps,
+    ) -> (hearth::AgentId, hearth::AgentId, hearth::Place) {
+        install_two_host_wires_with_declare_caps(
             st,
             sid,
             lost,
             Some(vec!["agent-0".into()]),
             Some(vec!["agent-1".into()]),
-            caps,
+            caps_a,
+            caps_b,
         )
     }
 
@@ -1079,11 +1104,10 @@ mod tests {
         }
     }
 
-    /// Must (Service-livecaps-refuse): Binding.live_caps advertise no resume
-    /// (and no loadSession); Fake proven-lost OldWire → one HTTP steer through
-    /// wake_each_kept_through_host_wake typed-refuses ResumeNotSupported
-    /// (SteerError::Remint / HTTP 500); no Binding mint; empty new-wire stdin
-    /// (no spawn/initialize); never session/load / session/new / session/resume.
+    /// Must (Service-livecaps-refuse + Service-wake-fanout-skip-retry): both
+    /// Agents Binding.live_caps no resume; Fake proven-lost → all-refuse typed
+    /// ResumeNotSupported (SteerError::Remint / HTTP 500); each Agent
+    /// FailClosed-skip (no mint/spawn/load/new/resume).
     #[tokio::test]
     async fn http_steer_livecaps_no_resume_refuses_without_spawn() {
         use hearth_agent_wire::{LiveCaps as WireCaps, RemintError, RemintEventKind};
@@ -1176,14 +1200,17 @@ mod tests {
             .filter(|e| matches!(e.body, EventBody::BindingAttached { .. }))
             .count();
         assert_eq!(after_mints, before_mints, "no Binding mint on refuse");
-        assert_eq!(st.runtime.binding_for(sid, a).unwrap(), bid_a_before);
-        assert_eq!(st.runtime.binding_for(sid, b).unwrap(), bid_b_before);
+        // FailClosed-skip unbinds so AlreadyBound does not turn_start on a
+        // dead Binding (Service-wake-fanout-skip-retry).
+        let _ = (bid_a_before, bid_b_before);
+        assert!(
+            st.runtime.binding_for(sid, a).is_err() && st.runtime.binding_for(sid, b).is_err(),
+            "all-refuse unbinds both Agents"
+        );
 
         let mut wires = st.host_wires.lock().unwrap();
-        // Fan-out aborts on first RemintError — only the first kept Agent is
-        // host_wake'd; pin refuse side-effects on that Agent (and empty stdin
-        // on any peer that was never reached).
-        let mut saw_fail_closed = false;
+        // Fan-out continues across caps-refuse: every kept Agent is host_wake'd
+        // and FailClosed-skipped (tip abort-on-first mutant fails).
         for agent in [a, b] {
             let w = wires.get_mut(sid, agent).unwrap();
             assert!(
@@ -1198,18 +1225,13 @@ mod tests {
                     && !old_raw.contains("session/resume"),
                 "never load/new/resume on {agent:?}: {old_raw}"
             );
-            if w.remint
-                .observe()
-                .iter()
-                .any(|e| e.kind == RemintEventKind::FailClosed && e.text == "ResumeNotSupported")
-            {
-                saw_fail_closed = true;
-            }
+            assert!(
+                w.remint.observe().iter().any(
+                    |e| e.kind == RemintEventKind::FailClosed && e.text == "ResumeNotSupported"
+                ),
+                "{agent:?} must FailClosed ResumeNotSupported"
+            );
         }
-        assert!(
-            saw_fail_closed,
-            "at least the first kept Agent must FailClosed ResumeNotSupported"
-        );
     }
 
     /// Must (Service-livecaps-refuse): load-only Binding (resume:false,
@@ -1295,7 +1317,6 @@ mod tests {
         );
 
         let mut wires = st.host_wires.lock().unwrap();
-        let mut saw_fail_closed = false;
         for agent in [a, b] {
             let w = wires.get_mut(sid, agent).unwrap();
             assert!(
@@ -1311,18 +1332,116 @@ mod tests {
                 !old_raw.contains("session/new") && !old_raw.contains("session/resume"),
                 "never new/resume on {agent:?}: {old_raw}"
             );
-            if w.remint
+            assert!(
+                w.remint.observe().iter().any(|e| {
+                    e.kind == RemintEventKind::FailClosed && e.text == "LoadFallbackBlocked"
+                }),
+                "{agent:?} must FailClosed LoadFallbackBlocked"
+            );
+        }
+    }
+
+    /// Must (Service-wake-fanout-skip-retry): A no-resume + Fake lost; B
+    /// resume-capable + Fake lost; one HTTP steer → A FailClosed (no mint /
+    /// spawn/load); B remints mint+1 + session/resume; HTTP 200 (not
+    /// Session-wide Remint→500); tip abort-on-first mutant fails.
+    #[tokio::test]
+    async fn http_steer_caps_refuse_skips_peer_still_remints() {
+        use hearth_agent_wire::{LiveCaps as WireCaps, RemintEventKind};
+
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let id = sid.0.to_string();
+        let no_resume = WireCaps {
+            resume: false,
+            load_session: false,
+            cancel: true,
+            close: true,
+        };
+        let resume = resume_capable_caps();
+        let (a, b, _) = install_two_parallel_safe_host_wires_with_per_agent_caps(
+            &st,
+            sid,
+            Some(hearth_agent_wire::OldWire::Exited(1)),
+            no_resume,
+            resume,
+        );
+        let before_mints = st
+            .store()
+            .session(sid)
+            .unwrap()
+            .events()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e.body, EventBody::BindingAttached { .. }))
+            .count();
+        let bid_b_before = st.runtime.binding_for(sid, b).unwrap();
+
+        let app = router(st.clone());
+        let (code, body) = call(
+            app,
+            Request::post(format!("/sessions/{id}/events"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"user":"cheng","message":"skip-peer"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            code,
+            StatusCode::OK,
+            "peer remint must not Session-wide Remint→500; body={body}"
+        );
+        assert!(body.contains("skip-peer"), "body={body}");
+
+        let after_mints = st
+            .store()
+            .session(sid)
+            .unwrap()
+            .events()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e.body, EventBody::BindingAttached { .. }))
+            .count();
+        assert_eq!(after_mints, before_mints + 1, "exactly one mint (B)");
+        assert!(
+            st.runtime.binding_for(sid, a).is_err(),
+            "A unbound after FailClosed-skip"
+        );
+        assert_ne!(
+            st.runtime.binding_for(sid, b).unwrap(),
+            bid_b_before,
+            "B reminted"
+        );
+
+        let session = st.store().session(sid).unwrap();
+        assert!(session.current_turn_of(a).unwrap().is_none());
+        assert!(
+            session.current_turn_of(b).unwrap().is_some(),
+            "B LiveInTurn; tip abort-on-first fails"
+        );
+        let ums = session
+            .events()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e.body, EventBody::UserMessage { .. }))
+            .count();
+        assert_eq!(ums, 1, "one shared UserMessage");
+
+        let mut wires = st.host_wires.lock().unwrap();
+        let w_a = wires.get_mut(sid, a).unwrap();
+        assert!(
+            w_a.remint
                 .observe()
                 .iter()
-                .any(|e| e.kind == RemintEventKind::FailClosed && e.text == "LoadFallbackBlocked")
-            {
-                saw_fail_closed = true;
-            }
-        }
-        assert!(
-            saw_fail_closed,
-            "at least the first kept Agent must FailClosed LoadFallbackBlocked"
+                .any(|e| e.kind == RemintEventKind::FailClosed && e.text == "ResumeNotSupported"),
+            "A FailClosed"
         );
+        assert!(w_a.new.stdin_log().unwrap().is_empty(), "A no spawn");
+        let w_b = wires.get_mut(sid, b).unwrap();
+        let raw_b = std::str::from_utf8(w_b.new.stdin_log().unwrap()).unwrap();
+        assert!(raw_b.contains("session/resume"), "B resume: {raw_b}");
+        assert!(!raw_b.contains("session/load") && !raw_b.contains("session/new"));
     }
 
     /// Service-real-cli-concurrent-remint: two ParallelSafe Agents with Real
