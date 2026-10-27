@@ -5,7 +5,8 @@
 //! many Agents may be kept on one Session, each with its own recipe and
 //! timer. [`Runtime::wake`] / [`Runtime::remint`] / [`Runtime::begin_turn`] /
 //! [`Runtime::classify`] take the Agent; [`Runtime::tick`] iterates each due
-//! `(Session, Agent)`. [`Runtime::wake`] is
+//! `(Session, Agent)`. [`Runtime::wake_each_kept`] fans a single wake out to
+//! every kept Agent on one Session (one shared wake record). [`Runtime::wake`] is
 //! find_server: classify the agent's Binding, remint only when none is live
 //! (`NeverBound` / `PositivelyDead`), link a prompt to a live idle Binding, or
 //! wait. A live Binding in an open turn does **not** remint and does **not**
@@ -512,6 +513,102 @@ impl Runtime {
 
         let events = sess.events()?;
         Ok(events[start_len..].to_vec())
+    }
+
+    /// Wake **every** kept Agent on `session` with one shared wake record.
+    ///
+    /// Closes the #47 service residual (first-only). Records [`Wake`] once
+    /// (one [`EventBody::UserMessage`] / one [`EventBody::Wake`]), then for
+    /// each kept Agent in keep order runs the same classify / gate / claim /
+    /// `turn_start_with` steps as [`Self::wake`]. An Agent that answers
+    /// [`Error::Waiting`] is skipped (like [`Self::tick`]); other Agents
+    /// still fire. If every Agent waits, returns that Waiting and appends
+    /// nothing. Unknown Session → [`Error::NotKept`].
+    ///
+    /// Claims run before the shared wake record so a failed claim never
+    /// leaves a UserMessage without turns. Parallel-safe declarations still
+    /// gate concurrent turns; without them only the first ready Agent fires.
+    ///
+    /// Production wire Host: ensure each Agent's Binding via `host_wake`, then
+    /// [`Self::wake_each_kept_with`] [`AlreadyBound`] — never [`ClaimBinding`]
+    /// on the same path as `host_wake`.
+    pub fn wake_each_kept(
+        &self,
+        session: SessionId,
+        wake: Wake,
+    ) -> Result<Vec<(AgentId, Vec<Event>)>> {
+        self.wake_each_kept_with(session, wake, &mut ClaimBinding)
+    }
+
+    /// [`Self::wake_each_kept`] with a pluggable Binding ensure step
+    /// (mirrors [`Self::wake_with`]).
+    pub fn wake_each_kept_with<C: WakeClaim>(
+        &self,
+        session: SessionId,
+        wake: Wake,
+        claim: &mut C,
+    ) -> Result<Vec<(AgentId, Vec<Event>)>> {
+        let _gate = self.lock_durable()?;
+        let recipes: Vec<(AgentId, Host, Option<ParallelSafe>)> = {
+            let g = self.lock_kept()?;
+            let kept = g.get(&session).ok_or(Error::NotKept(session))?;
+            kept.agents
+                .iter()
+                .map(|a| (a.agent, a.host.clone(), a.parallel_safe.clone()))
+                .collect()
+        };
+        let sess = self.store.session(session)?;
+        let start_len = sess.events()?.len();
+
+        // Keep order: classify / gate / claim / turn_start per Agent, like
+        // [`Self::wake`], but the wake record is shared. Re-check the gate
+        // after each turn_start so a non-ParallelSafe first Agent causes
+        // later Agents to skip (Waiting) instead of failing the fan-out.
+        // Claim + record happen only for Agents about to turn_start, so a
+        // full-Waiting fan-out appends nothing.
+        let mut out: Vec<(AgentId, Vec<Event>)> = Vec::new();
+        let mut wake_recorded = false;
+        let mut first_wait: Option<WaitReason> = None;
+        for (agent, host, decl) in recipes {
+            ensure_agent_member(&sess, agent)?;
+            let needs = match needs_claim(classify_session(&sess, agent)?) {
+                Ok(needs) => needs,
+                Err(Error::Waiting(reason)) => {
+                    first_wait.get_or_insert(reason);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            match sess.check_turn_gate(agent, decl.as_ref()) {
+                Ok(()) => {}
+                Err(Error::Waiting(reason)) => {
+                    first_wait.get_or_insert(reason);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+
+            let agent_start = sess.events()?.len();
+            if needs {
+                claim.claim(&sess, agent, host)?;
+            }
+            if !wake_recorded {
+                record_wake(&sess, &wake)?;
+                wake_recorded = true;
+            }
+            sess.turn_start_with(agent, decl)?;
+            let events = sess.events()?;
+            let from = if out.is_empty() {
+                start_len
+            } else {
+                agent_start
+            };
+            out.push((agent, events[from..].to_vec()));
+        }
+        if out.is_empty() {
+            return Err(Error::Waiting(first_wait.unwrap_or(WaitReason::TurnOpen)));
+        }
+        Ok(out)
     }
 
     /// For each kept `(session, agent)` with a due timer (`next_due_ms <= now`),
@@ -2508,6 +2605,90 @@ mod tests {
         let fired = rt.tick(Some(later)).unwrap();
         let who: Vec<_> = fired.iter().map(|(_, ag, _)| *ag).collect();
         assert_eq!(who, vec![b.id]);
+    }
+
+    /// Wake-each-kept: two kept ParallelSafe Agents both receive one shared
+    /// UserQuery (one UserMessage, each gets TurnStart). A first-only wake
+    /// mutant fails this floor.
+    #[test]
+    fn wake_each_kept_addresses_every_kept_agent() {
+        let rt = Runtime::new();
+        let a = rt.store().create_agent("a", "");
+        let b = rt.store().create_agent("b", "");
+        let user = rt.store().create_user("cheng");
+        let session = rt.create_session();
+        let sid = session.id();
+        session.join(Member::User(user.id)).unwrap();
+        rt.keep(sid, a.id, goose()).unwrap();
+        rt.keep(sid, b.id, codex()).unwrap();
+        opt_in(&rt, sid, &[a.id, b.id]);
+
+        let woke = rt
+            .wake_each_kept(
+                sid,
+                Wake::UserQuery {
+                    user: user.id,
+                    text: "hi".into(),
+                },
+            )
+            .unwrap();
+        let who: Vec<_> = woke.iter().map(|(ag, _)| *ag).collect();
+        assert_eq!(who, vec![a.id, b.id], "keep order; first-only mutant fails");
+        assert_eq!(turn_starts_of(&woke[0].1, a.id), 1);
+        assert_eq!(turn_starts_of(&woke[0].1, b.id), 0);
+        assert_eq!(turn_starts_of(&woke[1].1, b.id), 1);
+        assert_eq!(kind_of(&session, a.id), "goose");
+        assert_eq!(kind_of(&session, b.id), "codex");
+        assert!(session.current_turn_of(a.id).unwrap().is_some());
+        assert!(session.current_turn_of(b.id).unwrap().is_some());
+
+        let log = session.events().unwrap();
+        let ums: Vec<_> = log
+            .iter()
+            .filter(|e| matches!(e.body, EventBody::UserMessage { .. }))
+            .collect();
+        assert_eq!(ums.len(), 1, "one shared UserMessage, not per-Agent");
+        assert!(matches!(
+            &ums[0].body,
+            EventBody::UserMessage { text, .. } if text == "hi"
+        ));
+
+        // All busy → Waiting, nothing new appended.
+        let len = log.len();
+        assert!(matches!(
+            rt.wake_each_kept(
+                sid,
+                Wake::UserQuery {
+                    user: user.id,
+                    text: "again".into(),
+                }
+            ),
+            Err(Error::Waiting(WaitReason::TurnOpen))
+        ));
+        assert_eq!(session.events().unwrap().len(), len, "wait appends nothing");
+    }
+
+    /// Without ParallelSafe, wake_each_kept still walks keep order but the
+    /// conflict gate admits only the first ready Agent; the rest skip.
+    #[test]
+    fn wake_each_kept_without_parallel_safe_fires_first_ready_only() {
+        let rt = Runtime::new();
+        let a = rt.store().create_agent("a", "");
+        let b = rt.store().create_agent("b", "");
+        let session = rt.create_session();
+        let sid = session.id();
+        rt.keep(sid, a.id, goose()).unwrap();
+        rt.keep(sid, b.id, codex()).unwrap();
+
+        let woke = rt.wake_each_kept(sid, Wake::Timer).unwrap();
+        assert_eq!(woke.len(), 1);
+        assert_eq!(woke[0].0, a.id);
+        assert!(session.current_turn_of(a.id).unwrap().is_some());
+        assert!(session.current_turn_of(b.id).unwrap().is_none());
+        assert_eq!(kind_of(&session, a.id), "goose");
+        // B never claimed: still NeverBound (first-ready skip, not a borrowed
+        // recipe — B's recipe stays B's when it later wakes alone).
+        assert_eq!(rt.classify(sid, b.id).unwrap(), Liveness::NeverBound);
     }
 
     /// release_agent drops one recipe (and only its own lease); releasing
