@@ -193,6 +193,10 @@ async fn get_session(
 struct JoinBody {
     user: Option<String>,
     agent: Option<String>,
+    /// Optional ParallelSafe path list for an Agent join/keep. Omit/`None`
+    /// keeps fail-closed serialize (Service-parallel-safe-declare). Never
+    /// inferred from tools.
+    parallel_safe: Option<Vec<String>>,
 }
 
 /// Production keep stand-in. Grok is a test-only HostKind; do not replace this.
@@ -203,11 +207,15 @@ fn keep_standin(st: &AppState, id: SessionId, agent: hearth::AgentId) -> Result<
 }
 
 /// Shared join used by HTTP POST /join and WS `{"type":"join",...}`.
+///
+/// `parallel_safe` (optional path list) is applied only on Agent keep via
+/// [`Runtime::set_parallel_safe`]. Omit/`None` → fail-closed serialize.
 fn apply_join(
     st: &AppState,
     id: SessionId,
     user: Option<String>,
     agent: Option<String>,
+    parallel_safe: Option<Vec<String>>,
 ) -> Result<EventOut, StatusCode> {
     let session = st.store().session(id).map_err(|_| StatusCode::NOT_FOUND)?;
     let mut names = st
@@ -242,6 +250,12 @@ fn apply_join(
     drop(names);
     if let Some(aid) = keep_agent {
         keep_standin(st, id, aid)?;
+        // Explicit declare only — never inferred from tools (DESIGN).
+        if let Some(paths) = parallel_safe {
+            st.runtime
+                .set_parallel_safe(id, aid, Some(hearth::ParallelSafe::paths(paths)))
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        }
     }
     let out = event_out(&ev);
     st.publish(id, out.clone());
@@ -254,7 +268,7 @@ async fn join_session(
     Json(body): Json<JoinBody>,
 ) -> Result<Json<SessionView>, StatusCode> {
     let id = sid(&id)?;
-    apply_join(&st, id, body.user, body.agent)?;
+    apply_join(&st, id, body.user, body.agent, body.parallel_safe)?;
     let session = st.store().session(id).map_err(|_| StatusCode::NOT_FOUND)?;
     Ok(Json(view(&session)))
 }
@@ -395,6 +409,8 @@ struct WsIn {
     kind: Option<String>,
     user: Option<String>,
     agent: Option<String>,
+    /// Optional ParallelSafe path list on Agent join (same as HTTP JoinBody).
+    parallel_safe: Option<Vec<String>>,
     message: Option<String>,
     text: Option<String>,
 }
@@ -409,7 +425,7 @@ fn apply_ws_text(st: &AppState, id: SessionId, txt: &str) -> Result<EventOut, St
         let text = text.ok_or(StatusCode::BAD_REQUEST)?;
         apply_user_message(st, id, name, text)
     } else if kind == "join" || kind.is_empty() {
-        apply_join(st, id, body.user, body.agent)
+        apply_join(st, id, body.user, body.agent, body.parallel_safe)
     } else {
         Err(StatusCode::BAD_REQUEST)
     }
@@ -602,20 +618,25 @@ mod tests {
         let sid = session.id();
         let id = sid.0.to_string();
 
-        apply_join(&st, sid, Some("cheng".into()), None).unwrap();
-        apply_join(&st, sid, None, Some("alpha".into())).unwrap();
-        apply_join(&st, sid, None, Some("beta".into())).unwrap();
+        apply_join(&st, sid, Some("cheng".into()), None, None).unwrap();
+        apply_join(
+            &st,
+            sid,
+            None,
+            Some("alpha".into()),
+            Some(vec!["agent-0".into()]),
+        )
+        .unwrap();
+        apply_join(
+            &st,
+            sid,
+            None,
+            Some("beta".into()),
+            Some(vec!["agent-1".into()]),
+        )
+        .unwrap();
         let agents = st.runtime.kept_agents(sid);
         assert_eq!(agents.len(), 2, "join keeps each Agent");
-        for (i, a) in agents.iter().enumerate() {
-            st.runtime
-                .set_parallel_safe(
-                    sid,
-                    *a,
-                    Some(hearth::ParallelSafe::paths([format!("agent-{i}")])),
-                )
-                .unwrap();
-        }
 
         let app = router(st.clone());
         let (code, body) = call(
@@ -795,27 +816,27 @@ mod tests {
         let _ = b.close(None).await;
     }
 
-    /// Service-host-wake-each Must floor helper: two ParallelSafe Agents with
-    /// Host Bindings + RemintSession + Fake wires installed on AppState.
-    fn install_two_parallel_safe_host_wires(
+    /// Join two Agents with optional ParallelSafe path lists (product join
+    /// path), then install Host Bindings + RemintSession + Fake wires.
+    /// `None` paths → undeclared (fail-closed serialize).
+    fn install_two_host_wires_with_declare(
         st: &AppState,
         sid: SessionId,
         lost: Option<hearth_agent_wire::OldWire>,
+        paths_a: Option<Vec<String>>,
+        paths_b: Option<Vec<String>>,
     ) -> (hearth::AgentId, hearth::AgentId, hearth::Place) {
-        use hearth::{Host, ParallelSafe, PlaceAttach};
+        use hearth::{Host, PlaceAttach};
         use hearth_agent_wire::{LiveCaps as WireCaps, RemintSession};
 
-        apply_join(st, sid, Some("cheng".into()), None).unwrap();
-        apply_join(st, sid, None, Some("alpha".into())).unwrap();
-        apply_join(st, sid, None, Some("beta".into())).unwrap();
+        apply_join(st, sid, Some("cheng".into()), None, None).unwrap();
+        // Service-parallel-safe-declare: product path declares via join body,
+        // not Runtime::set_parallel_safe from the test.
+        apply_join(st, sid, None, Some("alpha".into()), paths_a).unwrap();
+        apply_join(st, sid, None, Some("beta".into()), paths_b).unwrap();
         let agents = st.runtime.kept_agents(sid);
         assert_eq!(agents.len(), 2);
         let (a, b) = (agents[0], agents[1]);
-        for (i, ag) in [a, b].into_iter().enumerate() {
-            st.runtime
-                .set_parallel_safe(sid, ag, Some(ParallelSafe::paths([format!("agent-{i}")])))
-                .unwrap();
-        }
 
         let session = st.store().session(sid).unwrap();
         let place = hearth::Place::local_dir(
@@ -846,6 +867,23 @@ mod tests {
             st.install_host_wire(sid, ag, wire).unwrap();
         }
         (a, b, place)
+    }
+
+    /// Service-host-wake-each Must floor helper: two ParallelSafe Agents with
+    /// Host Bindings + RemintSession + Fake wires installed on AppState.
+    /// Declares disjoint paths via the join product path.
+    fn install_two_parallel_safe_host_wires(
+        st: &AppState,
+        sid: SessionId,
+        lost: Option<hearth_agent_wire::OldWire>,
+    ) -> (hearth::AgentId, hearth::AgentId, hearth::Place) {
+        install_two_host_wires_with_declare(
+            st,
+            sid,
+            lost,
+            Some(vec!["agent-0".into()]),
+            Some(vec!["agent-1".into()]),
+        )
     }
 
     /// Must: HTTP steer through host_wake fan-out → both ParallelSafe Agents
@@ -1064,6 +1102,201 @@ mod tests {
             .filter(|e| matches!(e.body, EventBody::UserMessage { .. }))
             .count();
         assert_eq!(ums, 1, "Claim-before-record: one shared wake for A");
+    }
+
+    /// Must (Service-parallel-safe-declare): HTTP POST /join with optional
+    /// `parallel_safe` path list → set_parallel_safe; two Agents with disjoint
+    /// paths + one HTTP steer through host_wake → both LiveInTurn (composes #69).
+    #[tokio::test]
+    async fn http_join_parallel_safe_declare_both_live_in_turn() {
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let id = sid.0.to_string();
+        let app = router(st.clone());
+
+        let (code, _) = call(
+            app.clone(),
+            Request::post(format!("/sessions/{id}/join"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"user":"cheng"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        let (code, _) = call(
+            app.clone(),
+            Request::post(format!("/sessions/{id}/join"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"agent":"alpha","parallel_safe":["agent-0"]}"#,
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        let (code, _) = call(
+            app.clone(),
+            Request::post(format!("/sessions/{id}/join"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"agent":"beta","parallel_safe":["agent-1"]}"#,
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+
+        let agents = st.runtime.kept_agents(sid);
+        assert_eq!(agents.len(), 2);
+        let (a, b) = (agents[0], agents[1]);
+        // Wire HostAttach so steer composes #69 host_wake fan-out.
+        install_host_wires_for_kept(&st, sid, a, b, None);
+
+        let (code, body) = call(
+            app,
+            Request::post(format!("/sessions/{id}/events"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"user":"cheng","message":"declare-both"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "body={body}");
+        assert!(body.contains("declare-both"));
+
+        let session = st.store().session(sid).unwrap();
+        assert!(
+            session.current_turn_of(a).unwrap().is_some(),
+            "A LiveInTurn via HTTP parallel_safe declare"
+        );
+        assert!(
+            session.current_turn_of(b).unwrap().is_some(),
+            "B LiveInTurn via HTTP parallel_safe declare"
+        );
+        assert_eq!(
+            st.runtime.classify(sid, a).unwrap(),
+            hearth::Liveness::LiveInTurn
+        );
+        assert_eq!(
+            st.runtime.classify(sid, b).unwrap(),
+            hearth::Liveness::LiveInTurn
+        );
+    }
+
+    /// Must: omit parallel_safe on join → fail-closed serialize; one steer
+    /// through host_wake admits only the first ready Agent (Waiting/TurnOpen
+    /// skips the peer). Conflict gate unchanged.
+    #[tokio::test]
+    async fn http_join_missing_parallel_safe_serializes() {
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let id = sid.0.to_string();
+        let (a, b, _) = install_two_host_wires_with_declare(&st, sid, None, None, None);
+
+        let app = router(st.clone());
+        let (code, body) = call(
+            app,
+            Request::post(format!("/sessions/{id}/events"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"user":"cheng","message":"no-declare"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "body={body}");
+        assert!(body.contains("no-declare"));
+
+        let session = st.store().session(sid).unwrap();
+        assert!(
+            session.current_turn_of(a).unwrap().is_some(),
+            "first Agent still wakes"
+        );
+        assert!(
+            session.current_turn_of(b).unwrap().is_none(),
+            "undeclared peer serializes (Waiting TurnOpen skip)"
+        );
+        assert_eq!(
+            st.runtime.classify(sid, a).unwrap(),
+            hearth::Liveness::LiveInTurn
+        );
+    }
+
+    /// Must: overlapping ParallelSafe path lists still serialize — conflict
+    /// gate unchanged (B Waiting/skip while A LiveInTurn).
+    #[tokio::test]
+    async fn http_join_overlapping_parallel_safe_serializes() {
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let id = sid.0.to_string();
+        let (a, b, _) = install_two_host_wires_with_declare(
+            &st,
+            sid,
+            None,
+            Some(vec!["src".into()]),
+            Some(vec!["src/lib.rs".into()]),
+        );
+
+        let app = router(st.clone());
+        let (code, body) = call(
+            app,
+            Request::post(format!("/sessions/{id}/events"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"user":"cheng","message":"overlap"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "body={body}");
+        assert!(body.contains("overlap"));
+
+        let session = st.store().session(sid).unwrap();
+        assert!(
+            session.current_turn_of(a).unwrap().is_some(),
+            "first Agent wakes"
+        );
+        assert!(
+            session.current_turn_of(b).unwrap().is_none(),
+            "overlapping peer serializes (gate skip)"
+        );
+    }
+
+    /// Install Fake Host wires for already-kept Agents (HTTP-join floors).
+    fn install_host_wires_for_kept(
+        st: &AppState,
+        sid: SessionId,
+        a: hearth::AgentId,
+        b: hearth::AgentId,
+        lost: Option<hearth_agent_wire::OldWire>,
+    ) {
+        use hearth::{Host, PlaceAttach};
+        use hearth_agent_wire::{LiveCaps as WireCaps, RemintSession};
+
+        let session = st.store().session(sid).unwrap();
+        let place = hearth::Place::local_dir(
+            std::env::temp_dir().to_string_lossy().as_ref(),
+            PlaceAttach::MustExist,
+        );
+        session.attach_place(place.clone()).unwrap();
+        let names = st.names.lock().unwrap();
+        let uid = *names.users.get("cheng").unwrap();
+        drop(names);
+        let caps = WireCaps {
+            resume: true,
+            cancel: true,
+            close: true,
+            load_session: false,
+        };
+        for (ag, resume_id) in [(a, "S-a"), (b, "S-b")] {
+            let host = Host::from_bind("acp", Some(resume_id.into()), None);
+            session.rebind(None, ag, host).unwrap();
+            let remint = RemintSession::on_host_session(session.clone(), ag, uid, resume_id, caps)
+                .expect("remint session");
+            let wire = match &lost {
+                Some(w) => AgentHostWire::fake_lost(remint, Some(place.clone()), w.clone()),
+                None => AgentHostWire::fake_live(remint, Some(place.clone())),
+            };
+            st.install_host_wire(sid, ag, wire).unwrap();
+        }
     }
 
     #[allow(clippy::result_large_err)] // tungstenite::Error is upstream; test-only helper
