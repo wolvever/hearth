@@ -11,9 +11,11 @@
 //! # Architecture
 //! - **Transport** owns framing (Content-Length JSON-RPC, SSE EventSource, WS JSON, JSONL RPC).
 //! - **AdapterCodec** maps typed [`transport::WireFrame`]s ↔ [`AgentEvent`] / [`AgentCommand`].
-//! - **Catalog** maps an ACP profile (Copilot, Cursor) to [`catalog::LaunchSpec`] data.
-//!   Shared [`adapters::acp::AcpCodec`] on newline-delimited JSON-RPC (`jsonl-rpc`),
-//!   not Content-Length. Pi `rpc_chunk` is not used for ACP.
+//! - **Catalog** maps an ACP profile (Copilot, Cursor, Claude-acp) to
+//!   [`catalog::LaunchSpec`] data. Shared [`adapters::acp::AcpCodec`] on
+//!   newline-delimited JSON-RPC (`jsonl-rpc`), not Content-Length. Pi
+//!   `rpc_chunk` is not used for ACP. Claude-acp advertises `subagent`
+//!   via [`CapabilityFlags::CLAUDE_ACP`]; generic ACP stays false.
 //! - **Runner** ([`runner::AttachRunner`]) spawns/pumps framed stdio from a
 //!   [`LaunchSpec`]. ACP uses [`JsonlRpcTransport::without_rpc_chunks`]. Remint
 //!   is resume-not-load + fail-closed (never `session/new` / `session/load`

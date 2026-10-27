@@ -1,9 +1,10 @@
 //! ACP catalog: a profile resolves to [`LaunchSpec`] data.
 //!
-//! Builtin Copilot and Cursor rows live in [`builtin.toml`](builtin.toml).
-//! Both extend [`crate::adapters::acp::AcpCodec`] on newline-delimited
-//! JSON-RPC ([`WireKind::JsonlRpc`]). Pi `rpc_chunk` reassembly is not
-//! used. This module does not spawn, and it is not a kernel noun or a Queue.
+//! Builtin Copilot, Cursor, and Claude-acp rows live in
+//! [`builtin.toml`](builtin.toml). All extend
+//! [`crate::adapters::acp::AcpCodec`] on newline-delimited JSON-RPC
+//! ([`WireKind::JsonlRpc`]). Pi `rpc_chunk` reassembly is not used. This
+//! module does not spawn, and it is not a kernel noun or a Queue.
 //!
 //! Reattach is [`crate::host::HostAttach::resume`] (`native_resume_id`),
 //! never Gemini-style `session/load`. Live capability gating (a profile may
@@ -66,11 +67,24 @@ impl CatalogProfile {
         }
     }
 
-    /// Shared ACP codec. Copilot and Cursor do not get their own adapter.
+    /// Shared ACP codec. Copilot, Cursor, and Claude-acp do not get their
+    /// own adapter — they share [`AcpCodec`].
     pub fn codec(&self) -> AcpCodec {
         match self.extends {
             CatalogExtends::Acp => AcpCodec,
         }
+    }
+
+    /// Effective capability flags for this profile.
+    ///
+    /// Builtin Copilot / Cursor inherit [`CapabilityFlags::ACP`]
+    /// (`subagent: false`). `claude-acp` overrides with
+    /// [`CapabilityFlags::CLAUDE_ACP`] (`subagent: true`) so ACP
+    /// parent/subagent decode is capability-honest. The override is set
+    /// in Rust for the curated builtin row — not from TOML — so generic
+    /// ACP and non-Claude profiles stay false.
+    pub fn caps(&self) -> CapabilityFlags {
+        self.caps_override.unwrap_or(CapabilityFlags::ACP)
     }
 }
 
@@ -183,11 +197,26 @@ pub fn load_profiles(path: &Path) -> Result<Vec<CatalogProfile>, BusError> {
 pub fn builtin_profiles() -> &'static [CatalogProfile] {
     static BUILTIN: OnceLock<Vec<CatalogProfile>> = OnceLock::new();
     BUILTIN.get_or_init(|| {
-        load_profiles_str(include_str!("builtin.toml")).expect("catalog/builtin.toml")
+        let mut profiles =
+            load_profiles_str(include_str!("builtin.toml")).expect("catalog/builtin.toml");
+        apply_builtin_caps(&mut profiles);
+        profiles
     })
 }
 
-/// Lookup a builtin profile by id (`"copilot"`, `"cursor"`).
+/// Apply curated capability overrides that stay off `builtin.toml`.
+///
+/// Today: `claude-acp` → [`CapabilityFlags::CLAUDE_ACP`] (`subagent: true`).
+/// Copilot / Cursor leave `caps_override` unset (ACP defaults).
+fn apply_builtin_caps(profiles: &mut [CatalogProfile]) {
+    for profile in profiles {
+        if profile.id == "claude-acp" {
+            profile.caps_override = Some(CapabilityFlags::CLAUDE_ACP);
+        }
+    }
+}
+
+/// Lookup a builtin profile by id (`"copilot"`, `"cursor"`, `"claude-acp"`).
 pub fn lookup_profile(id: &str) -> Option<&'static CatalogProfile> {
     builtin_profiles().iter().find(|p| p.id == id)
 }
@@ -215,18 +244,23 @@ mod tests {
     }
 
     #[test]
-    fn builtin_fixture_resolves_copilot_and_cursor_launch_specs() {
-        let from_file = load_profiles_str(&builtin_fixture_text()).unwrap();
+    fn builtin_fixture_resolves_copilot_cursor_and_claude_acp_launch_specs() {
+        let mut from_file = load_profiles_str(&builtin_fixture_text()).unwrap();
+        apply_builtin_caps(&mut from_file);
         assert_eq!(from_file, builtin_profiles());
 
         let copilot = lookup_profile("copilot").expect("copilot");
         let cursor = lookup_profile("cursor").expect("cursor");
+        let claude = lookup_profile("claude-acp").expect("claude-acp");
         assert_eq!(copilot.label, "GitHub Copilot");
         assert_eq!(cursor.label, "Cursor");
+        assert_eq!(claude.label, "Claude Code (ACP)");
         assert_eq!(copilot.extends, CatalogExtends::Acp);
         assert_eq!(cursor.extends, CatalogExtends::Acp);
+        assert_eq!(claude.extends, CatalogExtends::Acp);
         assert!(copilot.caps_override.is_none());
         assert!(cursor.caps_override.is_none());
+        assert_eq!(claude.caps_override, Some(CapabilityFlags::CLAUDE_ACP));
 
         let copilot_spec = copilot.launch_spec().unwrap();
         assert_eq!(
@@ -250,27 +284,106 @@ mod tests {
                 wire: WireKind::JsonlRpc,
             }
         );
+        let claude_spec = claude.launch_spec().unwrap();
+        assert_eq!(
+            claude_spec,
+            LaunchSpec {
+                program: "claude-agent-acp".into(),
+                args: vec![],
+                cwd: None,
+                env: vec![],
+                wire: WireKind::JsonlRpc,
+            }
+        );
         assert_eq!(copilot_spec.wire.as_str(), "jsonl-rpc");
         assert_eq!(cursor_spec.wire.as_str(), "jsonl-rpc");
+        assert_eq!(claude_spec.wire.as_str(), "jsonl-rpc");
         assert_ne!(copilot_spec.wire, WireKind::JsonRpc);
         assert_ne!(cursor_spec.wire, WireKind::JsonRpc);
         assert!(WireKind::parse(copilot_spec.wire.as_str()).is_some());
         assert!(WireKind::parse(cursor_spec.wire.as_str()).is_some());
+        assert!(WireKind::parse(claude_spec.wire.as_str()).is_some());
+    }
+
+    /// Floors: selecting `claude-acp` advertises `subagent`; Copilot /
+    /// Cursor / generic ACP stay false (capability-honest with #49 decode).
+    #[test]
+    fn claude_acp_profile_advertises_subagent_non_claude_stay_false() {
+        let claude = lookup_profile("claude-acp").expect("claude-acp");
+        assert!(claude.caps().subagent);
+        assert_eq!(claude.caps(), CapabilityFlags::CLAUDE_ACP);
+        assert_eq!(claude.codec().kind(), AgentKind::Acp);
+        assert_eq!(claude.wire, WireKind::JsonlRpc);
+
+        for id in ["copilot", "cursor"] {
+            let profile = lookup_profile(id).expect(id);
+            assert!(!profile.caps().subagent, "{id} must not advertise subagent");
+            assert!(profile.caps_override.is_none());
+            assert_eq!(profile.caps(), CapabilityFlags::ACP);
+        }
+        // Registry / for_agent floors (non-const so clippy stays quiet).
+        assert!(!CapabilityFlags::for_agent(AgentKind::Acp).subagent);
+        assert!(
+            !registry()
+                .iter()
+                .find(|i| i.kind == AgentKind::Acp)
+                .unwrap()
+                .flags
+                .subagent
+        );
+        assert!(
+            !registry()
+                .iter()
+                .find(|i| i.kind == AgentKind::GrokBuild)
+                .unwrap()
+                .flags
+                .subagent
+        );
+        assert!(
+            !registry()
+                .iter()
+                .find(|i| i.kind == AgentKind::Codex)
+                .unwrap()
+                .flags
+                .subagent
+        );
+        assert!(
+            !registry()
+                .iter()
+                .find(|i| i.kind == AgentKind::OpenCode)
+                .unwrap()
+                .flags
+                .subagent
+        );
+        // Pi already advertises subagent on its own AgentKind — unchanged.
+        assert!(
+            registry()
+                .iter()
+                .find(|i| i.kind == AgentKind::Pi)
+                .unwrap()
+                .flags
+                .subagent
+        );
     }
 
     #[test]
-    fn copilot_and_cursor_share_acp_codec_on_fixture() {
+    fn catalog_profiles_share_acp_codec_on_fixture() {
         let frame = WireFrame::Json(acp_tool_fixture());
         let copilot = lookup_profile("copilot").unwrap().codec();
         let cursor = lookup_profile("cursor").unwrap().codec();
+        let claude = lookup_profile("claude-acp").unwrap().codec();
         assert_eq!(copilot.kind(), AgentKind::Acp);
         assert_eq!(cursor.kind(), AgentKind::Acp);
+        assert_eq!(claude.kind(), AgentKind::Acp);
         assert_eq!(copilot.wire(), cursor.wire());
+        assert_eq!(copilot.wire(), claude.wire());
         assert_eq!(copilot.wire(), WireKind::JsonlRpc.as_str());
         assert_ne!(copilot.wire(), WireKind::JsonRpc.as_str());
         let left = copilot.decode_event(&frame).unwrap();
         let right = cursor.decode_event(&frame).unwrap();
+        let claude_ev = claude.decode_event(&frame).unwrap();
         assert_eq!(left, right);
+        assert_eq!(left, claude_ev);
         assert!(matches!(
             left,
             Some(AgentEvent::ToolCall { ref item_id, ref name, .. })
@@ -301,7 +414,7 @@ mod tests {
 
     #[test]
     fn resume_not_load_profiles_do_not_speak_session_load() {
-        for id in ["copilot", "cursor"] {
+        for id in ["copilot", "cursor", "claude-acp"] {
             let spec = lookup_profile(id).unwrap().launch_spec().unwrap();
             let argv =
                 std::iter::once(spec.program.as_str()).chain(spec.args.iter().map(String::as_str));
@@ -416,7 +529,7 @@ mod tests {
         use crate::transport::{JsonlRpcTransport, Transport};
         use crate::AgentCommand;
 
-        for id in ["copilot", "cursor"] {
+        for id in ["copilot", "cursor", "claude-acp"] {
             let profile = lookup_profile(id).unwrap();
             assert_eq!(profile.wire, WireKind::JsonlRpc);
             let frame = profile

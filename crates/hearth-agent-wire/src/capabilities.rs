@@ -94,6 +94,15 @@ impl CapabilityFlags {
     /// Grok Build is an ACP profile — same landed flags as [`Self::ACP`].
     pub const GROK_BUILD: Self = Self::ACP;
 
+    /// Claude Code over ACP (`claude-acp` catalog profile). Same landed
+    /// surface as [`Self::ACP`], plus `subagent: true` so parent/subagent
+    /// decode (#49) is capability-honest. Generic [`Self::ACP`].subagent
+    /// stays false; only selecting this profile advertises the cap.
+    pub const CLAUDE_ACP: Self = Self {
+        subagent: true,
+        ..Self::ACP
+    };
+
     /// Codex App Server. Permission encode is a stub (flag stays false).
     /// Differs from [`Self::ACP`] on plan / permission / compact.
     pub const CODEX: Self = Self {
@@ -375,6 +384,19 @@ mod tests {
             CapabilityFlags::GROK_BUILD
         );
         assert_eq!(CapabilityFlags::ACP, CapabilityFlags::GROK_BUILD);
+        // Claude-acp is a catalog profile override, not an AgentKind: the
+        // generic ACP / registry row stays subagent-false.
+        assert!(!CapabilityFlags::for_agent(AgentKind::Acp).subagent);
+        assert!(!lookup(AgentKind::Acp).unwrap().flags.subagent);
+        let claude = CapabilityFlags::CLAUDE_ACP;
+        assert!(claude.subagent);
+        assert_eq!(
+            claude,
+            CapabilityFlags {
+                subagent: true,
+                ..CapabilityFlags::ACP
+            }
+        );
     }
 
     #[test]
