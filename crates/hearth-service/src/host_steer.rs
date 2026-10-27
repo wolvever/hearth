@@ -2,23 +2,26 @@
 //!
 //! Closes the production hole between #46–#68 kernel/wire proofs and the
 //! HTTP-visible orch path. Keep recipe stays a Host ticket per Agent; wires
-//! are a HostAttach / RemintSession map keyed by Agent (Fake / Loopback OK).
+//! are a HostAttach / RemintSession map keyed by Agent (Fake / Loopback / Real OK).
 //! SoftExpiring / fleet / ToolResult parent / v2 / durable EventLog parked.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use hearth::{AgentId, Event, Place, SessionId, Wake};
 use hearth_agent_wire::{
     transport_for_wire, wake_each_kept_through_host_wake, AttachRunner, HostRemintFullArgs,
-    KeptWakeWire, OldWire, RemintSession, RpcId, RunnerTransport, WakeEachKeptThroughHost,
-    WakeEachKeptThroughHostArgs, WakeThroughError, WireKind,
+    KeptWakeWire, LaunchSpec, OldWire, RemintSession, RpcId, RunnerTransport,
+    WakeEachKeptThroughHost, WakeEachKeptThroughHostArgs, WakeThroughError, WireKind,
 };
 
 use crate::AppState;
 
 /// One kept Agent's Host wire held by the service for steer / remint.
 ///
-/// Host supplies Fake or Real [`AttachRunner`]s; Must floors use Fake.
+/// Host supplies Fake or Real [`AttachRunner`]s. LiveIdle / quick remint Must
+/// floors use Fake; Real Exited concurrent remint Must
+/// ([`Self::real_exited`]) probes a Real CLI — no Fake Exited injection.
 pub struct AgentHostWire {
     pub remint: RemintSession,
     pub old: AttachRunner,
@@ -59,6 +62,24 @@ impl AgentHostWire {
             new: new_wire_fake(),
             new_transport: transport_for_wire(WireKind::JsonlRpc),
             old_wire: lost,
+            place,
+            old_next_rpc_id: 10,
+            new_next_rpc_id: 2,
+            init_rpc_id: RpcId::Num(1),
+        }
+    }
+
+    /// Build a Real-old / Fake-new wire after probing `sh -c 'exit {code}'` to
+    /// [`OldWire::Exited`]. Service-real-cli-concurrent-remint Must path —
+    /// reuses wire `spawn_and_probe_real_exit` (#64); never Fake-injects Exited.
+    pub fn real_exited(remint: RemintSession, place: Option<Place>, code: i32) -> Self {
+        let (old, old_wire) = spawn_and_probe_real_exit(code);
+        Self {
+            remint,
+            old,
+            new: new_wire_fake(),
+            new_transport: transport_for_wire(WireKind::JsonlRpc),
+            old_wire,
             place,
             old_next_rpc_id: 10,
             new_next_rpc_id: 2,
@@ -197,6 +218,33 @@ pub enum SteerError {
     Waiting(hearth::WaitReason),
     Runtime(hearth::Error),
     Remint(hearth_agent_wire::RemintError),
+}
+
+/// Spawn a Real CLI that exits with `code` and probe until [`OldWire::Exited`].
+/// Mirrors wire `spawn_and_probe_real_exit` (#64) for the service Host-wire map.
+fn spawn_and_probe_real_exit(code: i32) -> (AttachRunner, OldWire) {
+    let spec = LaunchSpec {
+        program: "sh".into(),
+        args: vec!["-c".into(), format!("exit {code}")],
+        cwd: None,
+        env: Vec::new(),
+        wire: WireKind::JsonlRpc,
+    };
+    let mut old = AttachRunner::spawn(spec).expect("spawn real CLI");
+    let mut old_wire = OldWire::Unknown;
+    for _ in 0..50 {
+        old_wire = old.probe_exit();
+        if matches!(old_wire, OldWire::Exited(_)) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        old_wire,
+        OldWire::Exited(code),
+        "Real probe must observe Exited (no Fake Exited injection)"
+    );
+    (old, old_wire)
 }
 
 /// Fake JSONL child that answered `initialize` (id 0).
