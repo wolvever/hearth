@@ -17,8 +17,8 @@ use std::collections::HashMap;
 
 use crate::adapters::acp::{self, ClientCapabilities, ClientRequestRoute};
 use crate::{
-    AgentCommand, AgentEvent, AgentKind, BusError, CodingAgent, LoopbackAgent, PermissionOption,
-    RpcId,
+    AgentCommand, AgentEvent, AgentKind, BusError, CapabilityFlags, CodingAgent, LoopbackAgent,
+    PermissionOption, RpcId,
 };
 use hearth::{
     AgentId, Binding, BindingId, Event, EventBody, EventId, Host, HostKind, PermissionRpc,
@@ -147,9 +147,21 @@ pub fn host_for(
 /// `_meta.claudeCode.parentToolUseId`) lands as `parent_tool_call_id` on
 /// [`EventBody::ToolCall`] / [`EventBody::AgentMessage`] /
 /// [`EventBody::PermissionAsked`] (outside [`PermissionRpc`]) — an Event field,
-/// never a child Session or Binding. The wire `subagent` launch marker and
-/// `SubagentStarted` / `SubagentEnded` are not appended.
-pub fn event_bodies(binding: BindingId, agent: AgentId, ev: &AgentEvent) -> Vec<EventBody> {
+/// never a child Session or Binding — **only when** `caps.subagent` is true
+/// ([`CapabilityFlags`] from [`crate::catalog::CatalogProfile::caps`] /
+/// [`HostAttach::with_agent_caps`], default [`CapabilityFlags::for_agent`]).
+/// When `caps.subagent` is false (generic ACP / Copilot / Cursor), parent is
+/// stripped to `None` even if the wire `_meta` carries `parentToolUseId`
+/// (fail-closed; catalog advertise alone is not enough). The wire `subagent`
+/// launch marker and `SubagentStarted` / `SubagentEnded` are not appended.
+pub fn event_bodies(
+    binding: BindingId,
+    agent: AgentId,
+    ev: &AgentEvent,
+    caps: CapabilityFlags,
+) -> Vec<EventBody> {
+    let retain_parent = caps.subagent;
+    let parent_id = |p: &Option<String>| if retain_parent { p.clone() } else { None };
     match ev {
         AgentEvent::Message {
             role, text, parent, ..
@@ -157,14 +169,14 @@ pub fn event_bodies(binding: BindingId, agent: AgentId, ev: &AgentEvent) -> Vec<
             vec![EventBody::AgentMessage {
                 agent,
                 text: text.clone(),
-                parent_tool_call_id: parent.clone(),
+                parent_tool_call_id: parent_id(parent),
             }]
         }
         AgentEvent::MessageDelta { delta, parent, .. } if !delta.is_empty() => {
             vec![EventBody::AgentMessage {
                 agent,
                 text: delta.clone(),
-                parent_tool_call_id: parent.clone(),
+                parent_tool_call_id: parent_id(parent),
             }]
         }
         AgentEvent::Thinking { text, .. } => vec![EventBody::AgentThink {
@@ -188,7 +200,7 @@ pub fn event_bodies(binding: BindingId, agent: AgentId, ev: &AgentEvent) -> Vec<
             tool_call_id: item_id.clone(),
             name: name.clone(),
             input: arguments.to_string(),
-            parent_tool_call_id: parent.clone(),
+            parent_tool_call_id: parent_id(parent),
         }],
         AgentEvent::ToolResult {
             item_id, output, ..
@@ -226,7 +238,7 @@ pub fn event_bodies(binding: BindingId, agent: AgentId, ev: &AgentEvent) -> Vec<
                     rpc_id: id.to_string(),
                     tool_call_id: tool_item_id.clone(),
                 }),
-                parent_tool_call_id: parent.clone(),
+                parent_tool_call_id: parent_id(parent),
             }]
         }
         AgentEvent::QuestionAsk { prompts, .. } => vec![EventBody::AskUser {
@@ -262,12 +274,18 @@ pub struct HostAttach<A: CodingAgent> {
     /// Explicit parallel-safe opt-in for turns this attach opens (prompt
     /// submit / wire `TurnStarted`). `None` = fail-closed.
     parallel_safe: Option<hearth::ParallelSafe>,
+    /// Adapter / catalog capability row consulted on drain when retaining
+    /// subagent nesting. Defaults to [`CapabilityFlags::for_agent`] of the
+    /// coding agent's kind; catalog profiles pin via [`Self::with_agent_caps`]
+    /// (e.g. `claude-acp` → [`CapabilityFlags::CLAUDE_ACP`]).
+    agent_caps: CapabilityFlags,
 }
 
 impl<A: CodingAgent> HostAttach<A> {
     /// Attach to an **existing** Binding. Does not remint [`Binding::id`].
     pub fn attach(binding: Binding, agent: AgentId, coding: A) -> Self {
         let native_session = binding.native_resume_id.clone();
+        let agent_caps = CapabilityFlags::for_agent(coding.kind());
         Self {
             binding,
             agent,
@@ -277,6 +295,7 @@ impl<A: CodingAgent> HostAttach<A> {
             client_caps: ClientCapabilities::HOST,
             client_requests: HashMap::new(),
             parallel_safe: None,
+            agent_caps,
         }
     }
 
@@ -285,6 +304,20 @@ impl<A: CodingAgent> HostAttach<A> {
     pub fn with_parallel_safe(mut self, decl: Option<hearth::ParallelSafe>) -> Self {
         self.parallel_safe = decl;
         self
+    }
+
+    /// Pin the capability row Host consults on drain (subagent nesting
+    /// retain). Catalog profiles pass [`crate::catalog::CatalogProfile::caps`]
+    /// (e.g. `claude-acp` → [`CapabilityFlags::CLAUDE_ACP`]). Default is the
+    /// [`CapabilityFlags::for_agent`] row for the coding agent's kind.
+    pub fn with_agent_caps(mut self, caps: CapabilityFlags) -> Self {
+        self.agent_caps = caps;
+        self
+    }
+
+    /// Capability row this attach consults when retaining subagent nesting.
+    pub fn agent_caps(&self) -> CapabilityFlags {
+        self.agent_caps
     }
 
     /// Whether this attach's Agent has an open turn on a live Binding.
@@ -664,7 +697,7 @@ impl<A: CodingAgent> HostAttach<A> {
                 // EventLog append first; track the ask only once it is on
                 // the log, so a failed append leaves no phantom pending entry.
                 let mut appended = Vec::new();
-                for body in event_bodies(self.binding.id, self.agent, &ev) {
+                for body in event_bodies(self.binding.id, self.agent, &ev, self.agent_caps) {
                     appended.push(session.append(body)?);
                 }
                 self.pending.insert(
@@ -700,7 +733,7 @@ impl<A: CodingAgent> HostAttach<A> {
             _ => {
                 let mut appended = Vec::new();
                 let log = session.events()?;
-                for body in event_bodies(self.binding.id, self.agent, &ev) {
+                for body in event_bodies(self.binding.id, self.agent, &ev, self.agent_caps) {
                     // Drop late ToolResult once tool_call_id is already
                     // terminal (ToolResult or ToolCallInterrupted) so one
                     // call never gets two terminals (2026-10-07 remint).
@@ -733,7 +766,7 @@ impl HostAttach<LoopbackAgent> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AgentKind, LoopbackAgent};
+    use crate::{lookup_profile, AgentKind, CapabilityFlags, LoopbackAgent};
     use hearth::{
         EventBody, HostKind, InMemory, Member, MemoryPolicy, Place, PlaceAttach, PlaceMemory,
     };
@@ -1053,7 +1086,9 @@ mod tests {
             for f in frames.as_array().unwrap() {
                 io.transport_mut().push_decoded(f.clone());
             }
-            let mut attach = HostAttach::attach(binding.clone(), agent.id, io);
+            let mut attach = HostAttach::attach(binding.clone(), agent.id, io)
+                .with_agent_caps(CapabilityFlags::CLAUDE_ACP);
+            assert!(attach.agent_caps().subagent);
             let appended = attach.drain(&session).unwrap();
             assert_eq!(appended.len(), frames.as_array().unwrap().len(), "{name}");
 
@@ -1119,7 +1154,9 @@ mod tests {
     }
 
     /// Pin the whole-item `Message` → `AgentMessage` parent copy directly:
-    /// the nest fixtures only exercise `ToolCall` / `MessageDelta`.
+    /// the nest fixtures only exercise `ToolCall` / `MessageDelta`. Retain
+    /// path requires `caps.subagent` (CLAUDE_ACP / Pi); strip path is
+    /// `event_bodies_strips_parent_when_subagent_cap_false`.
     #[test]
     fn event_bodies_copies_message_parent_onto_agent_message() {
         let agent = AgentId::new();
@@ -1131,7 +1168,12 @@ mod tests {
             parent: parent.map(Into::into),
         };
         for (parent, want) in [(Some("toolu_task"), Some("toolu_task")), (None, None)] {
-            let bodies = event_bodies(BindingId::new(), agent, &msg(parent));
+            let bodies = event_bodies(
+                BindingId::new(),
+                agent,
+                &msg(parent),
+                CapabilityFlags::CLAUDE_ACP,
+            );
             assert_eq!(bodies.len(), 1);
             match &bodies[0] {
                 EventBody::AgentMessage {
@@ -1144,6 +1186,90 @@ mod tests {
                     assert_eq!(parent_tool_call_id.as_deref(), want);
                 }
                 other => panic!("want AgentMessage, got {other:?}"),
+            }
+        }
+        // Pi AgentKind row also retains.
+        let bodies = event_bodies(
+            BindingId::new(),
+            agent,
+            &msg(Some("toolu_task")),
+            CapabilityFlags::for_agent(AgentKind::Pi),
+        );
+        match &bodies[0] {
+            EventBody::AgentMessage {
+                parent_tool_call_id,
+                ..
+            } => assert_eq!(parent_tool_call_id.as_deref(), Some("toolu_task")),
+            other => panic!("want AgentMessage, got {other:?}"),
+        }
+    }
+
+    /// Must floor: `caps.subagent == false` strips wire parent even when
+    /// `_meta` / AgentEvent carries one (kills always-retain / advertise-only
+    /// mutants). Generic ACP, Copilot, Cursor, Codex, OpenCode, GrokBuild.
+    #[test]
+    fn event_bodies_strips_parent_when_subagent_cap_false() {
+        let agent = AgentId::new();
+        let binding = BindingId::new();
+        let msg = AgentEvent::Message {
+            session_id: "s".into(),
+            item_id: "m1".into(),
+            role: "assistant".into(),
+            text: "child says".into(),
+            parent: Some("toolu_task".into()),
+        };
+        let tool = AgentEvent::ToolCall {
+            session_id: "s".into(),
+            item_id: "toolu_sub".into(),
+            name: "Bash".into(),
+            arguments: serde_json::json!({}),
+            status: crate::ToolStatus::Pending,
+            parent: Some("toolu_task".into()),
+            subagent: false,
+        };
+        let ask = AgentEvent::PermissionAsk {
+            session_id: "s".into(),
+            permission_id: "1".into(),
+            title: "Bash".into(),
+            description: None,
+            tool_item_id: Some("toolu_sub".into()),
+            options: vec![],
+            rpc_id: Some(crate::RpcId::Num(1)),
+            parent: Some("toolu_task".into()),
+        };
+        for caps in [
+            CapabilityFlags::ACP,
+            CapabilityFlags::GROK_BUILD,
+            CapabilityFlags::CODEX,
+            CapabilityFlags::OPENCODE,
+            CapabilityFlags::for_agent(AgentKind::Acp),
+            lookup_profile("copilot").unwrap().caps(),
+            lookup_profile("cursor").unwrap().caps(),
+        ] {
+            assert!(!caps.subagent, "{caps:?}");
+            for ev in [&msg, &tool, &ask] {
+                for body in event_bodies(binding, agent, ev, caps) {
+                    let parent = match &body {
+                        EventBody::AgentMessage {
+                            parent_tool_call_id,
+                            ..
+                        }
+                        | EventBody::ToolCall {
+                            parent_tool_call_id,
+                            ..
+                        }
+                        | EventBody::PermissionAsked {
+                            parent_tool_call_id,
+                            ..
+                        } => parent_tool_call_id,
+                        other => panic!("unexpected {other:?}"),
+                    };
+                    assert_eq!(
+                        parent.as_deref(),
+                        None,
+                        "subagent-false must strip parent: {caps:?} {body:?}"
+                    );
+                }
             }
         }
     }
@@ -1184,7 +1310,9 @@ mod tests {
         for f in frames {
             io.transport_mut().push_decoded(f);
         }
-        let mut attach = HostAttach::attach(binding.clone(), agent.id, io);
+        let mut attach = HostAttach::attach(binding.clone(), agent.id, io)
+            .with_agent_caps(CapabilityFlags::CLAUDE_ACP);
+        assert!(attach.agent_caps().subagent);
         attach.drain(&session).unwrap();
         assert_eq!(attach.pending_permissions().len(), 2);
         assert_eq!(session.bindings().unwrap().len(), 1);
@@ -1218,6 +1346,143 @@ mod tests {
             &e.body,
             EventBody::ToolCall { tool_call_id, parent_tool_call_id: Some(p), .. }
                 if tool_call_id == "toolu_sub_bash" && p == "toolu_task"
+        )));
+    }
+
+    /// Must floor (Host path, not advertise-only): generic ACP / Copilot /
+    /// Cursor caps + nested fixture → every EventLog `parent_tool_call_id`
+    /// is `None` even though wire `_meta` carries `parentToolUseId`.
+    /// CLAUDE_ACP retain stays in
+    /// `claude_acp_subagent_nests_on_eventlog_without_child_session_or_binding`.
+    #[test]
+    fn host_drain_strips_nested_parent_when_subagent_cap_false() {
+        use crate::adapters::acp::AcpCodec;
+        use crate::{FramedAgent, JsonlRpcTransport};
+
+        for (label, caps) in [
+            ("acp-default", CapabilityFlags::ACP),
+            ("copilot", lookup_profile("copilot").unwrap().caps()),
+            ("cursor", lookup_profile("cursor").unwrap().caps()),
+            ("for_agent(Acp)", CapabilityFlags::for_agent(AgentKind::Acp)),
+        ] {
+            assert!(!caps.subagent, "{label}");
+            let (_store, _user, agent, session) = room();
+            let binding = session
+                .bind_host(Some(agent.id), host_for(AgentKind::Acp, None, None))
+                .unwrap();
+            let frames = crate::adapters::fixture("acp", "claude_subagent_nested.json");
+            let mut io = FramedAgent::new(JsonlRpcTransport::without_rpc_chunks(), AcpCodec);
+            for f in frames.as_array().unwrap() {
+                io.transport_mut().push_decoded(f.clone());
+            }
+            let mut attach = HostAttach::attach(binding, agent.id, io).with_agent_caps(caps);
+            assert!(!attach.agent_caps().subagent, "{label}");
+            // Default attach without pin is also subagent-false for AcpCodec.
+            assert!(!CapabilityFlags::for_agent(AgentKind::Acp).subagent);
+            attach.drain(&session).unwrap();
+            let log = session.events().unwrap();
+            assert!(
+                log.iter().any(|e| matches!(
+                    &e.body,
+                    EventBody::ToolCall { tool_call_id, .. } if tool_call_id == "toolu_inner"
+                )),
+                "{label}: fixture must produce nested tool frames"
+            );
+            let leaked: Vec<_> = log
+                .iter()
+                .filter_map(|e| match &e.body {
+                    EventBody::ToolCall {
+                        tool_call_id,
+                        parent_tool_call_id: Some(p),
+                        ..
+                    } => Some(format!("ToolCall {tool_call_id} parent={p}")),
+                    EventBody::AgentMessage {
+                        text,
+                        parent_tool_call_id: Some(p),
+                        ..
+                    } => Some(format!("AgentMessage {text:?} parent={p}")),
+                    EventBody::PermissionAsked {
+                        parent_tool_call_id: Some(p),
+                        ..
+                    } => Some(format!("PermissionAsked parent={p}")),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                leaked.is_empty(),
+                "{label}: expected all parents stripped, leaked {leaked:?}"
+            );
+        }
+    }
+
+    /// Toy Loopback + caps pin: subagent-false strips; CLAUDE_ACP / Pi retain.
+    #[test]
+    fn loopback_caps_pin_gates_parent_retain_on_drain() {
+        let nested = || AgentEvent::ToolCall {
+            session_id: "s".into(),
+            item_id: "toolu_sub".into(),
+            name: "Bash".into(),
+            arguments: serde_json::json!({}),
+            status: crate::ToolStatus::Pending,
+            parent: Some("toolu_task".into()),
+            subagent: false,
+        };
+
+        // Default for_agent(Acp): strip.
+        let (_store, _user, agent, session) = room();
+        let binding = session
+            .bind_host(Some(agent.id), host_for(AgentKind::Acp, None, None))
+            .unwrap();
+        let mut coding = LoopbackAgent::new(AgentKind::Acp);
+        coding.push_inbound(nested());
+        let mut strip = HostAttach::attach(binding.clone(), agent.id, coding);
+        assert!(!strip.agent_caps().subagent);
+        strip.drain(&session).unwrap();
+        assert!(session.events().unwrap().iter().any(|e| matches!(
+            &e.body,
+            EventBody::ToolCall {
+                tool_call_id,
+                parent_tool_call_id: None,
+                ..
+            } if tool_call_id == "toolu_sub"
+        )));
+
+        // CLAUDE_ACP pin (catalog caps()): retain.
+        let before = session.events().unwrap().len();
+        let mut coding = LoopbackAgent::new(AgentKind::Acp);
+        coding.push_inbound(nested());
+        let mut keep = HostAttach::attach(binding, agent.id, coding)
+            .with_agent_caps(lookup_profile("claude-acp").unwrap().caps());
+        assert!(keep.agent_caps().subagent);
+        assert_eq!(keep.agent_caps(), CapabilityFlags::CLAUDE_ACP);
+        keep.drain(&session).unwrap();
+        assert!(session.events().unwrap()[before..].iter().any(|e| matches!(
+            &e.body,
+            EventBody::ToolCall {
+                tool_call_id,
+                parent_tool_call_id: Some(p),
+                ..
+            } if tool_call_id == "toolu_sub" && p == "toolu_task"
+        )));
+
+        // Pi AgentKind default row retains (toy push; Pi codec itself emits None).
+        let (_s2, _u2, agent2, session2) = room();
+        let binding2 = session2
+            .bind_host(Some(agent2.id), host_for(AgentKind::Pi, None, None))
+            .unwrap();
+        let mut coding = LoopbackAgent::new(AgentKind::Pi);
+        coding.push_inbound(nested());
+        let mut pi = HostAttach::attach(binding2, agent2.id, coding);
+        assert!(pi.agent_caps().subagent);
+        assert_eq!(pi.agent_caps(), CapabilityFlags::PI);
+        pi.drain(&session2).unwrap();
+        assert!(session2.events().unwrap().iter().any(|e| matches!(
+            &e.body,
+            EventBody::ToolCall {
+                tool_call_id,
+                parent_tool_call_id: Some(p),
+                ..
+            } if tool_call_id == "toolu_sub" && p == "toolu_task"
         )));
     }
 
