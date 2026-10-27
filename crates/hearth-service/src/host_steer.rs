@@ -20,8 +20,9 @@ use crate::AppState;
 /// One kept Agent's Host wire held by the service for steer / remint.
 ///
 /// Host supplies Fake or Real [`AttachRunner`]s. LiveIdle / quick remint Must
-/// floors use Fake; Real Exited concurrent remint Must
-/// ([`Self::real_exited`]) probes a Real CLI — no Fake Exited injection.
+/// floors use Fake; Real Exited ([`Self::real_exited`]) and Real StdoutEof
+/// ([`Self::real_stdout_eof`]) concurrent remint Musts probe a Real CLI —
+/// no Fake Exited / StdoutEof injection.
 pub struct AgentHostWire {
     pub remint: RemintSession,
     pub old: AttachRunner,
@@ -74,6 +75,26 @@ impl AgentHostWire {
     /// reuses wire `spawn_and_probe_real_exit` (#64); never Fake-injects Exited.
     pub fn real_exited(remint: RemintSession, place: Option<Place>, code: i32) -> Self {
         let (old, old_wire) = spawn_and_probe_real_exit(code);
+        Self {
+            remint,
+            old,
+            new: new_wire_fake(),
+            new_transport: transport_for_wire(WireKind::JsonlRpc),
+            old_wire,
+            place,
+            old_next_rpc_id: 10,
+            new_next_rpc_id: 2,
+            init_rpc_id: RpcId::Num(1),
+        }
+    }
+
+    /// Build a Real-old / Fake-new wire after probing
+    /// `sh -c 'exec 1>&-; sleep 30'` to [`OldWire::StdoutEof`].
+    /// Service-real-stdout-eof-concurrent-remint Must path (Soft twin of
+    /// [`Self::real_exited`] / #72) — reuses wire
+    /// `spawn_and_probe_real_stdout_eof` (#65); never Fake-injects StdoutEof.
+    pub fn real_stdout_eof(remint: RemintSession, place: Option<Place>) -> Self {
+        let (old, old_wire) = spawn_and_probe_real_stdout_eof();
         Self {
             remint,
             old,
@@ -243,6 +264,34 @@ fn spawn_and_probe_real_exit(code: i32) -> (AttachRunner, OldWire) {
         old_wire,
         OldWire::Exited(code),
         "Real probe must observe Exited (no Fake Exited injection)"
+    );
+    (old, old_wire)
+}
+
+/// Spawn a Real CLI that closes stdout but stays alive, then probe until
+/// [`OldWire::StdoutEof`]. Mirrors wire `spawn_and_probe_real_stdout_eof`
+/// (#65) for the service Host-wire map — no Fake StdoutEof injection.
+fn spawn_and_probe_real_stdout_eof() -> (AttachRunner, OldWire) {
+    let spec = LaunchSpec {
+        program: "sh".into(),
+        args: vec!["-c".into(), "exec 1>&-; sleep 30".into()],
+        cwd: None,
+        env: Vec::new(),
+        wire: WireKind::JsonlRpc,
+    };
+    let mut old = AttachRunner::spawn(spec).expect("spawn real CLI stdout-eof");
+    let mut old_wire = OldWire::Unknown;
+    for _ in 0..50 {
+        old_wire = old.probe_stdout().expect("probe stdout");
+        if old_wire == OldWire::StdoutEof {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        old_wire,
+        OldWire::StdoutEof,
+        "Real probe must observe StdoutEof (no Fake StdoutEof injection)"
     );
     (old, old_wire)
 }

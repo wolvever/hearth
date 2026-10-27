@@ -1298,6 +1298,252 @@ mod tests {
         }
     }
 
+    /// Service-real-stdout-eof-concurrent-remint: Soft twin of #72. Two
+    /// ParallelSafe Agents with Real old wires probed to StdoutEof (no Fake
+    /// StdoutEof injection), mid-turn so cancel-before-reattach fires, Fake
+    /// new wires for resume capture. Extends #72 install scaffolding.
+    fn install_two_parallel_safe_real_stdout_eof_host_wires(
+        st: &AppState,
+        sid: SessionId,
+    ) -> (hearth::AgentId, hearth::AgentId, hearth::Place) {
+        use hearth::{Host, PlaceAttach};
+        use hearth_agent_wire::{LiveCaps as WireCaps, RemintSession};
+
+        apply_join(st, sid, Some("cheng".into()), None, None).unwrap();
+        apply_join(
+            st,
+            sid,
+            None,
+            Some("alpha".into()),
+            Some(vec!["agent-0".into()]),
+        )
+        .unwrap();
+        apply_join(
+            st,
+            sid,
+            None,
+            Some("beta".into()),
+            Some(vec!["agent-1".into()]),
+        )
+        .unwrap();
+        let agents = st.runtime.kept_agents(sid);
+        assert_eq!(agents.len(), 2);
+        let (a, b) = (agents[0], agents[1]);
+
+        let session = st.store().session(sid).unwrap();
+        let place = hearth::Place::local_dir(
+            std::env::temp_dir().to_string_lossy().as_ref(),
+            PlaceAttach::MustExist,
+        );
+        session.attach_place(place.clone()).unwrap();
+
+        let names = st.names.lock().unwrap();
+        let uid = *names.users.get("cheng").unwrap();
+        drop(names);
+
+        let caps = WireCaps {
+            resume: true,
+            cancel: true,
+            close: true,
+            load_session: false,
+        };
+        for (ag, resume_id) in [(a, "S-a"), (b, "S-b")] {
+            let host = Host::from_bind("acp", Some(resume_id.into()), None);
+            session.rebind(None, ag, host).unwrap();
+            let remint = RemintSession::on_host_session(session.clone(), ag, uid, resume_id, caps)
+                .expect("remint session");
+            // Mid-turn so cancel-before-reattach fires (#43 / #65 / #72).
+            remint.begin_turn(&format!("mid-{resume_id}"));
+            let wire = AgentHostWire::real_stdout_eof(remint, Some(place.clone()));
+            assert!(
+                matches!(wire.old_wire, hearth_agent_wire::OldWire::StdoutEof),
+                "Real probe must yield StdoutEof, got {:?}",
+                wire.old_wire
+            );
+            st.install_host_wire(sid, ag, wire).unwrap();
+        }
+        (a, b, place)
+    }
+
+    /// Must (Service-real-stdout-eof-concurrent-remint): Soft twin of #72.
+    /// Real StdoutEof on both ParallelSafe Agents → one HTTP steer remints
+    /// both (mint+1 + session/resume each, stable sessionId);
+    /// cancel-before-reattach; no load/new; independent lease/fence; no
+    /// cross-Agent Binding steal; one shared UserMessage. No Fake StdoutEof
+    /// injection.
+    #[tokio::test]
+    async fn http_steer_through_host_wake_real_stdout_eof_remints_both_independent_leases_fences() {
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let id = sid.0.to_string();
+        let (a, b, _) = install_two_parallel_safe_real_stdout_eof_host_wires(&st, sid);
+
+        let bid_a_before = st.runtime.binding_for(sid, a).unwrap();
+        let bid_b_before = st.runtime.binding_for(sid, b).unwrap();
+        let before_mints = st
+            .store()
+            .session(sid)
+            .unwrap()
+            .events()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e.body, EventBody::BindingAttached { .. }))
+            .count();
+
+        {
+            let mut wires = st.host_wires.lock().unwrap();
+            assert!(
+                wires.get_mut(sid, a).unwrap().remint.turn_in_flight(),
+                "A mid-turn before steer"
+            );
+            assert!(
+                wires.get_mut(sid, b).unwrap().remint.turn_in_flight(),
+                "B mid-turn before steer"
+            );
+        }
+
+        let app = router(st.clone());
+        let (code, body) = call(
+            app,
+            Request::post(format!("/sessions/{id}/events"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"user":"cheng","message":"hi-both-real-eof"}"#,
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "body={body}");
+        assert!(body.contains("hi-both-real-eof"));
+
+        let session = st.store().session(sid).unwrap();
+        assert!(
+            session.current_turn_of(a).unwrap().is_some(),
+            "Agent A LiveInTurn (first-only mutant fails)"
+        );
+        assert!(
+            session.current_turn_of(b).unwrap().is_some(),
+            "Agent B LiveInTurn (first-only mutant fails)"
+        );
+        assert_eq!(
+            st.runtime.classify(sid, a).unwrap(),
+            hearth::Liveness::LiveInTurn
+        );
+        assert_eq!(
+            st.runtime.classify(sid, b).unwrap(),
+            hearth::Liveness::LiveInTurn
+        );
+
+        let after_mints = session
+            .events()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e.body, EventBody::BindingAttached { .. }))
+            .count();
+        assert_eq!(
+            after_mints,
+            before_mints + 2,
+            "exactly one mint per Agent (remint)"
+        );
+
+        let bid_a = st.runtime.binding_for(sid, a).unwrap();
+        let bid_b = st.runtime.binding_for(sid, b).unwrap();
+        assert_ne!(bid_a, bid_a_before, "A reminted");
+        assert_ne!(bid_b, bid_b_before, "B reminted");
+        assert_ne!(bid_a, bid_b, "no cross-Agent Binding steal");
+
+        let events = session.events().unwrap();
+        let ums: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e.body, EventBody::UserMessage { .. }))
+            .collect();
+        assert_eq!(ums.len(), 1, "one shared UserMessage");
+        assert!(matches!(
+            &ums[0].body,
+            EventBody::UserMessage { text, .. } if text == "hi-both-real-eof"
+        ));
+
+        // Attach per-Agent leases onto wake-opened turns; raw pins (not is_none).
+        let (ta, fa, _) = st
+            .runtime
+            .begin_turn(sid, a, hearth::HolderId::new("ha"))
+            .expect("lease A");
+        let (tb, fb, _) = st
+            .runtime
+            .begin_turn(sid, b, hearth::HolderId::new("hb"))
+            .expect("lease B");
+        assert_ne!(ta, tb);
+        assert_eq!(session.turn_fence_of(a).unwrap(), fa);
+        assert_eq!(session.turn_fence_of(b).unwrap(), fb);
+        for (agent, holder, turn, fence) in [(a, "ha", ta, fa), (b, "hb", tb, fb)] {
+            let lease = st
+                .runtime
+                .turn_lease_of(sid, agent)
+                .unwrap()
+                .expect("live lease");
+            assert_eq!(
+                (lease.agent, lease.holder, lease.turn_id, lease.fence),
+                (agent, hearth::HolderId::new(holder), turn, fence),
+                "raw turn_lease_of pin (not is_none)"
+            );
+        }
+        // A's fence raise must not steal B's lease/fence.
+        st.runtime.end_turn(sid, "ha".into(), fa, true).unwrap();
+        let (ta2, fa2, _) = st
+            .runtime
+            .resume_interrupted_turn(sid, a, "ha2".into())
+            .unwrap();
+        assert_eq!(ta2, ta);
+        assert!(fa2 > fa, "A's own fence must rise on resume");
+        let lease_b = st.runtime.turn_lease_of(sid, b).unwrap().expect("B live");
+        assert_eq!(
+            (
+                lease_b.agent,
+                lease_b.holder,
+                lease_b.turn_id,
+                lease_b.fence
+            ),
+            (b, hearth::HolderId::new("hb"), tb, fb),
+            "turn_lease_of(B).fence pinned after A's raise — no steal"
+        );
+
+        // New wires: session/resume stable id; never load/new; mid-turn cleared
+        // (cancel-before-reattach path under remint). Resume ids from install.
+        let expected = [(a, "S-a"), (b, "S-b")];
+        let mut wires = st.host_wires.lock().unwrap();
+        for (agent, expected_sid) in expected {
+            let w = wires.get_mut(sid, agent).unwrap();
+            assert!(
+                !w.remint.turn_in_flight(),
+                "Agent {agent:?} turn cleared after remint (cancel-before-reattach)"
+            );
+            let raw = std::str::from_utf8(w.new.stdin_log().unwrap()).unwrap();
+            let frames: Vec<serde_json::Value> = raw
+                .lines()
+                .filter(|l| !l.is_empty())
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+            assert!(
+                frames.len() >= 2,
+                "Agent {agent:?} expected initialize+resume; got {raw}"
+            );
+            assert_eq!(frames[0]["method"], "initialize", "Agent {agent:?}");
+            assert_eq!(
+                frames[1]["method"], "session/resume",
+                "Agent {agent:?} must session/resume; got {raw}"
+            );
+            assert_eq!(
+                frames[1]["params"]["sessionId"], expected_sid,
+                "Agent {agent:?} stable sessionId"
+            );
+            assert!(
+                !raw.contains("session/load") && !raw.contains("session/new"),
+                "no load/new on {agent:?}: {raw}"
+            );
+        }
+    }
+
     /// Must: Waiting / Unknown peer skips without aborting the other Agent
     /// (tick semantics). Claim-before-record preserved (shared wake only for
     /// the Agent that host_wake'd).
