@@ -36,8 +36,14 @@ pub struct CatalogProfile {
     /// Allowed framed wire. ACP stdio profiles are [`WireKind::JsonlRpc`]
     /// (one line, one JSON value — not Content-Length, not Pi `rpc_chunk`).
     pub wire: WireKind,
-    /// Host may set this later. Builtin rows leave it `None` so flags stay
-    /// the shared ACP defaults — not a per-vendor codec.
+    /// Optional override of effective capability flags for this profile.
+    ///
+    /// When `None`, [`Self::caps`] returns [`CapabilityFlags::ACP`]
+    /// (`subagent: false`) — Copilot / Cursor builtin rows leave it unset.
+    /// Builtin `claude-acp` sets `Some(CapabilityFlags::CLAUDE_ACP)`
+    /// (`subagent: true`) via `apply_builtin_caps` (Rust curated for the
+    /// builtin row — not from TOML). Consumers use [`Self::caps()`] rather
+    /// than reading this field directly.
     pub caps_override: Option<CapabilityFlags>,
     pub env: Vec<(String, String)>,
 }
