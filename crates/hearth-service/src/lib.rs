@@ -4925,6 +4925,761 @@ mod tests {
         );
     }
 
+
+    // ── Concurrent-host-tool-rap (#81 Soft lock floor) ─────────────────────
+    // Two ParallelSafe Host-wired Agents; each HTTP RAP tool-call → (optional)
+    // end-turn → tool-result → Trigger + LiveInTurn. Pin raw lease/fence/Binding;
+    // Trigger wake stays single-Agent (never wake_each_kept). Tests-only.
+
+    /// M1: A and B each POST …/tool-call (distinct ids) → one ToolCall each;
+    /// both stay LiveIdle; zero Trigger (dispatch does not fan-out / steal).
+    #[tokio::test]
+    async fn http_concurrent_rap_both_tool_call_live_idle_no_trigger() {
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let id = sid.0.to_string();
+        let (a, b, _) = install_two_parallel_safe_host_wires(&st, sid, None);
+        let bid_a = st.runtime.binding_for(sid, a).unwrap();
+        let bid_b = st.runtime.binding_for(sid, b).unwrap();
+        let lease_a_before = st.runtime.turn_lease_of(sid, a).unwrap();
+        let lease_b_before = st.runtime.turn_lease_of(sid, b).unwrap();
+        let fence_a_before = st.store().session(sid).unwrap().turn_fence_of(a).unwrap();
+        let fence_b_before = st.store().session(sid).unwrap().turn_fence_of(b).unwrap();
+
+        let app = router(st.clone());
+        let (c_a, b_a) = call(
+            app.clone(),
+            Request::post(format!("/sessions/{id}/agents/alpha/tool-call"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"rap_a","tool_call_id":"tc-rap-a1"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(c_a, StatusCode::OK, "body={b_a}");
+        let (c_b, b_b) = call(
+            app,
+            Request::post(format!("/sessions/{id}/agents/beta/tool-call"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"rap_b","tool_call_id":"tc-rap-b1"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(c_b, StatusCode::OK, "body={b_b}");
+
+        assert_eq!(count_tool_calls(&st, sid, "tc-rap-a1"), 1);
+        assert_eq!(count_tool_calls(&st, sid, "tc-rap-b1"), 1);
+        assert_eq!(count_trigger_wakes(&st, sid), 0);
+        assert_eq!(
+            st.runtime.classify(sid, a).unwrap(),
+            hearth::Liveness::LiveIdle
+        );
+        assert_eq!(
+            st.runtime.classify(sid, b).unwrap(),
+            hearth::Liveness::LiveIdle
+        );
+        assert!(st
+            .store()
+            .session(sid)
+            .unwrap()
+            .current_turn_of(a)
+            .unwrap()
+            .is_none());
+        assert!(st
+            .store()
+            .session(sid)
+            .unwrap()
+            .current_turn_of(b)
+            .unwrap()
+            .is_none());
+        // Raw Binding / lease / fence pins — not is_none() alone.
+        assert_eq!(st.runtime.binding_for(sid, a).unwrap(), bid_a);
+        assert_eq!(st.runtime.binding_for(sid, b).unwrap(), bid_b);
+        assert_ne!(bid_a, bid_b, "no cross-Agent Binding steal");
+        assert_eq!(st.runtime.turn_lease_of(sid, a).unwrap(), lease_a_before);
+        assert_eq!(st.runtime.turn_lease_of(sid, b).unwrap(), lease_b_before);
+        assert_eq!(
+            st.store().session(sid).unwrap().turn_fence_of(a).unwrap(),
+            fence_a_before
+        );
+        assert_eq!(
+            st.store().session(sid).unwrap().turn_fence_of(b).unwrap(),
+            fence_b_before
+        );
+    }
+
+    /// M2: A and B each POST …/tool-result → one ToolResult + one Trigger each;
+    /// both LiveInTurn; raw lease/fence/Binding independent; no cross-Agent
+    /// TurnStart from peer complete (Trigger never wake_each_kept).
+    #[tokio::test]
+    async fn http_concurrent_rap_both_tool_result_live_in_turn_independent_pins() {
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let id = sid.0.to_string();
+        let (a, b, _) = install_two_parallel_safe_host_wires(&st, sid, None);
+        let bid_a_before = st.runtime.binding_for(sid, a).unwrap();
+        let bid_b_before = st.runtime.binding_for(sid, b).unwrap();
+
+        let app = router(st.clone());
+        for (agent, tc) in [("alpha", "tc-rap-a2"), ("beta", "tc-rap-b2")] {
+            let (c, body) = call(
+                app.clone(),
+                Request::post(format!("/sessions/{id}/agents/{agent}/tool-call"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"name":"rap_{agent}","tool_call_id":"{tc}"}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(c, StatusCode::OK, "tool-call {agent}: {body}");
+        }
+
+        // A completes first — only A TurnStart / LiveInTurn; B stays LiveIdle.
+        let (c_a, b_a) = call(
+            app.clone(),
+            Request::post(format!("/sessions/{id}/agents/alpha/tool-result"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"tool_call_id":"tc-rap-a2","output":"done-a2"}"#,
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(c_a, StatusCode::OK, "body={b_a}");
+        assert!(b_a.contains(r#""applied":true"#), "body={b_a}");
+        assert_eq!(count_tool_results(&st, sid, "tc-rap-a2"), 1);
+        assert_eq!(count_trigger_wakes(&st, sid), 1);
+        assert_eq!(
+            st.runtime.classify(sid, a).unwrap(),
+            hearth::Liveness::LiveInTurn
+        );
+        assert_eq!(
+            st.runtime.classify(sid, b).unwrap(),
+            hearth::Liveness::LiveIdle,
+            "A's Trigger must not wake peer B"
+        );
+        let turn_starts_after_a: Vec<_> = st
+            .store()
+            .session(sid)
+            .unwrap()
+            .events()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match &e.body {
+                EventBody::TurnStart { agent } => Some(*agent),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            turn_starts_after_a,
+            vec![a],
+            "only completing Agent TurnStart after A's result"
+        );
+
+        // B completes — both LiveInTurn; independent raw lease/fence/Binding.
+        let (c_b, b_b) = call(
+            app,
+            Request::post(format!("/sessions/{id}/agents/beta/tool-result"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"tool_call_id":"tc-rap-b2","output":"done-b2"}"#,
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(c_b, StatusCode::OK, "body={b_b}");
+        assert!(b_b.contains(r#""applied":true"#), "body={b_b}");
+        assert_eq!(count_tool_results(&st, sid, "tc-rap-b2"), 1);
+        assert_eq!(count_trigger_wakes(&st, sid), 2, "one Trigger per Agent");
+        assert_eq!(
+            st.runtime.classify(sid, a).unwrap(),
+            hearth::Liveness::LiveInTurn,
+            "A stays LiveInTurn across B's complete"
+        );
+        assert_eq!(
+            st.runtime.classify(sid, b).unwrap(),
+            hearth::Liveness::LiveInTurn
+        );
+        let session = st.store().session(sid).unwrap();
+        assert!(session.current_turn_of(a).unwrap().is_some());
+        assert!(session.current_turn_of(b).unwrap().is_some());
+        let turn_starts: Vec<_> = session
+            .events()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match &e.body {
+                EventBody::TurnStart { agent } => Some(*agent),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            turn_starts,
+            vec![a, b],
+            "each Agent one TurnStart from its own Trigger; no fan-out"
+        );
+        assert_eq!(st.runtime.binding_for(sid, a).unwrap(), bid_a_before);
+        assert_eq!(st.runtime.binding_for(sid, b).unwrap(), bid_b_before);
+        assert_ne!(bid_a_before, bid_b_before);
+
+        // Compose begin_turn after Trigger wake (Concurrent-*-proof style) so
+        // raw turn_lease_of / turn_fence_of pins are live — not is_none() alone.
+        let (ta, fa, _) = st
+            .runtime
+            .begin_turn(sid, a, hearth::HolderId::new("rap-m2-a"))
+            .expect("lease A on wake-opened turn");
+        let (tb, fb, _) = st
+            .runtime
+            .begin_turn(sid, b, hearth::HolderId::new("rap-m2-b"))
+            .expect("lease B on wake-opened turn");
+        assert_ne!(ta, tb, "independent turn ids");
+        let session = st.store().session(sid).unwrap();
+        assert_eq!(session.turn_fence_of(a).unwrap(), fa);
+        assert_eq!(session.turn_fence_of(b).unwrap(), fb);
+        for (agent, holder, turn, fence) in [
+            (a, "rap-m2-a", ta, fa),
+            (b, "rap-m2-b", tb, fb),
+        ] {
+            let lease = st
+                .runtime
+                .turn_lease_of(sid, agent)
+                .unwrap()
+                .expect("raw turn_lease_of pin (not is_none)");
+            assert_eq!(
+                (lease.agent, lease.holder, lease.turn_id, lease.fence),
+                (agent, hearth::HolderId::new(holder), turn, fence),
+                "raw turn_lease_of pin (not is_none)"
+            );
+        }
+        assert_eq!(st.runtime.binding_for(sid, a).unwrap(), bid_a_before);
+        assert_eq!(st.runtime.binding_for(sid, b).unwrap(), bid_b_before);
+    }
+
+    /// M3: Interleave — A tool-call + end-turn → LiveIdle unmatched; B full
+    /// tool-call→tool-result→LiveInTurn; then A tool-result→Trigger+LiveInTurn.
+    /// A's unmatched survives B's loop (no Interrupt); B Binding/lease/fence
+    /// pins across A's yield+complete; A's Trigger does not re-wake or end B.
+    #[tokio::test]
+    async fn http_concurrent_rap_interleave_yield_peer_complete_then_resume() {
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let id = sid.0.to_string();
+        let (a, b, _) = install_two_parallel_safe_host_wires(&st, sid, None);
+        let bid_a = st.runtime.binding_for(sid, a).unwrap();
+        let bid_b = st.runtime.binding_for(sid, b).unwrap();
+
+        // Open A's turn so end-turn can yield (HTTP RAP yield under #81).
+        st.runtime
+            .begin_turn(sid, a, hearth::HolderId::new("rap-m3-a"))
+            .expect("begin_turn A");
+        let app = router(st.clone());
+        let (c1, b1) = call(
+            app.clone(),
+            Request::post(format!("/sessions/{id}/agents/alpha/tool-call"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"name":"rap_yield","tool_call_id":"tc-rap-a3"}"#,
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(c1, StatusCode::OK, "body={b1}");
+        let (c2, b2) = call(
+            app.clone(),
+            Request::post(format!("/sessions/{id}/agents/alpha/end-turn"))
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(c2, StatusCode::OK, "body={b2}");
+        assert_eq!(
+            st.runtime.classify(sid, a).unwrap(),
+            hearth::Liveness::LiveIdle
+        );
+        assert_eq!(count_tool_interrupted(&st, sid, "tc-rap-a3"), 0);
+        assert!(
+            !hearth::tool_call_is_terminal(
+                &st.store().session(sid).unwrap().events().unwrap(),
+                "tc-rap-a3"
+            ),
+            "A unmatched must stay open after yield"
+        );
+
+        // B full RAP while A is yielded LiveIdle unmatched.
+        let (c3, b3) = call(
+            app.clone(),
+            Request::post(format!("/sessions/{id}/agents/beta/tool-call"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"name":"rap_peer","tool_call_id":"tc-rap-b3"}"#,
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(c3, StatusCode::OK, "body={b3}");
+        let (c4, b4) = call(
+            app.clone(),
+            Request::post(format!("/sessions/{id}/agents/beta/tool-result"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"tool_call_id":"tc-rap-b3","output":"peer-done"}"#,
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(c4, StatusCode::OK, "body={b4}");
+        assert!(b4.contains(r#""applied":true"#), "body={b4}");
+        assert_eq!(
+            st.runtime.classify(sid, b).unwrap(),
+            hearth::Liveness::LiveInTurn
+        );
+        assert_eq!(
+            st.runtime.classify(sid, a).unwrap(),
+            hearth::Liveness::LiveIdle,
+            "B's Trigger must not wake yielded A"
+        );
+        assert_eq!(count_trigger_wakes(&st, sid), 1);
+        assert_eq!(count_tool_interrupted(&st, sid, "tc-rap-a3"), 0);
+        let unmatched =
+            hearth::unmatched_tool_calls(&st.store().session(sid).unwrap().events().unwrap());
+        assert!(
+            unmatched
+                .iter()
+                .any(|(ag, tid, _)| *ag == a && tid == "tc-rap-a3"),
+            "A's unmatched survived B's RAP loop: {unmatched:?}"
+        );
+
+        // Attach B's lease onto Trigger-opened turn; pin across A's complete.
+        let (tb, fb, _) = st
+            .runtime
+            .begin_turn(sid, b, hearth::HolderId::new("rap-m3-b"))
+            .expect("lease B after RAP");
+        let lease_b = st
+            .runtime
+            .turn_lease_of(sid, b)
+            .unwrap()
+            .expect("raw turn_lease_of(B) after B RAP");
+        assert_eq!(lease_b.agent, b);
+        assert_eq!(lease_b.holder, hearth::HolderId::new("rap-m3-b"));
+        assert_eq!(lease_b.turn_id, tb);
+        assert_eq!(lease_b.fence, fb);
+        assert_eq!(st.store().session(sid).unwrap().turn_fence_of(b).unwrap(), fb);
+        assert_eq!(st.runtime.binding_for(sid, b).unwrap(), bid_b);
+        assert_eq!(st.runtime.binding_for(sid, a).unwrap(), bid_a);
+        let ends_b_before = count_turn_ends(&st, sid, b);
+
+        // A completes → Trigger + LiveInTurn; B pins hold; no re-wake / end B.
+        let (c5, b5) = call(
+            app,
+            Request::post(format!("/sessions/{id}/agents/alpha/tool-result"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"tool_call_id":"tc-rap-a3","output":"after-yield"}"#,
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(c5, StatusCode::OK, "body={b5}");
+        assert!(b5.contains(r#""applied":true"#), "body={b5}");
+        assert_eq!(count_tool_results(&st, sid, "tc-rap-a3"), 1);
+        assert_eq!(count_trigger_wakes(&st, sid), 2);
+        assert_eq!(
+            st.runtime.classify(sid, a).unwrap(),
+            hearth::Liveness::LiveInTurn
+        );
+        assert_eq!(
+            st.runtime.classify(sid, b).unwrap(),
+            hearth::Liveness::LiveInTurn,
+            "A's Trigger must not end peer B"
+        );
+        assert_eq!(
+            st.runtime.turn_lease_of(sid, b).unwrap().expect("B still leased"),
+            lease_b,
+            "raw turn_lease_of(B) pinned across A's yield+complete"
+        );
+        assert_eq!(
+            st.store().session(sid).unwrap().turn_fence_of(b).unwrap(),
+            fb,
+            "raw turn_fence_of(B) pinned across A's yield+complete"
+        );
+        assert_eq!(st.runtime.binding_for(sid, b).unwrap(), bid_b);
+        assert_eq!(st.runtime.binding_for(sid, a).unwrap(), bid_a);
+        assert_eq!(count_turn_ends(&st, sid, b), ends_b_before);
+        assert!(st
+            .store()
+            .session(sid)
+            .unwrap()
+            .current_turn_of(b)
+            .unwrap()
+            .is_some());
+        // A is LiveInTurn via Trigger (unleased until begin_turn); pin Binding
+        // + open turn, then compose lease for independent raw pin.
+        assert!(st
+            .store()
+            .session(sid)
+            .unwrap()
+            .current_turn_of(a)
+            .unwrap()
+            .is_some());
+        let (ta, fa, _) = st
+            .runtime
+            .begin_turn(sid, a, hearth::HolderId::new("rap-m3-a2"))
+            .expect("lease A after complete");
+        let lease_a = st
+            .runtime
+            .turn_lease_of(sid, a)
+            .unwrap()
+            .expect("raw turn_lease_of(A) after complete");
+        assert_eq!(lease_a.agent, a);
+        assert_eq!(lease_a.turn_id, ta);
+        assert_eq!(lease_a.fence, fa);
+        assert_ne!(lease_a.turn_id, lease_b.turn_id);
+        // B pin still holds after A's lease attach.
+        assert_eq!(
+            st.runtime.turn_lease_of(sid, b).unwrap().expect("B leased"),
+            lease_b
+        );
+    }
+
+    /// M4: Cross-Agent same tool_call_id → 409 (#80 Fix-1); peer may still
+    /// complete its own distinct id under concurrent RAP.
+    #[tokio::test]
+    async fn http_concurrent_rap_cross_agent_same_id_409_peer_own_id_completes() {
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let id = sid.0.to_string();
+        let (a, b, _) = install_two_parallel_safe_host_wires(&st, sid, None);
+        let bid_a = st.runtime.binding_for(sid, a).unwrap();
+        let bid_b = st.runtime.binding_for(sid, b).unwrap();
+
+        let app = router(st.clone());
+        let (c1, b1) = call(
+            app.clone(),
+            Request::post(format!("/sessions/{id}/agents/alpha/tool-call"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"name":"rap_a","tool_call_id":"tc-rap-shared"}"#,
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(c1, StatusCode::OK, "body={b1}");
+
+        // B tries A's id → 409; A's ToolCall count stays 1.
+        let (c2, b2) = call(
+            app.clone(),
+            Request::post(format!("/sessions/{id}/agents/beta/tool-call"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"name":"steal","tool_call_id":"tc-rap-shared"}"#,
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            c2,
+            StatusCode::CONFLICT,
+            "cross-Agent same id → 409, body={b2}"
+        );
+        assert_eq!(count_tool_calls(&st, sid, "tc-rap-shared"), 1);
+
+        // B uses its own id and completes; A completes its own — both LiveInTurn.
+        let (c3, b3) = call(
+            app.clone(),
+            Request::post(format!("/sessions/{id}/agents/beta/tool-call"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"name":"rap_b","tool_call_id":"tc-rap-b4"}"#,
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(c3, StatusCode::OK, "body={b3}");
+        let (c4, b4) = call(
+            app.clone(),
+            Request::post(format!("/sessions/{id}/agents/beta/tool-result"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"tool_call_id":"tc-rap-b4","output":"b-own"}"#,
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(c4, StatusCode::OK, "body={b4}");
+        assert!(b4.contains(r#""applied":true"#), "body={b4}");
+        assert_eq!(
+            st.runtime.classify(sid, b).unwrap(),
+            hearth::Liveness::LiveInTurn
+        );
+        assert_eq!(
+            st.runtime.classify(sid, a).unwrap(),
+            hearth::Liveness::LiveIdle,
+            "B complete must not fan-out to A"
+        );
+
+        let (c5, b5) = call(
+            app,
+            Request::post(format!("/sessions/{id}/agents/alpha/tool-result"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"tool_call_id":"tc-rap-shared","output":"a-own"}"#,
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(c5, StatusCode::OK, "body={b5}");
+        assert!(b5.contains(r#""applied":true"#), "body={b5}");
+        assert_eq!(count_tool_results(&st, sid, "tc-rap-shared"), 1);
+        assert_eq!(count_tool_results(&st, sid, "tc-rap-b4"), 1);
+        assert_eq!(count_trigger_wakes(&st, sid), 2);
+        assert_eq!(
+            st.runtime.classify(sid, a).unwrap(),
+            hearth::Liveness::LiveInTurn
+        );
+        assert_eq!(
+            st.runtime.classify(sid, b).unwrap(),
+            hearth::Liveness::LiveInTurn
+        );
+        assert_eq!(st.runtime.binding_for(sid, a).unwrap(), bid_a);
+        assert_eq!(st.runtime.binding_for(sid, b).unwrap(), bid_b);
+        assert!(st
+            .store()
+            .session(sid)
+            .unwrap()
+            .current_turn_of(a)
+            .unwrap()
+            .is_some());
+        assert!(st
+            .store()
+            .session(sid)
+            .unwrap()
+            .current_turn_of(b)
+            .unwrap()
+            .is_some());
+        let (ta, fa, _) = st
+            .runtime
+            .begin_turn(sid, a, hearth::HolderId::new("rap-m4-a"))
+            .expect("lease A");
+        let (tb, fb, _) = st
+            .runtime
+            .begin_turn(sid, b, hearth::HolderId::new("rap-m4-b"))
+            .expect("lease B");
+        assert_ne!(ta, tb);
+        let lease_a = st
+            .runtime
+            .turn_lease_of(sid, a)
+            .unwrap()
+            .expect("raw turn_lease_of(A)");
+        let lease_b = st
+            .runtime
+            .turn_lease_of(sid, b)
+            .unwrap()
+            .expect("raw turn_lease_of(B)");
+        assert_eq!(
+            (lease_a.agent, lease_a.turn_id, lease_a.fence),
+            (a, ta, fa)
+        );
+        assert_eq!(
+            (lease_b.agent, lease_b.turn_id, lease_b.fence),
+            (b, tb, fb)
+        );
+        assert_eq!(st.store().session(sid).unwrap().turn_fence_of(a).unwrap(), fa);
+        assert_eq!(st.store().session(sid).unwrap().turn_fence_of(b).unwrap(), fb);
+    }
+
+    /// M5: Mid-loop LiveIdle remint on yielded A → AlreadyLive; unmatched stays
+    /// open (#79 M4 under concurrent peer LiveInTurn).
+    #[tokio::test]
+    async fn http_concurrent_rap_yielded_remint_already_live_peer_in_turn() {
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let id = sid.0.to_string();
+        let (a, b, _) = install_two_parallel_safe_host_wires(&st, sid, None);
+        let bid_a = st.runtime.binding_for(sid, a).unwrap();
+        let bid_b = st.runtime.binding_for(sid, b).unwrap();
+
+        st.runtime
+            .begin_turn(sid, a, hearth::HolderId::new("rap-m5-a"))
+            .unwrap();
+        let app = router(st.clone());
+        let (c1, b1) = call(
+            app.clone(),
+            Request::post(format!("/sessions/{id}/agents/alpha/tool-call"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"name":"rap_remint","tool_call_id":"tc-rap-a5"}"#,
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(c1, StatusCode::OK, "body={b1}");
+        let (c2, b2) = call(
+            app.clone(),
+            Request::post(format!("/sessions/{id}/agents/alpha/end-turn"))
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(c2, StatusCode::OK, "body={b2}");
+
+        // Peer B full RAP → LiveInTurn while A is yielded unmatched.
+        let (c3, _) = call(
+            app.clone(),
+            Request::post(format!("/sessions/{id}/agents/beta/tool-call"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"name":"rap_peer","tool_call_id":"tc-rap-b5"}"#,
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(c3, StatusCode::OK);
+        let (c4, b4) = call(
+            app,
+            Request::post(format!("/sessions/{id}/agents/beta/tool-result"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"tool_call_id":"tc-rap-b5","output":"peer"}"#,
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(c4, StatusCode::OK, "body={b4}");
+        assert_eq!(
+            st.runtime.classify(sid, b).unwrap(),
+            hearth::Liveness::LiveInTurn
+        );
+        let (tb, fb, _) = st
+            .runtime
+            .begin_turn(sid, b, hearth::HolderId::new("rap-m5-b"))
+            .expect("lease B while A yielded");
+        let lease_b = st
+            .runtime
+            .turn_lease_of(sid, b)
+            .unwrap()
+            .expect("raw turn_lease_of(B)");
+        assert_eq!(lease_b.agent, b);
+        assert_eq!(lease_b.holder, hearth::HolderId::new("rap-m5-b"));
+        assert_eq!(lease_b.turn_id, tb);
+        assert_eq!(lease_b.fence, fb);
+        assert_eq!(st.store().session(sid).unwrap().turn_fence_of(b).unwrap(), fb);
+
+        let remint_err = st.runtime.remint(sid, a).expect_err("LiveIdle remint");
+        assert!(
+            matches!(
+                remint_err,
+                hearth::Error::Waiting(hearth::WaitReason::AlreadyLive)
+            ),
+            "expected AlreadyLive under concurrent peer LiveInTurn, got {remint_err:?}"
+        );
+        assert_eq!(st.runtime.binding_for(sid, a).unwrap(), bid_a);
+        assert_eq!(count_tool_interrupted(&st, sid, "tc-rap-a5"), 0);
+        assert!(
+            !hearth::tool_call_is_terminal(
+                &st.store().session(sid).unwrap().events().unwrap(),
+                "tc-rap-a5"
+            ),
+            "LiveIdle remint must not finalize Host tool waiter"
+        );
+        assert_eq!(
+            st.runtime.classify(sid, a).unwrap(),
+            hearth::Liveness::LiveIdle
+        );
+        assert_eq!(
+            st.runtime.classify(sid, b).unwrap(),
+            hearth::Liveness::LiveInTurn,
+            "remint of A must not disturb peer B"
+        );
+        assert_eq!(st.runtime.binding_for(sid, b).unwrap(), bid_b);
+        assert_eq!(
+            st.runtime.turn_lease_of(sid, b).unwrap().expect("B leased"),
+            lease_b,
+            "raw turn_lease_of(B) pinned across A's AlreadyLive remint"
+        );
+        assert_eq!(
+            st.store().session(sid).unwrap().turn_fence_of(b).unwrap(),
+            fb,
+            "raw turn_fence_of(B) pinned across A's AlreadyLive remint"
+        );
+    }
+
+    /// M6: ACP HostAttach drain ToolCall/ToolResult unused path byte-identical
+    /// under Concurrent-host-tool-rap (no ACP yield / RAP-replace smuggle).
+    #[tokio::test]
+    async fn http_concurrent_rap_leaves_acp_drain_path_byte_identical() {
+        use hearth_agent_wire::{event_bodies, AgentEvent, CapabilityFlags, ToolStatus};
+        let agent = hearth::AgentId(uuid::Uuid::nil());
+        let call = AgentEvent::ToolCall {
+            session_id: "s".into(),
+            item_id: "drain-rap6".into(),
+            name: "Bash".into(),
+            arguments: serde_json::json!({}),
+            status: ToolStatus::Completed,
+            parent: None,
+            subagent: false,
+        };
+        let result = AgentEvent::ToolResult {
+            session_id: "s".into(),
+            item_id: "drain-rap6".into(),
+            output: serde_json::json!("ok"),
+            status: ToolStatus::Completed,
+        };
+        let bodies_call = event_bodies(
+            hearth::BindingId(uuid::Uuid::nil()),
+            agent,
+            &call,
+            CapabilityFlags::ACP,
+        );
+        let bodies_res = event_bodies(
+            hearth::BindingId(uuid::Uuid::nil()),
+            agent,
+            &result,
+            CapabilityFlags::ACP,
+        );
+        assert!(matches!(
+            &bodies_call[0],
+            EventBody::ToolCall {
+                tool_call_id,
+                name,
+                ..
+            } if tool_call_id == "drain-rap6" && name == "Bash"
+        ));
+        assert!(matches!(
+            &bodies_res[0],
+            EventBody::ToolResult {
+                tool_call_id,
+                name,
+                output,
+                ..
+            } if tool_call_id == "drain-rap6" && name == "drain-rap6" && output.contains("ok")
+        ));
+        assert!(
+            !bodies_call
+                .iter()
+                .chain(bodies_res.iter())
+                .any(|b| matches!(b, EventBody::TurnEnd { .. })),
+            "ACP drain must not smuggle turn_end"
+        );
+        assert!(
+            !bodies_call
+                .iter()
+                .chain(bodies_res.iter())
+                .any(|b| matches!(
+                    b,
+                    EventBody::Wake {
+                        source: hearth::WakeSource::Trigger { .. }
+                    }
+                )),
+            "ACP drain must not smuggle Trigger wake"
+        );
+    }
+
     #[allow(clippy::result_large_err)] // tungstenite::Error is upstream; test-only helper
     async fn expect_text(
         ws: &mut (impl StreamExt<Item = Result<WsMsg, tokio_tungstenite::tungstenite::Error>> + Unpin),
