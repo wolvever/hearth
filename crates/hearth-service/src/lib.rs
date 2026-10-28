@@ -106,6 +106,10 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions/{id}/join", post(join_session))
         .route("/sessions/{id}/events", get(list_events).post(post_event))
         .route(
+            "/sessions/{id}/agents/{agent}/tool-call",
+            post(post_tool_call),
+        )
+        .route(
             "/sessions/{id}/agents/{agent}/tool-result",
             post(post_tool_result),
         )
@@ -390,6 +394,57 @@ async fn post_event(
     let text = body.message.or(body.text).ok_or(StatusCode::BAD_REQUEST)?;
     let name = body.user.ok_or(StatusCode::BAD_REQUEST)?;
     Ok(Json(apply_user_message(&st, id, name, text)?))
+}
+
+#[derive(Deserialize)]
+struct ToolCallIn {
+    name: String,
+    #[serde(default)]
+    input: Option<String>,
+    /// Client-supplied id when present; else server mints a stable id.
+    #[serde(default)]
+    tool_call_id: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ToolCallOut {
+    tool_call_id: String,
+    /// Opaque path for existing `POST …/tool-result` (no auth Soft).
+    callback_url: String,
+}
+
+/// POST /sessions/{id}/agents/{agent}/tool-call — Host-owned ToolCall dispatch
+/// (RAP fire-and-forget). No wake. No auto turn_end. Completion is
+/// [`post_tool_result`].
+async fn post_tool_call(
+    State(st): State<AppState>,
+    AxPath((id, agent_name)): AxPath<(String, String)>,
+    Json(body): Json<ToolCallIn>,
+) -> Result<Json<ToolCallOut>, StatusCode> {
+    let id = sid(&id)?;
+    let session = st.store().session(id).map_err(|_| StatusCode::NOT_FOUND)?;
+    let agent = aid(&st, &agent_name)?;
+    // M5: unknown handled by aid; not-kept → 4xx, zero ToolCall.
+    if !st.runtime.kept_agents(id).contains(&agent) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let tool_call_id = body
+        .tool_call_id
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let input = body.input.unwrap_or_else(|| "{}".into());
+    match session.append_host_tool_call(agent, &tool_call_id, &body.name, &input) {
+        Ok(ev) => {
+            st.publish(id, event_out(&ev));
+            let callback_url = format!("/sessions/{}/agents/{}/tool-result", id.0, agent_name);
+            Ok(Json(ToolCallOut {
+                tool_call_id,
+                callback_url,
+            }))
+        }
+        Err(hearth::HostToolCallError::AlreadyExists) => Err(StatusCode::CONFLICT),
+        Err(hearth::HostToolCallError::NotOnSession) => Err(StatusCode::BAD_REQUEST),
+    }
 }
 
 #[derive(Deserialize)]
@@ -3090,6 +3145,22 @@ mod tests {
             .unwrap();
     }
 
+    fn count_tool_calls(st: &AppState, sid: SessionId, tool_call_id: &str) -> usize {
+        st.store()
+            .session(sid)
+            .unwrap()
+            .events()
+            .unwrap()
+            .iter()
+            .filter(|e| {
+                matches!(
+                    &e.body,
+                    EventBody::ToolCall { tool_call_id: id, .. } if id == tool_call_id
+                )
+            })
+            .count()
+    }
+
     fn count_tool_results(st: &AppState, sid: SessionId, tool_call_id: &str) -> usize {
         st.store()
             .session(sid)
@@ -3904,6 +3975,500 @@ mod tests {
                 .chain(bodies_res.iter())
                 .any(|b| matches!(b, EventBody::TurnEnd { .. })),
             "ACP drain must not smuggle turn_end"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Service-host-tool-call (#80) — RAP dispatch half under #78/#79 Softs.
+    // -------------------------------------------------------------------------
+
+    /// M1: LiveIdle kept Agent + POST tool-call → one EventBody::ToolCall; 200
+    /// with tool_call_id.
+    #[tokio::test]
+    async fn http_tool_call_live_idle_appends_one_tool_call() {
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let id = sid.0.to_string();
+        let (a, _, _) = install_two_parallel_safe_host_wires(&st, sid, None);
+        assert_eq!(
+            st.runtime.classify(sid, a).unwrap(),
+            hearth::Liveness::LiveIdle
+        );
+
+        let app = router(st.clone());
+        let (code, body) = call(
+            app,
+            Request::post(format!("/sessions/{id}/agents/alpha/tool-call"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"name":"host_dispatch","tool_call_id":"tc-d1","input":"{\"x\":1}"}"#,
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "body={body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["tool_call_id"], "tc-d1");
+        assert_eq!(count_tool_calls(&st, sid, "tc-d1"), 1);
+        let evs = st.store().session(sid).unwrap().events().unwrap();
+        assert!(evs.iter().any(|e| matches!(
+            &e.body,
+            EventBody::ToolCall {
+                tool_call_id,
+                name,
+                input,
+                ..
+            } if tool_call_id == "tc-d1" && name == "host_dispatch" && input.contains("x")
+        )));
+        // No wake / no auto turn_end — still LiveIdle.
+        assert_eq!(
+            st.runtime.classify(sid, a).unwrap(),
+            hearth::Liveness::LiveIdle
+        );
+        assert_eq!(count_trigger_wakes(&st, sid), 0);
+        assert!(st
+            .store()
+            .session(sid)
+            .unwrap()
+            .current_turn_of(a)
+            .unwrap()
+            .is_none());
+    }
+
+    /// M2: callback_url path targets that session/agent's existing tool-result
+    /// route (string match; no auth).
+    #[tokio::test]
+    async fn http_tool_call_callback_url_targets_tool_result_route() {
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let id = sid.0.to_string();
+        let (_a, _, _) = install_two_parallel_safe_host_wires(&st, sid, None);
+
+        let app = router(st.clone());
+        let (code, body) = call(
+            app,
+            Request::post(format!("/sessions/{id}/agents/alpha/tool-call"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"cb","tool_call_id":"tc-d2"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "body={body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let expected = format!("/sessions/{id}/agents/alpha/tool-result");
+        assert_eq!(
+            v["callback_url"].as_str().unwrap(),
+            expected,
+            "callback_url must be opaque path to existing tool-result route"
+        );
+        assert_eq!(v["tool_call_id"], "tc-d2");
+    }
+
+    /// M3: Later POST tool-result with that id → one ToolResult + Trigger +
+    /// LiveInTurn (#78 compose).
+    #[tokio::test]
+    async fn http_tool_call_then_tool_result_triggers_live_in_turn() {
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let id = sid.0.to_string();
+        let (a, _, _) = install_two_parallel_safe_host_wires(&st, sid, None);
+
+        let app = router(st.clone());
+        let (c1, b1) = call(
+            app.clone(),
+            Request::post(format!("/sessions/{id}/agents/alpha/tool-call"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"compose","tool_call_id":"tc-d3"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(c1, StatusCode::OK, "body={b1}");
+        let v: serde_json::Value = serde_json::from_str(&b1).unwrap();
+        let tc_id = v["tool_call_id"].as_str().unwrap();
+        let callback = v["callback_url"].as_str().unwrap();
+        assert_eq!(callback, format!("/sessions/{id}/agents/alpha/tool-result"));
+
+        let (c2, b2) = call(
+            app,
+            Request::post(callback)
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"tool_call_id":"{tc_id}","output":"done-d3"}}"#
+                )))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(c2, StatusCode::OK, "body={b2}");
+        assert!(b2.contains(r#""applied":true"#), "body={b2}");
+        assert_eq!(count_tool_calls(&st, sid, "tc-d3"), 1);
+        assert_eq!(count_tool_results(&st, sid, "tc-d3"), 1);
+        assert_eq!(count_trigger_wakes(&st, sid), 1);
+        assert_eq!(
+            st.runtime.classify(sid, a).unwrap(),
+            hearth::Liveness::LiveInTurn
+        );
+    }
+
+    /// M4: Duplicate POST same unmatched tool_call_id → 4xx; still one ToolCall.
+    #[tokio::test]
+    async fn http_tool_call_duplicate_unmatched_refused() {
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let id = sid.0.to_string();
+        let (_a, _, _) = install_two_parallel_safe_host_wires(&st, sid, None);
+
+        let app = router(st.clone());
+        let req = || {
+            Request::post(format!("/sessions/{id}/agents/alpha/tool-call"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"dup","tool_call_id":"tc-d4"}"#))
+                .unwrap()
+        };
+        let (c1, b1) = call(app.clone(), req()).await;
+        assert_eq!(c1, StatusCode::OK, "body={b1}");
+        let (c2, b2) = call(app, req()).await;
+        assert!(
+            c2.is_client_error(),
+            "duplicate unmatched must be 4xx, got {c2} body={b2}"
+        );
+        assert_eq!(count_tool_calls(&st, sid, "tc-d4"), 1);
+    }
+
+    /// M5: Unknown / not-kept Agent → 4xx; zero ToolCall.
+    #[tokio::test]
+    async fn http_tool_call_unknown_or_not_kept_refused() {
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let id = sid.0.to_string();
+        let (_a, _, _) = install_two_parallel_safe_host_wires(&st, sid, None);
+        // NameMap entry for an Agent that is not kept on this Session.
+        let stranger = st.store().create_agent("stranger", "");
+        st.names
+            .lock()
+            .unwrap()
+            .agents
+            .insert("stranger".into(), stranger.id);
+
+        let app = router(st.clone());
+        let (c_unk, _) = call(
+            app.clone(),
+            Request::post(format!("/sessions/{id}/agents/nope/tool-call"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"x","tool_call_id":"tc-unk"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert!(c_unk.is_client_error(), "unknown agent → 4xx, got {c_unk}");
+        assert_eq!(count_tool_calls(&st, sid, "tc-unk"), 0);
+
+        let (c_nk, _) = call(
+            app,
+            Request::post(format!("/sessions/{id}/agents/stranger/tool-call"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"x","tool_call_id":"tc-nk"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert!(c_nk.is_client_error(), "not-kept agent → 4xx, got {c_nk}");
+        assert_eq!(count_tool_calls(&st, sid, "tc-nk"), 0);
+
+        // Member-but-not-kept: Host membership passes, so only the service
+        // `kept_agents` guard refuses (load-bearing for that guard).
+        let member = st.store().create_agent("member", "");
+        st.names
+            .lock()
+            .unwrap()
+            .agents
+            .insert("member".into(), member.id);
+        st.store()
+            .session(sid)
+            .unwrap()
+            .join(hearth::Member::Agent(member.id))
+            .unwrap();
+        assert!(!st.runtime.kept_agents(sid).contains(&member.id));
+        let (c_mnk, b_mnk) = call(
+            router(st.clone()),
+            Request::post(format!("/sessions/{id}/agents/member/tool-call"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"x","tool_call_id":"tc-mnk"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            c_mnk,
+            StatusCode::BAD_REQUEST,
+            "member-but-not-kept → 400, body={b_mnk}"
+        );
+        assert_eq!(count_tool_calls(&st, sid, "tc-mnk"), 0);
+        let total_calls = st
+            .store()
+            .session(sid)
+            .unwrap()
+            .events()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e.body, EventBody::ToolCall { .. }))
+            .count();
+        assert_eq!(total_calls, 0, "refused dispatch must append zero ToolCall");
+    }
+
+    /// Fix-1: re-dispatch of a terminal tool_call_id → 409; ToolCall count
+    /// stays 1 (terminal keyed by id alone — reuse could never complete).
+    #[tokio::test]
+    async fn http_tool_call_redispatch_after_terminal_refused() {
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let id = sid.0.to_string();
+        let (_a, _, _) = install_two_parallel_safe_host_wires(&st, sid, None);
+
+        let app = router(st.clone());
+        let dispatch = || {
+            Request::post(format!("/sessions/{id}/agents/alpha/tool-call"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"re","tool_call_id":"tc-re"}"#))
+                .unwrap()
+        };
+        let (c1, b1) = call(app.clone(), dispatch()).await;
+        assert_eq!(c1, StatusCode::OK, "body={b1}");
+        let (c2, b2) = call(
+            app.clone(),
+            Request::post(format!("/sessions/{id}/agents/alpha/tool-result"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"tool_call_id":"tc-re","output":"done-re"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(c2, StatusCode::OK, "body={b2}");
+        assert!(b2.contains(r#""applied":true"#), "body={b2}");
+        assert!(hearth::tool_call_is_terminal(
+            &st.store().session(sid).unwrap().events().unwrap(),
+            "tc-re"
+        ));
+
+        let (c3, b3) = call(app, dispatch()).await;
+        assert_eq!(
+            c3,
+            StatusCode::CONFLICT,
+            "re-dispatch after terminal → 409, body={b3}"
+        );
+        assert_eq!(count_tool_calls(&st, sid, "tc-re"), 1);
+        assert_eq!(count_tool_results(&st, sid, "tc-re"), 1);
+    }
+
+    /// Fix-1: cross-Agent same tool_call_id → 409; peer's original ToolCall
+    /// still completes (Trigger + LiveInTurn), no cross-Agent steal.
+    #[tokio::test]
+    async fn http_tool_call_cross_agent_same_id_refused_peer_completes() {
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let id = sid.0.to_string();
+        let (a, b, _) = install_two_parallel_safe_host_wires(&st, sid, None);
+
+        let app = router(st.clone());
+        let (c1, b1) = call(
+            app.clone(),
+            Request::post(format!("/sessions/{id}/agents/beta/tool-call"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"peer","tool_call_id":"tc-shared"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(c1, StatusCode::OK, "body={b1}");
+        let (c2, b2) = call(
+            app.clone(),
+            Request::post(format!("/sessions/{id}/agents/alpha/tool-call"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"steal","tool_call_id":"tc-shared"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            c2,
+            StatusCode::CONFLICT,
+            "cross-Agent same id → 409, body={b2}"
+        );
+        assert_eq!(count_tool_calls(&st, sid, "tc-shared"), 1);
+
+        // alpha cannot complete beta's id (orphan for alpha).
+        let (c3, b3) = call(
+            app.clone(),
+            Request::post(format!("/sessions/{id}/agents/alpha/tool-result"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"tool_call_id":"tc-shared","output":"stolen"}"#,
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert!(
+            !(c3 == StatusCode::OK && b3.contains(r#""applied":true"#)),
+            "alpha must not complete beta's ToolCall: {c3} {b3}"
+        );
+        assert_eq!(count_tool_results(&st, sid, "tc-shared"), 0);
+
+        let (c4, b4) = call(
+            app,
+            Request::post(format!("/sessions/{id}/agents/beta/tool-result"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"tool_call_id":"tc-shared","output":"ok"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(c4, StatusCode::OK, "body={b4}");
+        assert!(b4.contains(r#""applied":true"#), "body={b4}");
+        assert_eq!(count_tool_results(&st, sid, "tc-shared"), 1);
+        assert_eq!(count_trigger_wakes(&st, sid), 1);
+        assert_eq!(
+            st.runtime.classify(sid, b).unwrap(),
+            hearth::Liveness::LiveInTurn
+        );
+        assert_eq!(
+            st.runtime.classify(sid, a).unwrap(),
+            hearth::Liveness::LiveIdle,
+            "no fan-out to alpha"
+        );
+    }
+
+    /// M6: Peer ParallelSafe Binding / lease / fence untouched; dispatch does
+    /// not fan-out wake.
+    #[tokio::test]
+    async fn http_tool_call_peer_parallel_safe_untouched_no_fanout() {
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let id = sid.0.to_string();
+        let (a, b, _) = install_two_parallel_safe_host_wires(&st, sid, None);
+        let bid_b = st.runtime.binding_for(sid, b).unwrap();
+        let lease_b_before = st.runtime.turn_lease_of(sid, b).unwrap();
+        let fence_b_before = st.store().session(sid).unwrap().turn_fence_of(b).unwrap();
+
+        let app = router(st.clone());
+        let (code, body) = call(
+            app,
+            Request::post(format!("/sessions/{id}/agents/alpha/tool-call"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"solo","tool_call_id":"tc-d6"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "body={body}");
+        assert_eq!(count_tool_calls(&st, sid, "tc-d6"), 1);
+        assert_eq!(
+            st.runtime.classify(sid, a).unwrap(),
+            hearth::Liveness::LiveIdle
+        );
+        assert_eq!(
+            st.runtime.classify(sid, b).unwrap(),
+            hearth::Liveness::LiveIdle,
+            "peer must not be woken by dispatch"
+        );
+        assert!(st
+            .store()
+            .session(sid)
+            .unwrap()
+            .current_turn_of(a)
+            .unwrap()
+            .is_none());
+        assert!(st
+            .store()
+            .session(sid)
+            .unwrap()
+            .current_turn_of(b)
+            .unwrap()
+            .is_none());
+        assert_eq!(st.runtime.binding_for(sid, b).unwrap(), bid_b);
+        assert_eq!(st.runtime.turn_lease_of(sid, b).unwrap(), lease_b_before);
+        assert_eq!(
+            st.store().session(sid).unwrap().turn_fence_of(b).unwrap(),
+            fence_b_before
+        );
+        assert_eq!(count_trigger_wakes(&st, sid), 0);
+    }
+
+    /// M7: ACP HostAttach drain ToolCall/ToolResult unused path byte-identical.
+    #[tokio::test]
+    async fn http_tool_call_leaves_acp_drain_path_unused() {
+        use hearth_agent_wire::{event_bodies, AgentEvent, CapabilityFlags, ToolStatus};
+        let agent = hearth::AgentId(uuid::Uuid::nil());
+        let call = AgentEvent::ToolCall {
+            session_id: "s".into(),
+            item_id: "drain-d7".into(),
+            name: "Bash".into(),
+            arguments: serde_json::json!({}),
+            status: ToolStatus::Completed,
+            parent: None,
+            subagent: false,
+        };
+        let result = AgentEvent::ToolResult {
+            session_id: "s".into(),
+            item_id: "drain-d7".into(),
+            output: serde_json::json!("ok"),
+            status: ToolStatus::Completed,
+        };
+        let bodies_call = event_bodies(
+            hearth::BindingId(uuid::Uuid::nil()),
+            agent,
+            &call,
+            CapabilityFlags::ACP,
+        );
+        let bodies_res = event_bodies(
+            hearth::BindingId(uuid::Uuid::nil()),
+            agent,
+            &result,
+            CapabilityFlags::ACP,
+        );
+        assert!(matches!(
+            &bodies_call[0],
+            EventBody::ToolCall {
+                tool_call_id,
+                name,
+                ..
+            } if tool_call_id == "drain-d7" && name == "Bash"
+        ));
+        assert!(matches!(
+            &bodies_res[0],
+            EventBody::ToolResult {
+                tool_call_id,
+                name,
+                output,
+                ..
+            } if tool_call_id == "drain-d7" && name == "drain-d7" && output.contains("ok")
+        ));
+    }
+
+    /// Server-mint when tool_call_id omitted (compose with M1 client-supplied).
+    #[tokio::test]
+    async fn http_tool_call_server_mints_id_when_absent() {
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let id = sid.0.to_string();
+        let (_a, _, _) = install_two_parallel_safe_host_wires(&st, sid, None);
+
+        let app = router(st.clone());
+        let (code, body) = call(
+            app,
+            Request::post(format!("/sessions/{id}/agents/alpha/tool-call"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"minted"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "body={body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let tc_id = v["tool_call_id"].as_str().unwrap();
+        assert!(!tc_id.is_empty(), "server must mint non-empty id");
+        assert_eq!(count_tool_calls(&st, sid, tc_id), 1);
+        assert_eq!(
+            v["callback_url"].as_str().unwrap(),
+            format!("/sessions/{id}/agents/alpha/tool-result")
         );
     }
 
