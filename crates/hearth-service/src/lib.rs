@@ -113,6 +113,10 @@ pub fn router(state: AppState) -> Router {
             "/sessions/{id}/agents/{agent}/tool-result",
             post(post_tool_result),
         )
+        .route(
+            "/sessions/{id}/agents/{agent}/end-turn",
+            post(post_end_turn),
+        )
         .route("/sessions/{id}/stream", get(stream_session))
         .route("/agents/local", get(agents_local))
         .with_state(state)
@@ -444,6 +448,44 @@ async fn post_tool_call(
         }
         Err(hearth::HostToolCallError::AlreadyExists) => Err(StatusCode::CONFLICT),
         Err(hearth::HostToolCallError::NotOnSession) => Err(StatusCode::BAD_REQUEST),
+    }
+}
+
+#[derive(Serialize)]
+struct EndTurnOut {
+    ended: bool,
+}
+
+/// POST /sessions/{id}/agents/{agent}/end-turn — explicit Host yield (RAP).
+/// Empty or `{}` body. LiveInTurn → LiveIdle + TurnEnd; LiveIdle/no-open → 409;
+/// unknown/not-kept → 4xx. Does not finalize unmatched ToolCalls; does not wake.
+async fn post_end_turn(
+    State(st): State<AppState>,
+    AxPath((id, agent_name)): AxPath<(String, String)>,
+    body: Option<Json<serde_json::Value>>,
+) -> Result<Json<EndTurnOut>, StatusCode> {
+    let _ = body; // empty or {} accepted; no fields required
+    let id = sid(&id)?;
+    let _session = st.store().session(id).map_err(|_| StatusCode::NOT_FOUND)?;
+    let agent = aid(&st, &agent_name)?;
+    // M5: unknown handled by aid; not-kept → 4xx, zero TurnEnd.
+    if !st.runtime.kept_agents(id).contains(&agent) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    match st.runtime.end_host_turn(id, agent) {
+        Ok(ev) => {
+            st.publish(id, event_out(&ev));
+            Ok(Json(EndTurnOut { ended: true }))
+        }
+        Err(hearth::Error::TurnNotOpen) => Err(StatusCode::CONFLICT),
+        Err(hearth::Error::Waiting(_)) => Err(StatusCode::CONFLICT),
+        Err(hearth::Error::NotKept(_)) | Err(hearth::Error::AgentNotKept(..)) => {
+            Err(StatusCode::BAD_REQUEST)
+        }
+        Err(hearth::Error::NotMember) | Err(hearth::Error::UnknownUser(_)) => {
+            Err(StatusCode::FORBIDDEN)
+        }
+        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
 
@@ -4469,6 +4511,417 @@ mod tests {
         assert_eq!(
             v["callback_url"].as_str().unwrap(),
             format!("/sessions/{id}/agents/alpha/tool-result")
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Service-host-end-turn — RAP yield ingress under #79 (+ compose #78/#80).
+    // -------------------------------------------------------------------------
+
+    fn count_turn_ends(st: &AppState, sid: SessionId, agent: hearth::AgentId) -> usize {
+        st.store()
+            .session(sid)
+            .unwrap()
+            .events()
+            .unwrap()
+            .iter()
+            .filter(|e| {
+                matches!(
+                    &e.body,
+                    EventBody::TurnEnd { agent: a } if *a == agent
+                )
+            })
+            .count()
+    }
+
+    /// M1: LiveInTurn kept Agent + POST end-turn → LiveIdle; one TurnEnd;
+    /// Binding identity unchanged.
+    #[tokio::test]
+    async fn http_end_turn_live_in_turn_yields_live_idle() {
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let id = sid.0.to_string();
+        let (a, _, _) = install_two_parallel_safe_host_wires(&st, sid, None);
+        st.runtime
+            .begin_turn(sid, a, hearth::HolderId::new("et-m1"))
+            .expect("begin_turn");
+        let bid_before = st.runtime.binding_for(sid, a).unwrap();
+        assert_eq!(
+            st.runtime.classify(sid, a).unwrap(),
+            hearth::Liveness::LiveInTurn
+        );
+        assert_eq!(count_turn_ends(&st, sid, a), 0);
+
+        let app = router(st.clone());
+        let (code, body) = call(
+            app,
+            Request::post(format!("/sessions/{id}/agents/alpha/end-turn"))
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "body={body}");
+        assert!(body.contains(r#""ended":true"#), "body={body}");
+        assert_eq!(
+            st.runtime.classify(sid, a).unwrap(),
+            hearth::Liveness::LiveIdle
+        );
+        assert_eq!(count_turn_ends(&st, sid, a), 1);
+        assert_eq!(st.runtime.binding_for(sid, a).unwrap(), bid_before);
+        assert!(st.runtime.turn_lease_of(sid, a).unwrap().is_none());
+    }
+
+    /// M2: Mid-turn Host ToolCall + POST end-turn → LiveIdle; tool_call_id
+    /// unmatched (no ToolCallInterrupted).
+    #[tokio::test]
+    async fn http_end_turn_mid_tool_call_unmatched_no_interrupt() {
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let id = sid.0.to_string();
+        let (a, _, _) = install_two_parallel_safe_host_wires(&st, sid, None);
+        st.runtime
+            .begin_turn(sid, a, hearth::HolderId::new("et-m2"))
+            .unwrap();
+        let bid_before = st.runtime.binding_for(sid, a).unwrap();
+
+        let app = router(st.clone());
+        let (c1, b1) = call(
+            app.clone(),
+            Request::post(format!("/sessions/{id}/agents/alpha/tool-call"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"name":"yield_tool","tool_call_id":"tc-et2"}"#,
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(c1, StatusCode::OK, "body={b1}");
+
+        let (c2, b2) = call(
+            app,
+            Request::post(format!("/sessions/{id}/agents/alpha/end-turn"))
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(c2, StatusCode::OK, "body={b2}");
+        assert_eq!(
+            st.runtime.classify(sid, a).unwrap(),
+            hearth::Liveness::LiveIdle
+        );
+        assert_eq!(st.runtime.binding_for(sid, a).unwrap(), bid_before);
+        assert_eq!(count_tool_interrupted(&st, sid, "tc-et2"), 0);
+        assert!(
+            !hearth::tool_call_is_terminal(
+                &st.store().session(sid).unwrap().events().unwrap(),
+                "tc-et2"
+            ),
+            "yield must not finalize unmatched Host ToolCall"
+        );
+        let unmatched =
+            hearth::unmatched_tool_calls(&st.store().session(sid).unwrap().events().unwrap());
+        assert!(
+            unmatched
+                .iter()
+                .any(|(ag, tid, _)| *ag == a && tid == "tc-et2"),
+            "tool_call_id must stay unmatched: {unmatched:?}"
+        );
+    }
+
+    /// M3: After M2 yield → POST tool-result → one ToolResult + Trigger +
+    /// LiveInTurn (#78 compose).
+    #[tokio::test]
+    async fn http_end_turn_then_tool_result_triggers_live_in_turn() {
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let id = sid.0.to_string();
+        let (a, _, _) = install_two_parallel_safe_host_wires(&st, sid, None);
+        st.runtime
+            .begin_turn(sid, a, hearth::HolderId::new("et-m3"))
+            .unwrap();
+
+        let app = router(st.clone());
+        let (c1, b1) = call(
+            app.clone(),
+            Request::post(format!("/sessions/{id}/agents/alpha/tool-call"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"name":"compose_et","tool_call_id":"tc-et3"}"#,
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(c1, StatusCode::OK, "body={b1}");
+        let (c2, b2) = call(
+            app.clone(),
+            Request::post(format!("/sessions/{id}/agents/alpha/end-turn"))
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(c2, StatusCode::OK, "body={b2}");
+        assert_eq!(
+            st.runtime.classify(sid, a).unwrap(),
+            hearth::Liveness::LiveIdle
+        );
+
+        let (c3, b3) = call(
+            app,
+            Request::post(format!("/sessions/{id}/agents/alpha/tool-result"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"tool_call_id":"tc-et3","output":"after-et"}"#,
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(c3, StatusCode::OK, "body={b3}");
+        assert!(b3.contains(r#""applied":true"#), "body={b3}");
+        assert_eq!(count_tool_results(&st, sid, "tc-et3"), 1);
+        assert_eq!(count_trigger_wakes(&st, sid), 1);
+        assert_eq!(
+            st.runtime.classify(sid, a).unwrap(),
+            hearth::Liveness::LiveInTurn
+        );
+        assert!(st
+            .store()
+            .session(sid)
+            .unwrap()
+            .current_turn_of(a)
+            .unwrap()
+            .is_some());
+        let evs = st.store().session(sid).unwrap().events().unwrap();
+        assert!(evs.iter().any(|e| matches!(
+            &e.body,
+            EventBody::Wake {
+                source: hearth::WakeSource::Trigger { name }
+            } if name == "tool_result"
+        )));
+    }
+
+    /// M4: LiveIdle / no open turn → 409; zero new TurnEnd.
+    #[tokio::test]
+    async fn http_end_turn_live_idle_conflict() {
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let id = sid.0.to_string();
+        let (a, _, _) = install_two_parallel_safe_host_wires(&st, sid, None);
+        assert_eq!(
+            st.runtime.classify(sid, a).unwrap(),
+            hearth::Liveness::LiveIdle
+        );
+        assert_eq!(count_turn_ends(&st, sid, a), 0);
+
+        let app = router(st.clone());
+        let (code, body) = call(
+            app,
+            Request::post(format!("/sessions/{id}/agents/alpha/end-turn"))
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CONFLICT, "body={body}");
+        assert_eq!(count_turn_ends(&st, sid, a), 0);
+    }
+
+    /// M5: Unknown / not-kept Agent → 4xx; zero TurnEnd.
+    #[tokio::test]
+    async fn http_end_turn_unknown_or_not_kept_refused() {
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let id = sid.0.to_string();
+        let (a, _, _) = install_two_parallel_safe_host_wires(&st, sid, None);
+        st.runtime
+            .begin_turn(sid, a, hearth::HolderId::new("et-m5"))
+            .unwrap();
+        let ends_before = count_turn_ends(&st, sid, a);
+
+        let stranger = st.store().create_agent("stranger", "");
+        st.names
+            .lock()
+            .unwrap()
+            .agents
+            .insert("stranger".into(), stranger.id);
+        // Member-but-not-kept: join without keep.
+        let member = st.store().create_agent("member", "");
+        st.store()
+            .session(sid)
+            .unwrap()
+            .join(hearth::Member::Agent(member.id))
+            .unwrap();
+        st.names
+            .lock()
+            .unwrap()
+            .agents
+            .insert("member".into(), member.id);
+
+        let app = router(st.clone());
+        let (c_unk, _) = call(
+            app.clone(),
+            Request::post(format!("/sessions/{id}/agents/nope/end-turn"))
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await;
+        assert!(c_unk.is_client_error(), "unknown → 4xx, got {c_unk}");
+
+        let (c_nk, _) = call(
+            app.clone(),
+            Request::post(format!("/sessions/{id}/agents/stranger/end-turn"))
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await;
+        assert!(c_nk.is_client_error(), "not-kept → 4xx, got {c_nk}");
+
+        let (c_mem, _) = call(
+            app,
+            Request::post(format!("/sessions/{id}/agents/member/end-turn"))
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await;
+        assert!(
+            c_mem.is_client_error(),
+            "member-but-not-kept → 4xx, got {c_mem}"
+        );
+        assert_eq!(count_turn_ends(&st, sid, a), ends_before);
+        assert_eq!(count_turn_ends(&st, sid, stranger.id), 0);
+        assert_eq!(count_turn_ends(&st, sid, member.id), 0);
+        // Alpha still LiveInTurn (refused peers did not end it).
+        assert_eq!(
+            st.runtime.classify(sid, a).unwrap(),
+            hearth::Liveness::LiveInTurn
+        );
+    }
+
+    /// M6: Peer ParallelSafe Binding/lease/fence untouched; end-turn does not
+    /// fan-out wake / does not end peer turn.
+    #[tokio::test]
+    async fn http_end_turn_peer_parallel_safe_untouched_no_fanout() {
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let id = sid.0.to_string();
+        let (a, b, _) = install_two_parallel_safe_host_wires(&st, sid, None);
+        st.runtime
+            .begin_turn(sid, a, hearth::HolderId::new("et-m6a"))
+            .unwrap();
+        st.runtime
+            .begin_turn(sid, b, hearth::HolderId::new("et-m6b"))
+            .unwrap();
+        let bid_a = st.runtime.binding_for(sid, a).unwrap();
+        let bid_b = st.runtime.binding_for(sid, b).unwrap();
+        let lease_b = st.runtime.turn_lease_of(sid, b).unwrap();
+        let fence_b = st.store().session(sid).unwrap().turn_fence_of(b).unwrap();
+        let wakes_before = count_trigger_wakes(&st, sid);
+        let ends_b_before = count_turn_ends(&st, sid, b);
+
+        let app = router(st.clone());
+        let (code, body) = call(
+            app,
+            Request::post(format!("/sessions/{id}/agents/alpha/end-turn"))
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "body={body}");
+        assert_eq!(
+            st.runtime.classify(sid, a).unwrap(),
+            hearth::Liveness::LiveIdle
+        );
+        assert_eq!(
+            st.runtime.classify(sid, b).unwrap(),
+            hearth::Liveness::LiveInTurn,
+            "peer turn must stay open"
+        );
+        assert_eq!(st.runtime.binding_for(sid, a).unwrap(), bid_a);
+        assert_eq!(st.runtime.binding_for(sid, b).unwrap(), bid_b);
+        assert_eq!(st.runtime.turn_lease_of(sid, b).unwrap(), lease_b);
+        assert_eq!(
+            st.store().session(sid).unwrap().turn_fence_of(b).unwrap(),
+            fence_b
+        );
+        assert_eq!(count_turn_ends(&st, sid, b), ends_b_before);
+        assert_eq!(count_trigger_wakes(&st, sid), wakes_before);
+        assert!(st
+            .store()
+            .session(sid)
+            .unwrap()
+            .current_turn_of(b)
+            .unwrap()
+            .is_some());
+    }
+
+    /// M7: ACP HostAttach drain ToolCall/ToolResult unused path byte-identical
+    /// (no mid-ACP auto turn_end smuggle).
+    #[tokio::test]
+    async fn http_end_turn_leaves_acp_drain_path_byte_identical() {
+        use hearth_agent_wire::{event_bodies, AgentEvent, CapabilityFlags, ToolStatus};
+        let agent = hearth::AgentId(uuid::Uuid::nil());
+        let call = AgentEvent::ToolCall {
+            session_id: "s".into(),
+            item_id: "drain-et7".into(),
+            name: "Bash".into(),
+            arguments: serde_json::json!({}),
+            status: ToolStatus::Completed,
+            parent: None,
+            subagent: false,
+        };
+        let result = AgentEvent::ToolResult {
+            session_id: "s".into(),
+            item_id: "drain-et7".into(),
+            output: serde_json::json!("ok"),
+            status: ToolStatus::Completed,
+        };
+        let bodies_call = event_bodies(
+            hearth::BindingId(uuid::Uuid::nil()),
+            agent,
+            &call,
+            CapabilityFlags::ACP,
+        );
+        let bodies_res = event_bodies(
+            hearth::BindingId(uuid::Uuid::nil()),
+            agent,
+            &result,
+            CapabilityFlags::ACP,
+        );
+        assert!(matches!(
+            &bodies_call[0],
+            EventBody::ToolCall {
+                tool_call_id,
+                name,
+                ..
+            } if tool_call_id == "drain-et7" && name == "Bash"
+        ));
+        assert!(matches!(
+            &bodies_res[0],
+            EventBody::ToolResult {
+                tool_call_id,
+                name,
+                output,
+                ..
+            } if tool_call_id == "drain-et7" && name == "drain-et7" && output.contains("ok")
+        ));
+        assert!(
+            !bodies_call
+                .iter()
+                .chain(bodies_res.iter())
+                .any(|b| matches!(b, EventBody::TurnEnd { .. })),
+            "ACP drain must not smuggle turn_end"
         );
     }
 
