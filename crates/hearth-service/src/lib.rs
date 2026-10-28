@@ -3187,54 +3187,40 @@ mod tests {
             .unwrap();
     }
 
-    fn count_tool_calls(st: &AppState, sid: SessionId, tool_call_id: &str) -> usize {
+    /// Count this Session's EventLog entries whose body matches `pred`.
+    fn count_events(st: &AppState, sid: SessionId, pred: impl Fn(&EventBody) -> bool) -> usize {
         st.store()
             .session(sid)
             .unwrap()
             .events()
             .unwrap()
             .iter()
-            .filter(|e| {
-                matches!(
-                    &e.body,
-                    EventBody::ToolCall { tool_call_id: id, .. } if id == tool_call_id
-                )
-            })
+            .filter(|e| pred(&e.body))
             .count()
+    }
+
+    fn count_tool_calls(st: &AppState, sid: SessionId, tool_call_id: &str) -> usize {
+        count_events(
+            st,
+            sid,
+            |b| matches!(b, EventBody::ToolCall { tool_call_id: id, .. } if id == tool_call_id),
+        )
     }
 
     fn count_tool_results(st: &AppState, sid: SessionId, tool_call_id: &str) -> usize {
-        st.store()
-            .session(sid)
-            .unwrap()
-            .events()
-            .unwrap()
-            .iter()
-            .filter(|e| {
-                matches!(
-                    &e.body,
-                    EventBody::ToolResult { tool_call_id: id, .. } if id == tool_call_id
-                )
-            })
-            .count()
+        count_events(
+            st,
+            sid,
+            |b| matches!(b, EventBody::ToolResult { tool_call_id: id, .. } if id == tool_call_id),
+        )
     }
 
     fn count_trigger_wakes(st: &AppState, sid: SessionId) -> usize {
-        st.store()
-            .session(sid)
-            .unwrap()
-            .events()
-            .unwrap()
-            .iter()
-            .filter(|e| {
-                matches!(
-                    &e.body,
-                    EventBody::Wake {
-                        source: hearth::WakeSource::Trigger { name }
-                    } if name == "tool_result"
-                )
-            })
-            .count()
+        count_events(
+            st,
+            sid,
+            |b| matches!(b, EventBody::Wake { source: hearth::WakeSource::Trigger { name } } if name == "tool_result"),
+        )
     }
 
     /// M1: Prior Host ToolCall + POST → one ToolResult + Wake Trigger + that
@@ -3673,19 +3659,11 @@ mod tests {
     }
 
     fn count_tool_interrupted(st: &AppState, sid: SessionId, tool_call_id: &str) -> usize {
-        st.store()
-            .session(sid)
-            .unwrap()
-            .events()
-            .unwrap()
-            .iter()
-            .filter(|e| {
-                matches!(
-                    &e.body,
-                    EventBody::ToolCallInterrupted { tool_call_id: id, .. } if id == tool_call_id
-                )
-            })
-            .count()
+        count_events(
+            st,
+            sid,
+            |b| matches!(b, EventBody::ToolCallInterrupted { tool_call_id: id, .. } if id == tool_call_id),
+        )
     }
 
     /// M1: Mid-turn Host ToolCall + turn_end → LiveIdle; tool_call_id unmatched
@@ -4519,19 +4497,11 @@ mod tests {
     // -------------------------------------------------------------------------
 
     fn count_turn_ends(st: &AppState, sid: SessionId, agent: hearth::AgentId) -> usize {
-        st.store()
-            .session(sid)
-            .unwrap()
-            .events()
-            .unwrap()
-            .iter()
-            .filter(|e| {
-                matches!(
-                    &e.body,
-                    EventBody::TurnEnd { agent: a } if *a == agent
-                )
-            })
-            .count()
+        count_events(
+            st,
+            sid,
+            |b| matches!(b, EventBody::TurnEnd { agent: a } if *a == agent),
+        )
     }
 
     /// M1: LiveInTurn kept Agent + POST end-turn → LiveIdle; one TurnEnd;
