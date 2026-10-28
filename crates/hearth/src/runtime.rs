@@ -883,6 +883,49 @@ impl Runtime {
         Ok(())
     }
 
+    /// Explicit Host yield for one kept Agent (RAP end-turn ingress).
+    ///
+    /// - Live Runtime lease for `agent` → [`Self::end_turn`] with that slot's
+    ///   holder/fence and `interrupted: false` (appends `TurnEnd`, clears lease).
+    /// - Else Session open turn for `agent` → [`Session::turn_end`].
+    /// - Else [`Error::TurnNotOpen`].
+    ///
+    /// Does **not** finalize unmatched ToolCalls. Does **not** wake. Binding
+    /// stays. Peer Agents' leases / fences / open turns are untouched.
+    /// Service `POST …/end-turn` is the HTTP ingress.
+    pub fn end_host_turn(&self, session: SessionId, agent: AgentId) -> Result<Event> {
+        let _gate = self.lock_durable()?;
+        let _ = self.kept_host(session, agent)?;
+
+        // Live lease for this Agent (holder present)?
+        let live = {
+            let g = self.lock_kept()?;
+            let kept = g.get(&session).ok_or(Error::NotKept(session))?;
+            match kept.leases.get(&agent) {
+                Some(lease) => lease.holder.clone().map(|holder| (holder, lease.turn_id)),
+                None => None,
+            }
+        };
+        if let Some((holder, _turn_id)) = live {
+            let fence = self.store.session(session)?.turn_fence_of(agent)?;
+            self.require_live_holder_fence(session, &holder, fence)?;
+            let sess = self.store.session(session)?;
+            let ev = sess.turn_end(agent)?;
+            let mut g = self.lock_kept()?;
+            let kept = g.get_mut(&session).ok_or(Error::NotKept(session))?;
+            kept.leases.remove(&agent);
+            return Ok(ev);
+        }
+
+        let sess = self.store.session(session)?;
+        if sess.current_turn_of(agent)?.is_none() {
+            return Err(Error::TurnNotOpen);
+        }
+        // Open turn without live lease (e.g. un-leased wake turn). Fail-closed
+        // TurnNotOpen already checked; turn_end stamps the open turn.
+        sess.turn_end(agent)
+    }
+
     /// Intra-turn step memoization. If `StepCompleted` for `(turn_id, step_id)`
     /// is already on the EventLog, returns [`StepOutcome::Memoized`] and does
     /// not run `f`. Otherwise runs `f`, appends `StepCompleted` under the live
@@ -3346,6 +3389,93 @@ mod tests {
         assert_eq!(session.events().unwrap().len(), before, "nothing written");
         assert_eq!(session.bindings().unwrap().len(), 1, "B never claimed");
         assert!(rt.turn_lease(sid).unwrap().is_none());
+    }
+
+    /// Host end_host_turn: leased LiveInTurn → LiveIdle + one TurnEnd; unmatched
+    /// ToolCall stays live; idle → TurnNotOpen; peer lease untouched.
+    #[test]
+    fn end_host_turn_yields_live_idle_refuses_idle_peer_untouched() {
+        let rt = Runtime::new();
+        let a = rt.store().create_agent("a", "");
+        let b = rt.store().create_agent("b", "");
+        let session = rt.create_session();
+        let sid = session.id();
+        rt.keep(sid, a.id, goose()).unwrap();
+        rt.keep(sid, b.id, goose()).unwrap();
+        rt.set_parallel_safe(sid, a.id, ps("a")).unwrap();
+        rt.set_parallel_safe(sid, b.id, ps("b")).unwrap();
+
+        // Idle / no open turn → TurnNotOpen; zero TurnEnd.
+        assert!(matches!(
+            rt.end_host_turn(sid, a.id),
+            Err(Error::TurnNotOpen)
+        ));
+        let turn_ends = |agent: AgentId| {
+            session
+                .events()
+                .unwrap()
+                .iter()
+                .filter(|e| matches!(&e.body, EventBody::TurnEnd { agent: ag } if *ag == agent))
+                .count()
+        };
+        assert_eq!(turn_ends(a.id), 0);
+
+        let (_t, _f, bid) = rt.begin_turn(sid, a.id, "ha".into()).unwrap();
+        assert_eq!(rt.classify(sid, a.id).unwrap(), Liveness::LiveInTurn);
+        session
+            .append(EventBody::ToolCall {
+                agent: a.id,
+                tool_call_id: "tc-eht".into(),
+                name: "host_fn".into(),
+                input: "{}".into(),
+                parent_tool_call_id: None,
+            })
+            .unwrap();
+        // Peer also LiveInTurn under ParallelSafe.
+        let (_tb, fb, bid_b) = rt.begin_turn(sid, b.id, "hb".into()).unwrap();
+        let lease_b = rt.turn_lease_of(sid, b.id).unwrap();
+        let fence_b = session.turn_fence_of(b.id).unwrap();
+
+        let ev = rt.end_host_turn(sid, a.id).expect("yield");
+        assert!(matches!(
+            &ev.body,
+            EventBody::TurnEnd { agent } if *agent == a.id
+        ));
+        assert_eq!(rt.classify(sid, a.id).unwrap(), Liveness::LiveIdle);
+        assert_eq!(rt.binding_for(sid, a.id).unwrap(), bid);
+        assert!(rt.turn_lease_of(sid, a.id).unwrap().is_none());
+        assert_eq!(turn_ends(a.id), 1);
+        assert!(
+            !crate::tool_call_is_terminal(&session.events().unwrap(), "tc-eht"),
+            "yield must not finalize unmatched ToolCall"
+        );
+        // Peer untouched.
+        assert_eq!(rt.classify(sid, b.id).unwrap(), Liveness::LiveInTurn);
+        assert_eq!(rt.binding_for(sid, b.id).unwrap(), bid_b);
+        assert_eq!(rt.turn_lease_of(sid, b.id).unwrap(), lease_b);
+        assert_eq!(session.turn_fence_of(b.id).unwrap(), fence_b);
+        assert_eq!(turn_ends(b.id), 0);
+        let _ = fb;
+
+        // Second end-turn on idle → TurnNotOpen; still one TurnEnd.
+        assert!(matches!(
+            rt.end_host_turn(sid, a.id),
+            Err(Error::TurnNotOpen)
+        ));
+        assert_eq!(turn_ends(a.id), 1);
+
+        // Un-leased open turn path: wake without begin_turn lease, then yield.
+        rt.end_host_turn(sid, b.id).unwrap(); // clear peer first
+        rt.wake(sid, a.id, Wake::Timer).unwrap();
+        assert_eq!(rt.classify(sid, a.id).unwrap(), Liveness::LiveInTurn);
+        assert!(rt.turn_lease_of(sid, a.id).unwrap().is_none());
+        let ev2 = rt.end_host_turn(sid, a.id).expect("unleased yield");
+        assert!(matches!(
+            &ev2.body,
+            EventBody::TurnEnd { agent } if *agent == a.id
+        ));
+        assert_eq!(rt.classify(sid, a.id).unwrap(), Liveness::LiveIdle);
+        assert_eq!(turn_ends(a.id), 2);
     }
 
     #[test]
