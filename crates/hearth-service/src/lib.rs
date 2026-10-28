@@ -4176,6 +4176,164 @@ mod tests {
         .await;
         assert!(c_nk.is_client_error(), "not-kept agent → 4xx, got {c_nk}");
         assert_eq!(count_tool_calls(&st, sid, "tc-nk"), 0);
+
+        // Member-but-not-kept: Host membership passes, so only the service
+        // `kept_agents` guard refuses (load-bearing for that guard).
+        let member = st.store().create_agent("member", "");
+        st.names
+            .lock()
+            .unwrap()
+            .agents
+            .insert("member".into(), member.id);
+        st.store()
+            .session(sid)
+            .unwrap()
+            .join(hearth::Member::Agent(member.id))
+            .unwrap();
+        assert!(!st.runtime.kept_agents(sid).contains(&member.id));
+        let (c_mnk, b_mnk) = call(
+            router(st.clone()),
+            Request::post(format!("/sessions/{id}/agents/member/tool-call"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"x","tool_call_id":"tc-mnk"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            c_mnk,
+            StatusCode::BAD_REQUEST,
+            "member-but-not-kept → 400, body={b_mnk}"
+        );
+        assert_eq!(count_tool_calls(&st, sid, "tc-mnk"), 0);
+        let total_calls = st
+            .store()
+            .session(sid)
+            .unwrap()
+            .events()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e.body, EventBody::ToolCall { .. }))
+            .count();
+        assert_eq!(total_calls, 0, "refused dispatch must append zero ToolCall");
+    }
+
+    /// Fix-1: re-dispatch of a terminal tool_call_id → 409; ToolCall count
+    /// stays 1 (terminal keyed by id alone — reuse could never complete).
+    #[tokio::test]
+    async fn http_tool_call_redispatch_after_terminal_refused() {
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let id = sid.0.to_string();
+        let (_a, _, _) = install_two_parallel_safe_host_wires(&st, sid, None);
+
+        let app = router(st.clone());
+        let dispatch = || {
+            Request::post(format!("/sessions/{id}/agents/alpha/tool-call"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"re","tool_call_id":"tc-re"}"#))
+                .unwrap()
+        };
+        let (c1, b1) = call(app.clone(), dispatch()).await;
+        assert_eq!(c1, StatusCode::OK, "body={b1}");
+        let (c2, b2) = call(
+            app.clone(),
+            Request::post(format!("/sessions/{id}/agents/alpha/tool-result"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"tool_call_id":"tc-re","output":"done-re"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(c2, StatusCode::OK, "body={b2}");
+        assert!(b2.contains(r#""applied":true"#), "body={b2}");
+        assert!(hearth::tool_call_is_terminal(
+            &st.store().session(sid).unwrap().events().unwrap(),
+            "tc-re"
+        ));
+
+        let (c3, b3) = call(app, dispatch()).await;
+        assert_eq!(
+            c3,
+            StatusCode::CONFLICT,
+            "re-dispatch after terminal → 409, body={b3}"
+        );
+        assert_eq!(count_tool_calls(&st, sid, "tc-re"), 1);
+        assert_eq!(count_tool_results(&st, sid, "tc-re"), 1);
+    }
+
+    /// Fix-1: cross-Agent same tool_call_id → 409; peer's original ToolCall
+    /// still completes (Trigger + LiveInTurn), no cross-Agent steal.
+    #[tokio::test]
+    async fn http_tool_call_cross_agent_same_id_refused_peer_completes() {
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let id = sid.0.to_string();
+        let (a, b, _) = install_two_parallel_safe_host_wires(&st, sid, None);
+
+        let app = router(st.clone());
+        let (c1, b1) = call(
+            app.clone(),
+            Request::post(format!("/sessions/{id}/agents/beta/tool-call"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"peer","tool_call_id":"tc-shared"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(c1, StatusCode::OK, "body={b1}");
+        let (c2, b2) = call(
+            app.clone(),
+            Request::post(format!("/sessions/{id}/agents/alpha/tool-call"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"steal","tool_call_id":"tc-shared"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            c2,
+            StatusCode::CONFLICT,
+            "cross-Agent same id → 409, body={b2}"
+        );
+        assert_eq!(count_tool_calls(&st, sid, "tc-shared"), 1);
+
+        // alpha cannot complete beta's id (orphan for alpha).
+        let (c3, b3) = call(
+            app.clone(),
+            Request::post(format!("/sessions/{id}/agents/alpha/tool-result"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"tool_call_id":"tc-shared","output":"stolen"}"#,
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert!(
+            !(c3 == StatusCode::OK && b3.contains(r#""applied":true"#)),
+            "alpha must not complete beta's ToolCall: {c3} {b3}"
+        );
+        assert_eq!(count_tool_results(&st, sid, "tc-shared"), 0);
+
+        let (c4, b4) = call(
+            app,
+            Request::post(format!("/sessions/{id}/agents/beta/tool-result"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"tool_call_id":"tc-shared","output":"ok"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(c4, StatusCode::OK, "body={b4}");
+        assert!(b4.contains(r#""applied":true"#), "body={b4}");
+        assert_eq!(count_tool_results(&st, sid, "tc-shared"), 1);
+        assert_eq!(count_trigger_wakes(&st, sid), 1);
+        assert_eq!(
+            st.runtime.classify(sid, b).unwrap(),
+            hearth::Liveness::LiveInTurn
+        );
+        assert_eq!(
+            st.runtime.classify(sid, a).unwrap(),
+            hearth::Liveness::LiveIdle,
+            "no fan-out to alpha"
+        );
     }
 
     /// M6: Peer ParallelSafe Binding / lease / fence untouched; dispatch does

@@ -633,7 +633,8 @@ pub enum HostToolResultError {
 pub enum HostToolCallError {
     /// Agent is not a member of this Session (unknown / not-on-session).
     NotOnSession,
-    /// Unmatched [`EventBody::ToolCall`] with this id already exists for the Agent.
+    /// An [`EventBody::ToolCall`] with this id already exists on the Session
+    /// (any Agent, matched or not).
     AlreadyExists,
 }
 
@@ -1641,8 +1642,8 @@ impl Session {
     /// Append a Host-owned [`EventBody::ToolCall`] (RAP dispatch half).
     ///
     /// - Agent not a Session member → [`HostToolCallError::NotOnSession`].
-    /// - Unmatched ToolCall already present for `(agent, tool_call_id)` →
-    ///   [`HostToolCallError::AlreadyExists`].
+    /// - Any ToolCall already present on the Session with `tool_call_id`
+    ///   (any Agent, matched or terminal) → [`HostToolCallError::AlreadyExists`].
     /// - Else append ToolCall (`parent_tool_call_id: None`).
     ///
     /// Does **not** wake and does **not** auto `turn_end`. Service
@@ -1665,10 +1666,12 @@ impl Session {
             return Err(HostToolCallError::NotOnSession);
         }
         let events = self.events().map_err(|_| HostToolCallError::NotOnSession)?;
-        if unmatched_tool_calls(&events)
-            .iter()
-            .any(|(a, id, _)| *a == agent && id == &tool_call_id)
-        {
+        // Terminal state is keyed by `tool_call_id` alone, so any prior
+        // ToolCall with this id (any Agent, matched or not) refuses: a reused
+        // id could never complete and could steal a peer's completion.
+        if events.iter().any(|e| {
+            matches!(&e.body, EventBody::ToolCall { tool_call_id: id, .. } if id == &tool_call_id)
+        }) {
             return Err(HostToolCallError::AlreadyExists);
         }
         Ok(self
@@ -2856,13 +2859,30 @@ mod tests {
             .filter(|e| matches!(e.body, EventBody::ToolCall { .. }))
             .count();
         assert_eq!(calls, 1, "duplicate must not append a second ToolCall");
-        // After terminal, same id may be re-dispatched (not unmatched).
+        // After terminal, same id is still refused (terminal keyed by id alone).
         session
             .append_host_tool_result(agent.id, "tc-h1", "done")
             .unwrap();
-        session
-            .append_host_tool_call(agent.id, "tc-h1", "host_fn", "{}")
-            .expect("re-dispatch after terminal ok");
+        assert_eq!(
+            session.append_host_tool_call(agent.id, "tc-h1", "host_fn", "{}"),
+            Err(HostToolCallError::AlreadyExists),
+            "re-dispatch after terminal must be refused"
+        );
+        // Cross-Agent same id is refused too.
+        let peer = store.create_agent("peer", "");
+        session.join(Member::Agent(peer.id)).unwrap();
+        assert_eq!(
+            session.append_host_tool_call(peer.id, "tc-h1", "host_fn", "{}"),
+            Err(HostToolCallError::AlreadyExists),
+            "cross-Agent id reuse must be refused"
+        );
+        let calls = session
+            .events()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e.body, EventBody::ToolCall { .. }))
+            .count();
+        assert_eq!(calls, 1, "refused reuse must not append");
     }
 
     #[test]
