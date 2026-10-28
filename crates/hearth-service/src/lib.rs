@@ -4925,7 +4925,6 @@ mod tests {
         );
     }
 
-
     // ── Concurrent-host-tool-rap (#81 Soft lock floor) ─────────────────────
     // Two ParallelSafe Host-wired Agents; each HTTP RAP tool-call → (optional)
     // end-turn → tool-result → Trigger + LiveInTurn. Pin raw lease/fence/Binding;
@@ -5137,10 +5136,7 @@ mod tests {
         let session = st.store().session(sid).unwrap();
         assert_eq!(session.turn_fence_of(a).unwrap(), fa);
         assert_eq!(session.turn_fence_of(b).unwrap(), fb);
-        for (agent, holder, turn, fence) in [
-            (a, "rap-m2-a", ta, fa),
-            (b, "rap-m2-b", tb, fb),
-        ] {
+        for (agent, holder, turn, fence) in [(a, "rap-m2-a", ta, fa), (b, "rap-m2-b", tb, fb)] {
             let lease = st
                 .runtime
                 .turn_lease_of(sid, agent)
@@ -5266,7 +5262,10 @@ mod tests {
         assert_eq!(lease_b.holder, hearth::HolderId::new("rap-m3-b"));
         assert_eq!(lease_b.turn_id, tb);
         assert_eq!(lease_b.fence, fb);
-        assert_eq!(st.store().session(sid).unwrap().turn_fence_of(b).unwrap(), fb);
+        assert_eq!(
+            st.store().session(sid).unwrap().turn_fence_of(b).unwrap(),
+            fb
+        );
         assert_eq!(st.runtime.binding_for(sid, b).unwrap(), bid_b);
         assert_eq!(st.runtime.binding_for(sid, a).unwrap(), bid_a);
         let ends_b_before = count_turn_ends(&st, sid, b);
@@ -5296,7 +5295,10 @@ mod tests {
             "A's Trigger must not end peer B"
         );
         assert_eq!(
-            st.runtime.turn_lease_of(sid, b).unwrap().expect("B still leased"),
+            st.runtime
+                .turn_lease_of(sid, b)
+                .unwrap()
+                .expect("B still leased"),
             lease_b,
             "raw turn_lease_of(B) pinned across A's yield+complete"
         );
@@ -5392,9 +5394,7 @@ mod tests {
             app.clone(),
             Request::post(format!("/sessions/{id}/agents/beta/tool-call"))
                 .header("content-type", "application/json")
-                .body(Body::from(
-                    r#"{"name":"rap_b","tool_call_id":"tc-rap-b4"}"#,
-                ))
+                .body(Body::from(r#"{"name":"rap_b","tool_call_id":"tc-rap-b4"}"#))
                 .unwrap(),
         )
         .await;
@@ -5479,16 +5479,16 @@ mod tests {
             .turn_lease_of(sid, b)
             .unwrap()
             .expect("raw turn_lease_of(B)");
+        assert_eq!((lease_a.agent, lease_a.turn_id, lease_a.fence), (a, ta, fa));
+        assert_eq!((lease_b.agent, lease_b.turn_id, lease_b.fence), (b, tb, fb));
         assert_eq!(
-            (lease_a.agent, lease_a.turn_id, lease_a.fence),
-            (a, ta, fa)
+            st.store().session(sid).unwrap().turn_fence_of(a).unwrap(),
+            fa
         );
         assert_eq!(
-            (lease_b.agent, lease_b.turn_id, lease_b.fence),
-            (b, tb, fb)
+            st.store().session(sid).unwrap().turn_fence_of(b).unwrap(),
+            fb
         );
-        assert_eq!(st.store().session(sid).unwrap().turn_fence_of(a).unwrap(), fa);
-        assert_eq!(st.store().session(sid).unwrap().turn_fence_of(b).unwrap(), fb);
     }
 
     /// M5: Mid-loop LiveIdle remint on yielded A → AlreadyLive; unmatched stays
@@ -5568,7 +5568,10 @@ mod tests {
         assert_eq!(lease_b.holder, hearth::HolderId::new("rap-m5-b"));
         assert_eq!(lease_b.turn_id, tb);
         assert_eq!(lease_b.fence, fb);
-        assert_eq!(st.store().session(sid).unwrap().turn_fence_of(b).unwrap(), fb);
+        assert_eq!(
+            st.store().session(sid).unwrap().turn_fence_of(b).unwrap(),
+            fb
+        );
 
         let remint_err = st.runtime.remint(sid, a).expect_err("LiveIdle remint");
         assert!(
