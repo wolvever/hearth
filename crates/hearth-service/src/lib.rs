@@ -6492,13 +6492,16 @@ mod tests {
             })
             .count();
         assert_eq!(trs, 1, "exactly one ToolResult");
-        // A was FailClosed-unbound by steer #1; Binding for B kept.
+        // The 2nd X steer may take the Session lock right after the beta
+        // tool-result (std Mutex is not FIFO) and run its own serialized
+        // remint of A (transient Binding per attempt). Join it before reading
+        // A's Binding so the assert never races that remint.
+        let (_c2, _b2) = hx2.await.unwrap();
+        // A FailClosed-unbound after the (serialized) budget; Binding for B kept.
         assert!(
             st.runtime.binding_for(sx, ax).is_err(),
             "A unbound after budget"
         );
-
-        let (_c2, _b2) = hx2.await.unwrap();
     }
 
     /// M4: X outcome unchanged + wires reinserted. Hung remint → A FailClosed
