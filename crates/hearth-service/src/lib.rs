@@ -8075,4 +8075,262 @@ mod tests {
             );
         }
     }
+
+    // ---- Stream-tails-log (M1–M8) ----
+    // Each floor drains the WS *before* the action under test, then asserts
+    // the live frames are exactly `log[len0..]` (order, no dup, no miss).
+
+    type StlWs = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    async fn stl_ws(st: &AppState, sid: SessionId) -> StlWs {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(axum::serve(listener, router(st.clone())).into_future());
+        let url = format!("ws://{addr}/sessions/{}/stream", sid.0);
+        let (ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        ws
+    }
+
+    /// Every WS text frame body until `quiet_ms` of silence.
+    async fn stl_drain(ws: &mut StlWs, quiet_ms: u64) -> Vec<String> {
+        let mut out = Vec::new();
+        loop {
+            let next =
+                tokio::time::timeout(std::time::Duration::from_millis(quiet_ms), ws.next()).await;
+            match next {
+                Ok(Some(Ok(WsMsg::Text(t)))) => {
+                    let v: serde_json::Value = serde_json::from_str(t.as_str()).unwrap();
+                    out.push(v["body"].as_str().unwrap_or("").to_string());
+                }
+                Ok(Some(Ok(_))) => continue,
+                _ => return out,
+            }
+        }
+    }
+
+    fn stl_log(st: &AppState, sid: SessionId) -> Vec<String> {
+        st.store()
+            .session(sid)
+            .unwrap()
+            .events()
+            .unwrap()
+            .iter()
+            .map(|e| event_out(e).body)
+            .collect()
+    }
+
+    /// Live frames == `log[len0..]` exactly, and the log grew.
+    fn stl_assert_exact(tag: &str, st: &AppState, sid: SessionId, len0: usize, live: &[String]) {
+        let log = stl_log(st, sid);
+        assert!(log.len() > len0, "{tag}: expected appends after {len0}");
+        assert_eq!(live, &log[len0..], "{tag}: live != log tail");
+    }
+
+    /// M1: RAP tool-result while the Agent is mid-turn → 409; the appended
+    /// ToolResult is streamed live exactly once (re-POST adds nothing).
+    #[tokio::test]
+    async fn ws_rap_409_tool_result_streamed() {
+        let (st, sid, a) = rcb_setup(vec!["agent-0".into()]);
+        let mut ws = stl_ws(&st, sid).await;
+        let _ = stl_drain(&mut ws, 300).await;
+        let (c, b) = steer(&st, sid, "go").await;
+        assert_eq!(c, StatusCode::OK, "{b}");
+        rcb_tool_call(&st, sid, "tc1").await;
+        let _ = stl_drain(&mut ws, 300).await;
+        let len0 = stl_log(&st, sid).len();
+        let (c, b) = rcb_tool_result(&st, sid, "tc1").await;
+        assert_eq!(c, StatusCode::CONFLICT, "{b}");
+        assert_eq!(
+            st.runtime.classify(sid, a).unwrap(),
+            hearth::Liveness::LiveInTurn
+        );
+        let live = stl_drain(&mut ws, 500).await;
+        stl_assert_exact("M1", &st, sid, len0, &live);
+        assert_eq!(live.len(), 1, "{live:?}");
+        assert!(live[0].contains("ToolResult"), "{live:?}");
+        let len1 = stl_log(&st, sid).len();
+        let (c, b) = rcb_tool_result(&st, sid, "tc1").await;
+        assert_eq!(c, StatusCode::OK, "{b}");
+        assert!(b.contains(r#""applied":false"#), "{b}");
+        let live2 = stl_drain(&mut ws, 400).await;
+        assert_eq!(live2, &stl_log(&st, sid)[len1..], "M1 re-POST");
+    }
+
+    /// M2: RAP tool-result → 500 after append (NewWire exhaust): every
+    /// appended event is live.
+    #[tokio::test]
+    async fn ws_rap_500_events_streamed() {
+        let (st, sid, a) = rcb_setup(vec!["agent-0".into()]);
+        rcb_tool_call(&st, sid, "tc1").await;
+        st.set_host_old_wire(sid, a, hearth_agent_wire::OldWire::Exited(1))
+            .unwrap();
+        rrb_set_new_wire(&st, sid, a, rrb_flaky_new_wire(99));
+        let mut ws = stl_ws(&st, sid).await;
+        let _ = stl_drain(&mut ws, 300).await;
+        let len0 = stl_log(&st, sid).len();
+        let (c, b) = rcb_tool_result(&st, sid, "tc1").await;
+        assert_eq!(c, StatusCode::INTERNAL_SERVER_ERROR, "{b}");
+        let live = stl_drain(&mut ws, 500).await;
+        stl_assert_exact("M2", &st, sid, len0, &live);
+        assert!(live.iter().any(|b| b.contains("ToolResult")), "{live:?}");
+    }
+
+    /// M3: steer that remints both lost Agents → 200; Binding events,
+    /// UserMessage and TurnStarts are all live, exact.
+    #[tokio::test]
+    async fn ws_steer_remint_binding_events_streamed() {
+        let st = AppState::new(vec![]);
+        let sid = st.store().create_session().id();
+        let _ = install_two_parallel_safe_host_wires(
+            &st,
+            sid,
+            Some(hearth_agent_wire::OldWire::Exited(1)),
+        );
+        let mut ws = stl_ws(&st, sid).await;
+        let _ = stl_drain(&mut ws, 300).await;
+        let len0 = stl_log(&st, sid).len();
+        let (c, b) = steer(&st, sid, "go").await;
+        assert_eq!(c, StatusCode::OK, "{b}");
+        let live = stl_drain(&mut ws, 500).await;
+        stl_assert_exact("M3", &st, sid, len0, &live);
+        assert!(
+            live.iter().any(|b| b.contains("BindingAttached")),
+            "{live:?}"
+        );
+        assert!(
+            live.iter().any(|b| b.contains("BindingReleased")),
+            "{live:?}"
+        );
+    }
+
+    /// M3 twin: RAP Applied with a remint (yielded A, lost wire).
+    #[tokio::test]
+    async fn ws_rap_applied_remint_events_streamed() {
+        let (st, sid, a) = rcb_setup(vec!["agent-0".into()]);
+        let (c, b) = steer(&st, sid, "go").await;
+        assert_eq!(c, StatusCode::OK, "{b}");
+        rcb_tool_call(&st, sid, "tc1").await;
+        rcb_end_turn(&st, sid).await;
+        st.set_host_old_wire(sid, a, hearth_agent_wire::OldWire::Exited(1))
+            .unwrap();
+        let mut ws = stl_ws(&st, sid).await;
+        let _ = stl_drain(&mut ws, 300).await;
+        let len0 = stl_log(&st, sid).len();
+        let (c, b) = rcb_tool_result(&st, sid, "tc1").await;
+        assert_eq!(c, StatusCode::OK, "{b}");
+        assert!(b.contains(r#""applied":true"#), "{b}");
+        let live = stl_drain(&mut ws, 500).await;
+        stl_assert_exact("M3 twin", &st, sid, len0, &live);
+        assert!(
+            live.iter().any(|b| b.contains("BindingAttached")),
+            "{live:?}"
+        );
+    }
+
+    /// M4: member steer, two lost no-resume Agents → 500 after the
+    /// FailClosed unbinds; the `BindingReleased` events are still live.
+    #[tokio::test]
+    async fn ws_steer_500_failclosed_streamed() {
+        let st = AppState::new(vec![]);
+        let sid = st.store().create_session().id();
+        let _ = install_two_parallel_safe_host_wires_with_caps(
+            &st,
+            sid,
+            Some(hearth_agent_wire::OldWire::Exited(1)),
+            hearth_agent_wire::LiveCaps::default(),
+        );
+        let mut ws = stl_ws(&st, sid).await;
+        let _ = stl_drain(&mut ws, 300).await;
+        let len0 = stl_log(&st, sid).len();
+        let (c, b) = steer(&st, sid, "go").await;
+        assert_eq!(c, StatusCode::INTERNAL_SERVER_ERROR, "{b}");
+        let live = stl_drain(&mut ws, 500).await;
+        stl_assert_exact("M4", &st, sid, len0, &live);
+        assert_eq!(
+            live.iter()
+                .filter(|b| b.contains("BindingReleased"))
+                .count(),
+            2,
+            "{live:?}"
+        );
+    }
+
+    /// M5: one event on Session X, then a 300-join flood on Session Y: X's
+    /// client still gets X's own event (cross-Session isolation).
+    #[tokio::test]
+    async fn ws_other_session_flood_keeps_own_event() {
+        let st = AppState::new(vec![]);
+        let sx = st.store().create_session().id();
+        let sy = st.store().create_session().id();
+        let mut ws = stl_ws(&st, sx).await;
+        let _ = stl_drain(&mut ws, 300).await;
+        let len0 = stl_log(&st, sx).len();
+        apply_join(&st, sx, Some("x0".into()), None, None).unwrap();
+        for i in 0..300 {
+            apply_join(&st, sy, Some(format!("y{i}")), None, None).unwrap();
+        }
+        let live = stl_drain(&mut ws, 800).await;
+        stl_assert_exact("M5", &st, sx, len0, &live);
+        assert_eq!(live.len(), 1, "{live:?}");
+    }
+
+    /// M6: 300 own-Session events in one burst with no yield (over the
+    /// 256-slot doorbell channel): all 300 are live, exact.
+    #[tokio::test]
+    async fn ws_burst_over_capacity_all_streamed() {
+        let st = AppState::new(vec![]);
+        let sid = st.store().create_session().id();
+        let mut ws = stl_ws(&st, sid).await;
+        let _ = stl_drain(&mut ws, 300).await;
+        let len0 = stl_log(&st, sid).len();
+        for i in 0..300 {
+            apply_join(&st, sid, Some(format!("u{i}")), None, None).unwrap();
+        }
+        let live = stl_drain(&mut ws, 800).await;
+        stl_assert_exact("M6", &st, sid, len0, &live);
+        assert_eq!(live.len(), 300);
+    }
+
+    /// M7: two clients, the second connects mid-Session; each client's
+    /// replay + live == the full log, exact, no duplicates.
+    #[tokio::test]
+    async fn ws_two_clients_replay_plus_live_exact() {
+        let (st, sid, _a) = rcb_setup(vec!["agent-0".into()]);
+        let mut ws1 = stl_ws(&st, sid).await;
+        let r1 = stl_drain(&mut ws1, 300).await;
+        let (c, b) = steer(&st, sid, "go").await;
+        assert_eq!(c, StatusCode::OK, "{b}");
+        let mut ws2 = stl_ws(&st, sid).await;
+        let r2 = stl_drain(&mut ws2, 300).await;
+        rcb_tool_call(&st, sid, "tc1").await;
+        let (c, b) = rcb_tool_result(&st, sid, "tc1").await;
+        assert_eq!(c, StatusCode::CONFLICT, "{b}");
+        let l1 = stl_drain(&mut ws1, 500).await;
+        let l2 = stl_drain(&mut ws2, 500).await;
+        let all1: Vec<String> = r1.into_iter().chain(l1).collect();
+        let all2: Vec<String> = r2.into_iter().chain(l2).collect();
+        stl_assert_exact("M7 c1", &st, sid, 0, &all1);
+        stl_assert_exact("M7 c2", &st, sid, 0, &all2);
+    }
+
+    /// M8 (contrast, green on tip): tool-call alone, then end-turn alone,
+    /// each streamed exactly, drained before any later ring.
+    #[tokio::test]
+    async fn ws_tool_call_and_end_turn_streamed_alone() {
+        let (st, sid, _a) = rcb_setup(vec!["agent-0".into()]);
+        let (c, b) = steer(&st, sid, "go").await;
+        assert_eq!(c, StatusCode::OK, "{b}");
+        let mut ws = stl_ws(&st, sid).await;
+        let _ = stl_drain(&mut ws, 300).await;
+        let len0 = stl_log(&st, sid).len();
+        rcb_tool_call(&st, sid, "tc1").await;
+        let l1 = stl_drain(&mut ws, 400).await;
+        stl_assert_exact("M8 tool-call", &st, sid, len0, &l1);
+        let len1 = stl_log(&st, sid).len();
+        rcb_end_turn(&st, sid).await;
+        let l2 = stl_drain(&mut ws, 400).await;
+        stl_assert_exact("M8 end-turn", &st, sid, len1, &l2);
+    }
 }
