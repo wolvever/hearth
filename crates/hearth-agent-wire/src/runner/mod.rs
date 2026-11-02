@@ -1022,7 +1022,11 @@ pub struct CompleteHostToolArgs<'a> {
 /// 2. Already terminal → [`CompleteHostTool::NotApplied`] (duplicate / late after
 ///    Interrupted) — no wake.
 /// 3. Append ToolResult (name from matching ToolCall).
-/// 4. Wake **this Agent only** (never fan-out / `wake_each_kept`): conflict
+/// 4. Wake **this Agent only** (never fan-out / `wake_each_kept`):
+///    read-only [`hearth::Runtime::classify`] (RAP-classify-before-remint:
+///    `LiveInTurn` → Waiting `TurnOpen`, `Unknown` → Waiting
+///    `LivenessUnknown`, zero wire action — never remint under an open
+///    turn, even when an empty ParallelSafe set passes the gate) → conflict
 ///    gate → [`host_wake`] with limited remint retry
 ///    (RAP-remint-retry-budget: transient [`RemintError::NewWire`] on a
 ///    resume-capable Binding retries up to [`HOST_WAKE_REMINT_RETRY_BUDGET`],
@@ -1100,8 +1104,9 @@ pub fn complete_host_tool(
 /// RAP-remint-retry-budget: [`wake_through_host_wake`] with
 /// [`host_wake_with_limited_remint_retry`] in place of the single-shot
 /// [`host_wake`]. Used **only** by [`complete_host_tool`]; tick and explicit
-/// single wake stay single-shot. Same gate → host wake → `wake_with`
-/// ([`hearth::AlreadyBound`]) order. On exhaust the typed
+/// single wake stay single-shot. Order: classify (`LiveInTurn` / `Unknown`
+/// → Waiting, zero wire action; RAP-classify-before-remint) → gate → host
+/// wake → `wake_with` ([`hearth::AlreadyBound`]). On exhaust the typed
 /// `Remint(NewWire)` returns with FailClosed recorded once and the Binding
 /// left bound (single Agent: no ghost-turn risk, so no fan-out unbind).
 fn wake_through_host_wake_with_retry(
@@ -1118,6 +1123,22 @@ fn wake_through_host_wake_with_retry(
         remint,
     } = args;
     let agent = remint.session.host_agent_id();
+    // RAP-classify-before-remint: same read-only classify as the fan-out /
+    // tick / begin_turn / remint paths, before the gate and any wire action.
+    // The gate alone is not the guard: an empty ParallelSafe set never
+    // self-conflicts, so without this a lost wire would remint under the
+    // Agent's own open turn.
+    match runtime.classify(session_id, agent)? {
+        hearth::Liveness::LiveInTurn => {
+            return Ok(WakeThroughHost::Waiting(hearth::WaitReason::TurnOpen));
+        }
+        hearth::Liveness::Unknown => {
+            return Ok(WakeThroughHost::Waiting(
+                hearth::WaitReason::LivenessUnknown,
+            ));
+        }
+        _ => {}
+    }
     match runtime.check_turn_gate(session_id, agent) {
         Err(hearth::Error::Waiting(reason)) => return Ok(WakeThroughHost::Waiting(reason)),
         r => r?,
@@ -7606,5 +7627,146 @@ mod tests {
         assert!(!std::str::from_utf8(new.stdin_log().unwrap())
             .unwrap()
             .contains("session/resume"));
+    }
+
+    // ---- RAP-classify-before-remint ----
+
+    /// One wire-level `complete_host_tool` for `agent`'s `tc` on a lost
+    /// (`Exited(1)`) wire.
+    fn rcb_complete(
+        rt: &hearth::Runtime,
+        sid: hearth::SessionId,
+        remint: &RemintSession,
+        place: &hearth::Place,
+        tc: &str,
+        old: &mut AttachRunner,
+        new: &mut AttachRunner,
+    ) -> CompleteHostTool {
+        let agent = remint.host_agent_id();
+        rt.store()
+            .session(sid)
+            .unwrap()
+            .append(hearth::EventBody::ToolCall {
+                agent,
+                tool_call_id: tc.into(),
+                name: "t".into(),
+                input: "{}".into(),
+                parent_tool_call_id: None,
+            })
+            .expect("host ToolCall");
+        let mut transport = transport_for_wire(WireKind::JsonlRpc);
+        let (mut old_next, mut new_next) = (10u64, 2u64);
+        complete_host_tool(
+            old,
+            new,
+            &mut transport,
+            CompleteHostToolArgs {
+                runtime: rt,
+                session_id: sid,
+                agent,
+                tool_call_id: tc,
+                output: "o",
+                old_wire: OldWire::Exited(1),
+                remint: HostRemintFullArgs {
+                    session: remint,
+                    place: Some(place),
+                    mcp_servers: &[],
+                    init_rpc_id: &RpcId::Num(1),
+                    old_next_rpc_id: &mut old_next,
+                    new_next_rpc_id: &mut new_next,
+                },
+            },
+        )
+        .expect("AppliedWakeWaiting, not Err")
+    }
+
+    /// M4 (RAP-classify-before-remint): A declares the empty ParallelSafe set
+    /// (never self-conflicts at the gate) and is kernel LiveInTurn; its wire
+    /// is `Exited(1)`. `complete_host_tool` → `AppliedWakeWaiting(TurnOpen)`
+    /// with the ToolResult appended (M8) and **zero wire action**: 0 mints,
+    /// Binding unchanged, old/new stdin untouched, old child not killed.
+    /// Pin: A kernel LiveIdle (also `[]`) with a peer's non-ParallelSafe turn
+    /// open → still `AppliedWakeWaiting` before any wire action, via the gate
+    /// (order: classify → gate, both pre-wire). Tip / "classify after
+    /// host_wake": the RAP step reminted under the turn (+1 mint).
+    #[test]
+    fn complete_host_tool_open_turn_waits_before_wire_action() {
+        // (1) Own open turn, empty declaration → classify refuses.
+        let (rt, sid, uid, a, _b, remint_a, _remint_b, place) = shared_runtime_two_agents();
+        rt.set_parallel_safe(sid, a, Some(hearth::ParallelSafe::default()))
+            .expect("declare []");
+        rt.wake(
+            sid,
+            a,
+            hearth::Wake::UserQuery {
+                user: uid,
+                text: "go".into(),
+            },
+        )
+        .expect("open A's turn");
+        assert_eq!(rt.classify(sid, a).unwrap(), hearth::Liveness::LiveInTurn);
+        rt.check_turn_gate(sid, a)
+            .expect("[] never self-conflicts: the gate alone is not the guard");
+        let session = rt.store().session(sid).unwrap();
+        let turn0 = session.current_turn_of(a).unwrap();
+        let bid0 = rt.binding_for(sid, a).unwrap();
+        let before = binding_attached_count(&rt, sid);
+        let mut old = initialized_fake(Vec::new());
+        let old_log = old.stdin_log().unwrap().to_vec();
+        let mut new = new_wire_fake();
+        let r = rcb_complete(&rt, sid, &remint_a, &place, "tc-own", &mut old, &mut new);
+        let CompleteHostTool::AppliedWakeWaiting {
+            tool_result,
+            reason,
+        } = r
+        else {
+            panic!("expected AppliedWakeWaiting, got {r:?}");
+        };
+        assert_eq!(reason, hearth::WaitReason::TurnOpen);
+        assert!(matches!(
+            &tool_result.body,
+            hearth::EventBody::ToolResult { tool_call_id, .. } if tool_call_id == "tc-own"
+        ));
+        assert_eq!(binding_attached_count(&rt, sid), before, "0 mints");
+        assert_eq!(rt.binding_for(sid, a).unwrap(), bid0, "Binding unchanged");
+        assert_eq!(session.current_turn_of(a).unwrap(), turn0);
+        assert_eq!(old.stdin_log().unwrap(), &old_log[..], "old untouched");
+        assert!(new.stdin_log().unwrap().is_empty(), "no session/resume");
+        assert_ne!(old.try_wait().unwrap(), Some(9), "old child not killed");
+        assert!(!remint_a
+            .observe()
+            .iter()
+            .any(|e| e.kind == RemintEventKind::FailClosed));
+
+        // (2) Pin: A LiveIdle, peer B's non-ParallelSafe turn open → gate.
+        let (rt, sid, uid, a, b, remint_a, _remint_b, place) = shared_runtime_two_agents();
+        rt.set_parallel_safe(sid, a, Some(hearth::ParallelSafe::default()))
+            .expect("declare []");
+        rt.wake(
+            sid,
+            b,
+            hearth::Wake::UserQuery {
+                user: uid,
+                text: "peer".into(),
+            },
+        )
+        .expect("open B's turn");
+        assert_eq!(rt.classify(sid, a).unwrap(), hearth::Liveness::LiveIdle);
+        assert_eq!(rt.classify(sid, b).unwrap(), hearth::Liveness::LiveInTurn);
+        let bid0 = rt.binding_for(sid, a).unwrap();
+        let before = binding_attached_count(&rt, sid);
+        let mut old = initialized_fake(Vec::new());
+        let old_log = old.stdin_log().unwrap().to_vec();
+        let mut new = new_wire_fake();
+        let r = rcb_complete(&rt, sid, &remint_a, &place, "tc-peer", &mut old, &mut new);
+        let CompleteHostTool::AppliedWakeWaiting { reason, .. } = r else {
+            panic!("expected AppliedWakeWaiting (gate), got {r:?}");
+        };
+        assert_eq!(reason, hearth::WaitReason::TurnOpen);
+        assert_eq!(binding_attached_count(&rt, sid), before, "0 mints");
+        assert_eq!(rt.binding_for(sid, a).unwrap(), bid0);
+        assert_eq!(old.stdin_log().unwrap(), &old_log[..]);
+        assert!(new.stdin_log().unwrap().is_empty());
+        assert_ne!(old.try_wait().unwrap(), Some(9));
     }
 }
