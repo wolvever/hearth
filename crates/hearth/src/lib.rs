@@ -1197,7 +1197,7 @@ impl Session {
         })
     }
 
-    fn require_user(&self, user: UserId) -> Result<()> {
+    pub(crate) fn require_user(&self, user: UserId) -> Result<()> {
         let g = self.store.lock()?;
         if !g.users.contains_key(&user) {
             return Err(Error::UnknownUser(user));

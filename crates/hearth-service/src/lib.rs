@@ -7771,4 +7771,308 @@ mod tests {
             assert_eq!(count_trigger_wakes(&st, sid), 0);
         }
     }
+
+    // ---- Waker-admit-before-wire (M1–M6) ----
+
+    /// `mallory` joins only another Session (user names are global).
+    fn wab_join_mallory_elsewhere(st: &AppState) {
+        let other = st.store().create_session().id();
+        apply_join(st, other, Some("mallory".into()), None, None).unwrap();
+    }
+
+    async fn wab_steer_as(
+        st: &AppState,
+        sid: SessionId,
+        user: &str,
+        msg: &str,
+    ) -> (StatusCode, String) {
+        let id = sid.0.to_string();
+        call(
+            router(st.clone()),
+            Request::post(format!("/sessions/{id}/events"))
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"user":"{user}","message":"{msg}"}}"#
+                )))
+                .unwrap(),
+        )
+        .await
+    }
+
+    fn wab_log_len(st: &AppState, sid: SessionId) -> usize {
+        st.store().session(sid).unwrap().events().unwrap().len()
+    }
+
+    /// Per-Agent zero-wire footprint: (Binding, old stdin, new stdin,
+    /// evidence, FailClosed texts).
+    #[allow(clippy::type_complexity)]
+    fn wab_agent_footprint(
+        st: &AppState,
+        sid: SessionId,
+        agent: hearth::AgentId,
+    ) -> (
+        Option<hearth::BindingId>,
+        String,
+        String,
+        hearth_agent_wire::OldWire,
+        Vec<String>,
+    ) {
+        (
+            st.runtime.binding_for(sid, agent).ok(),
+            rrb_runner_log(st, sid, agent, true),
+            rrb_runner_log(st, sid, agent, false),
+            host_old_wire(st, sid, agent),
+            rrb_fail_closed_texts(st, sid, agent),
+        )
+    }
+
+    /// Assert a refused steer left zero wire / Runtime action on both Agents.
+    #[allow(clippy::type_complexity)]
+    fn wab_assert_zero_wire(
+        st: &AppState,
+        sid: SessionId,
+        agents: [hearth::AgentId; 2],
+        mints0: usize,
+        len0: usize,
+        fps0: &[(
+            Option<hearth::BindingId>,
+            String,
+            String,
+            hearth_agent_wire::OldWire,
+            Vec<String>,
+        )],
+    ) {
+        assert_eq!(count_mints(st, sid), mints0, "0 mints on a refused steer");
+        assert_eq!(wab_log_len(st, sid), len0, "log length unchanged");
+        assert_eq!(count_user_messages(st, sid), 0, "0 UserMessage");
+        for (ag, fp0) in agents.iter().zip(fps0) {
+            let fp = wab_agent_footprint(st, sid, *ag);
+            assert!(fp.0.is_some(), "Agent {ag:?} still bound (no unbind)");
+            assert_eq!(
+                fp.3,
+                hearth_agent_wire::OldWire::Exited(1),
+                "Agent {ag:?} evidence unchanged"
+            );
+            assert!(fp.4.is_empty(), "Agent {ag:?} 0 FailClosed: {:?}", fp.4);
+            assert!(fp.2.is_empty(), "Agent {ag:?} new wire untouched: {}", fp.2);
+            assert_eq!(&fp, fp0, "Agent {ag:?} zero wire action");
+            assert_ne!(
+                rcb_old_exit(st, sid, *ag),
+                Some(9),
+                "Agent {ag:?} old child not killed"
+            );
+            assert!(
+                st.store()
+                    .session(sid)
+                    .unwrap()
+                    .current_turn_of(*ag)
+                    .unwrap()
+                    .is_none(),
+                "Agent {ag:?} no TurnStart"
+            );
+        }
+    }
+
+    /// M1 (Waker-admit-before-wire): `mallory` (member of another Session
+    /// only) steers X over HTTP; both kept Agents have lost resume-capable
+    /// Host wires (`Exited(1)`). → 403 and **zero wire action**: 0 mints,
+    /// old children not killed, evidence still `Exited(1)`, Bindings
+    /// unchanged, 0 FailClosed, log length unchanged. Tip: membership is
+    /// checked only in `record_wake` → both CLIs killed + reminted (2 → 4
+    /// mints), evidence LiveIdle, then 403.
+    #[tokio::test]
+    async fn http_non_member_steer_lost_wires_403_zero_wire_action() {
+        let st = AppState::new(vec![]);
+        let sid = st.store().create_session().id();
+        let (a, b, _) = install_two_parallel_safe_host_wires(
+            &st,
+            sid,
+            Some(hearth_agent_wire::OldWire::Exited(1)),
+        );
+        wab_join_mallory_elsewhere(&st);
+        let m0 = count_mints(&st, sid);
+        let len0 = wab_log_len(&st, sid);
+        let fps0 = [
+            wab_agent_footprint(&st, sid, a),
+            wab_agent_footprint(&st, sid, b),
+        ];
+
+        let (c, body) = wab_steer_as(&st, sid, "mallory", "x").await;
+        assert_eq!(c, StatusCode::FORBIDDEN, "{body}");
+        wab_assert_zero_wire(&st, sid, [a, b], m0, len0, &fps0);
+    }
+
+    /// M2 (Waker-admit-before-wire): same as M1 but the Bindings advertise no
+    /// resume (`LiveCaps::default()`). → **403** (not 500), both Agents still
+    /// bound, 0 FailClosed, no unbind, zero wire action. Tip: caps-refuse
+    /// FailClosed + unbind on both Agents, every peer skipped → 500.
+    #[tokio::test]
+    async fn http_non_member_steer_no_resume_caps_403_no_unbind() {
+        let st = AppState::new(vec![]);
+        let sid = st.store().create_session().id();
+        let (a, b, _) = install_two_parallel_safe_host_wires_with_caps(
+            &st,
+            sid,
+            Some(hearth_agent_wire::OldWire::Exited(1)),
+            hearth_agent_wire::LiveCaps::default(),
+        );
+        wab_join_mallory_elsewhere(&st);
+        let m0 = count_mints(&st, sid);
+        let len0 = wab_log_len(&st, sid);
+        let fps0 = [
+            wab_agent_footprint(&st, sid, a),
+            wab_agent_footprint(&st, sid, b),
+        ];
+
+        let (c, body) = wab_steer_as(&st, sid, "mallory", "x").await;
+        assert_eq!(c, StatusCode::FORBIDDEN, "403 not 500: {body}");
+        assert_eq!(count_fail_closed(&st, sid, a), 0);
+        assert_eq!(count_fail_closed(&st, sid, b), 0);
+        wab_assert_zero_wire(&st, sid, [a, b], m0, len0, &fps0);
+    }
+
+    /// M3 twin (Waker-admit-before-wire): unwired Session (kernel / Goose
+    /// path), never-bound kept Agent. Non-member steer → 403, nothing
+    /// appended (0 BindingAttached). Tip: `claim` appends a BindingAttached
+    /// before `record_wake` refuses NotMember.
+    #[tokio::test]
+    async fn http_non_member_steer_unwired_session_no_binding() {
+        let st = AppState::new(vec![]);
+        let sid = st.store().create_session().id();
+        apply_join(&st, sid, Some("cheng".into()), None, None).unwrap();
+        apply_join(&st, sid, None, Some("scribe".into()), None).unwrap();
+        wab_join_mallory_elsewhere(&st);
+        let agent = st.runtime.kept_agents(sid)[0];
+        assert_eq!(
+            st.runtime.classify(sid, agent).unwrap(),
+            hearth::Liveness::NeverBound
+        );
+        let len0 = wab_log_len(&st, sid);
+
+        let (c, body) = wab_steer_as(&st, sid, "mallory", "x").await;
+        assert_eq!(c, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(count_mints(&st, sid), 0, "0 BindingAttached");
+        assert_eq!(wab_log_len(&st, sid), len0, "nothing appended");
+        assert_eq!(
+            st.runtime.classify(sid, agent).unwrap(),
+            hearth::Liveness::NeverBound
+        );
+
+        // A member steer still claims + wakes on the kernel path.
+        let (c, body) = steer(&st, sid, "hi").await;
+        assert_eq!(c, StatusCode::OK, "{body}");
+        assert_eq!(count_mints(&st, sid), 1);
+        assert_eq!(
+            st.runtime.classify(sid, agent).unwrap(),
+            hearth::Liveness::LiveInTurn
+        );
+    }
+
+    /// M5 (Waker-admit-before-wire): WS twin of M1 —
+    /// `{"type":"message","user":"mallory"}` → `{"error":403}` frame, 0
+    /// mints, evidence unchanged, zero wire action. Tip: 403 frame after
+    /// 2 → 4 mints.
+    #[tokio::test]
+    async fn ws_non_member_steer_403_zero_wire_action() {
+        let st = AppState::new(vec![]);
+        let sid = st.store().create_session().id();
+        let id = sid.0.to_string();
+        let (a, b, _) = install_two_parallel_safe_host_wires(
+            &st,
+            sid,
+            Some(hearth_agent_wire::OldWire::Exited(1)),
+        );
+        wab_join_mallory_elsewhere(&st);
+        let m0 = count_mints(&st, sid);
+        let len0 = wab_log_len(&st, sid);
+        let fps0 = [
+            wab_agent_footprint(&st, sid, a),
+            wab_agent_footprint(&st, sid, b),
+        ];
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(axum::serve(listener, router(st.clone())).into_future());
+        let url = format!("ws://{addr}/sessions/{id}/stream");
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        ws.send(WsMsg::Text(
+            r#"{"type":"message","user":"mallory","message":"m5-ws"}"#.into(),
+        ))
+        .await
+        .unwrap();
+        expect_text(&mut ws, r#"{"error":403}"#).await;
+
+        wab_assert_zero_wire(&st, sid, [a, b], m0, len0, &fps0);
+        let _ = ws.close(None).await;
+    }
+
+    /// M6 (Waker-admit-before-wire) compose / contrast: after the M1
+    /// refusal (and an unknown-name 404, still zero wire action), a RAP
+    /// tool-result (Trigger waker) on lost A → 200 Applied, A reminted once
+    /// (+1 mint, `session/resume`): Trigger is not subject to the user
+    /// admit. Then a **member** steer → 200: lost B reminted exactly once,
+    /// A (in its Trigger turn) skipped. Net: each lost Agent reminted
+    /// **exactly once**, both LiveInTurn. (Ordered so no Agent remints twice:
+    /// remint-after-remint stays a parked Soft.) Tip: the refused steer
+    /// already reminted both → RAP / steer reuse live, and the remint lands
+    /// on the refused request.
+    #[tokio::test]
+    async fn http_non_member_then_member_steer_remints_once() {
+        let st = AppState::new(vec![]);
+        let sid = st.store().create_session().id();
+        let (a, b, _) = install_two_parallel_safe_host_wires(
+            &st,
+            sid,
+            Some(hearth_agent_wire::OldWire::Exited(1)),
+        );
+        wab_join_mallory_elsewhere(&st);
+        let m0 = count_mints(&st, sid);
+
+        let (c, body) = wab_steer_as(&st, sid, "mallory", "x").await;
+        assert_eq!(c, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(count_mints(&st, sid), m0);
+
+        // Unknown name: 404, zero wire action.
+        let len_g = wab_log_len(&st, sid);
+        let (c, body) = wab_steer_as(&st, sid, "ghost-never-joined", "x").await;
+        assert_eq!(c, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(wab_log_len(&st, sid), len_g);
+        assert_eq!(count_mints(&st, sid), m0);
+
+        // RAP Trigger on lost A: Applied, +1 mint (no user admit).
+        rcb_tool_call(&st, sid, "tc-wab").await;
+        let (c, body) = rcb_tool_result(&st, sid, "tc-wab").await;
+        assert_eq!(c, StatusCode::OK, "{body}");
+        assert!(body.contains(r#""applied":true"#), "{body}");
+        assert_eq!(count_trigger_wakes(&st, sid), 1);
+        assert_eq!(count_mints(&st, sid), m0 + 1, "RAP remints A once");
+        assert_eq!(
+            st.runtime.classify(sid, a).unwrap(),
+            hearth::Liveness::LiveInTurn
+        );
+
+        // Member steer: lost B reminted exactly once; A (in turn) skipped.
+        let (c, body) = steer(&st, sid, "member").await;
+        assert_eq!(c, StatusCode::OK, "{body}");
+        assert_eq!(count_mints(&st, sid), m0 + 2, "each Agent reminted once");
+        assert_eq!(count_user_messages(&st, sid), 1);
+        for ag in [a, b] {
+            assert_eq!(
+                st.runtime.classify(sid, ag).unwrap(),
+                hearth::Liveness::LiveInTurn,
+                "{ag:?}"
+            );
+            let raw = rrb_runner_log(&st, sid, ag, true);
+            assert_eq!(raw.matches("session/resume").count(), 1, "{ag:?}: {raw}");
+            assert!(
+                !raw.contains("session/load") && !raw.contains("session/new"),
+                "{ag:?} no load/new: {raw}"
+            );
+            assert!(rrb_fail_closed_texts(&st, sid, ag).is_empty());
+            assert_eq!(
+                host_old_wire(&st, sid, ag),
+                hearth_agent_wire::OldWire::LiveIdle
+            );
+        }
+    }
 }
