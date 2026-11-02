@@ -959,12 +959,21 @@ pub enum CompleteHostTool {
     },
 }
 
-/// Error from [`complete_host_tool`] before any ToolResult append.
+/// Error from [`complete_host_tool`].
+///
+/// Only [`Self::Orphan`] is guaranteed pre-append (nothing written).
+/// [`Self::Remint`] / [`Self::Runtime`] may be returned **after** the
+/// ToolResult was appended (M8: append before wake), e.g. a permanent remint
+/// refuse or an exhausted [`HOST_WAKE_REMINT_RETRY_BUDGET`] — a re-POST is
+/// then [`CompleteHostTool::NotApplied`] (Trigger redelivery parked).
 #[derive(Debug)]
 pub enum CompleteHostToolError {
     /// No prior Host ToolCall for `(agent, tool_call_id)` — refuse orphan.
+    /// Pre-append: zero Result / Wake.
     Orphan,
+    /// Remint failure in the wake step; may be post-append.
     Remint(RemintError),
+    /// Runtime failure; may be post-append (wake step) or pre-append (store).
     Runtime(hearth::Error),
 }
 
@@ -1004,16 +1013,26 @@ pub struct CompleteHostToolArgs<'a> {
 }
 
 /// Host-owned tool completion: append idempotent ToolResult, then single-Agent
-/// [`wake_through_host_wake`] with [`hearth::Wake::Trigger`] `{ name: "tool_result" }`.
+/// Host wake (same seam as [`wake_through_host_wake`], plus the steer
+/// fan-out's limited remint retry) with [`hearth::Wake::Trigger`]
+/// `{ name: "tool_result" }`.
 ///
 /// Order (load-bearing, M8):
 /// 1. Refuse orphan (no prior ToolCall for this Agent + id) — no Result, no wake.
 /// 2. Already terminal → [`CompleteHostTool::NotApplied`] (duplicate / late after
 ///    Interrupted) — no wake.
 /// 3. Append ToolResult (name from matching ToolCall).
-/// 4. [`wake_through_host_wake`] for **this Agent only** (never fan-out /
-///    `wake_each_kept`). Claim-before-record + conflict gate unchanged on wake.
+/// 4. Wake **this Agent only** (never fan-out / `wake_each_kept`): conflict
+///    gate → [`host_wake`] with limited remint retry
+///    (RAP-remint-retry-budget: transient [`RemintError::NewWire`] on a
+///    resume-capable Binding retries up to [`HOST_WAKE_REMINT_RETRY_BUDGET`],
+///    same as the steer fan-out; caps / no-place refuse never retry; exhaust
+///    → typed `Remint(NewWire)` with FailClosed once and **no unbind**) →
+///    [`hearth::Runtime::wake_with`] [`hearth::AlreadyBound`].
 /// 5. Wake Waiting after Result → [`CompleteHostTool::AppliedWakeWaiting`].
+///
+/// Never reorder the wake before the append: a mid-turn remint finalizes
+/// unmatched ToolCalls to Interrupted and the Result would be lost.
 ///
 /// Never `session/load` / `session/new`. MCP/ACP drain path untouched (RAP
 /// semantics, not RAP-replace). SoftExpiring / Flush / Stage / Evidence /
@@ -1057,7 +1076,7 @@ pub fn complete_host_tool(
         old_wire,
         remint,
     };
-    match wake_through_host_wake(old, new, new_transport, wake_args) {
+    match wake_through_host_wake_with_retry(old, new, new_transport, wake_args) {
         Ok(WakeThroughHost::Woke { host, events }) => Ok(CompleteHostTool::Applied {
             tool_result,
             host,
@@ -1075,6 +1094,41 @@ pub fn complete_host_tool(
         }
         Err(WakeThroughError::Remint(e)) => Err(CompleteHostToolError::Remint(e)),
         Err(WakeThroughError::Runtime(e)) => Err(CompleteHostToolError::Runtime(e)),
+    }
+}
+
+/// RAP-remint-retry-budget: [`wake_through_host_wake`] with
+/// [`host_wake_with_limited_remint_retry`] in place of the single-shot
+/// [`host_wake`]. Used **only** by [`complete_host_tool`]; tick and explicit
+/// single wake stay single-shot. Same gate → host wake → `wake_with`
+/// ([`hearth::AlreadyBound`]) order. On exhaust the typed
+/// `Remint(NewWire)` returns with FailClosed recorded once and the Binding
+/// left bound (single Agent: no ghost-turn risk, so no fan-out unbind).
+fn wake_through_host_wake_with_retry(
+    old: &mut AttachRunner,
+    new: &mut AttachRunner,
+    new_transport: &mut RunnerTransport,
+    args: WakeThroughHostArgs<'_>,
+) -> Result<WakeThroughHost, WakeThroughError> {
+    let WakeThroughHostArgs {
+        runtime,
+        session_id,
+        wake,
+        old_wire,
+        remint,
+    } = args;
+    let agent = remint.session.host_agent_id();
+    match runtime.check_turn_gate(session_id, agent) {
+        Err(hearth::Error::Waiting(reason)) => return Ok(WakeThroughHost::Waiting(reason)),
+        r => r?,
+    }
+    let host = host_wake_with_limited_remint_retry(old_wire, old, new, new_transport, remint)?;
+    match host {
+        HostWake::Waiting(reason) => Ok(WakeThroughHost::Waiting(reason)),
+        host => {
+            let events = runtime.wake_with(session_id, agent, wake, &mut hearth::AlreadyBound)?;
+            Ok(WakeThroughHost::Woke { host, events })
+        }
     }
 }
 
@@ -1446,7 +1500,8 @@ fn unbind_after_fail_closed_skip(
 ///   already recorded by [`RemintSession::refuse_if_binding_caps_block_resume`]).
 /// - [`RemintError::NewWire`] while Binding allows resume: retry up to
 ///   [`HOST_WAKE_REMINT_RETRY_BUDGET`] with [`HOST_WAKE_REMINT_RETRY_BACKOFF`];
-///   on exhaust record FailClosed and return the error for fan-out skip.
+///   on exhaust record FailClosed and return the error (fan-out: skip +
+///   unbind; RAP [`complete_host_tool`]: typed Remint, no unbind).
 /// - Other RemintErrors: return immediately (fan-out still aborts — Soft
 ///   taxonomy expansion parked).
 fn host_wake_with_limited_remint_retry(
@@ -7510,5 +7565,46 @@ mod tests {
             "within budget: no FailClosed: {:?}",
             remint.observe()
         );
+    }
+
+    /// M5 compose pin (RAP-remint-retry-budget): the retry lives only on the
+    /// RAP path. Explicit [`wake_through_host_wake`] (shared with tick) stays
+    /// single-shot: the same one-time transient `NewWire` returns typed
+    /// `Remint(NewWire)` with no FailClosed. Kills "retry inside the shared
+    /// `wake_through_host_wake`" (mutant d). If tick / explicit-wake retry
+    /// parity (parked Soft) is ever taken, this pin flips deliberately.
+    #[test]
+    fn wake_through_host_wake_transient_new_wire_stays_single_shot() {
+        let (rt, sid, uid, remint, place) = shared_runtime_remint();
+        let mut old = initialized_fake(Vec::new());
+        let mut new = new_wire_fake_with_stdin_failures(1);
+        let err = run_through(
+            &rt,
+            sid,
+            hearth::Wake::UserQuery {
+                user: uid,
+                text: "single".into(),
+            },
+            &remint,
+            &place,
+            OldWire::Exited(1),
+            &mut old,
+            &mut new,
+        )
+        .expect_err("explicit wake stays single-shot");
+        assert!(
+            matches!(err, WakeThroughError::Remint(RemintError::NewWire(_))),
+            "{err:?}"
+        );
+        assert!(
+            !remint
+                .observe()
+                .iter()
+                .any(|e| e.kind == RemintEventKind::FailClosed),
+            "single-shot: no retry-exhaust FailClosed"
+        );
+        assert!(!std::str::from_utf8(new.stdin_log().unwrap())
+            .unwrap()
+            .contains("session/resume"));
     }
 }
