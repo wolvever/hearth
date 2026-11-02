@@ -3587,4 +3587,94 @@ mod tests {
         rt.keep(sid, a.id, codex()).unwrap();
         assert_eq!(rt.kept_parallel_safe(sid, a.id).unwrap(), ps("a"));
     }
+
+    /// Waker-admit-before-wire fixture: kept never-bound `a` on Session X;
+    /// `mallory` is a member of another Session only (names are global).
+    fn wab_non_member_fixture() -> (Runtime, Session, AgentId, crate::UserId) {
+        let rt = Runtime::new();
+        let a = rt.store().create_agent("a", "");
+        let cheng = rt.store().create_user("cheng");
+        let mallory = rt.store().create_user("mallory");
+        let session = rt.create_session();
+        let sid = session.id();
+        session.join(Member::User(cheng.id)).unwrap();
+        session.join(Member::Agent(a.id)).unwrap();
+        rt.keep(sid, a.id, goose()).unwrap();
+        let other = rt.create_session();
+        other.join(Member::User(mallory.id)).unwrap();
+        assert_eq!(rt.classify(sid, a.id).unwrap(), Liveness::NeverBound);
+        (rt, session, a.id, mallory.id)
+    }
+
+    fn wab_attached(session: &Session) -> usize {
+        session
+            .events()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e.body, EventBody::BindingAttached { .. }))
+            .count()
+    }
+
+    /// M3 (Waker-admit-before-wire): kernel fan-out with a non-member
+    /// `UserQuery` on a never-bound kept Agent → `Err(NotMember)`, **0
+    /// BindingAttached**, log unchanged. Tip: `claim` appends a
+    /// BindingAttached before `record_wake` refuses. Service-only fix
+    /// leaves this red.
+    #[test]
+    fn wake_each_kept_non_member_no_claim() {
+        let (rt, session, a, mallory) = wab_non_member_fixture();
+        let sid = session.id();
+        let len0 = session.events().unwrap().len();
+        let r = rt.wake_each_kept(
+            sid,
+            Wake::UserQuery {
+                user: mallory,
+                text: "x".into(),
+            },
+        );
+        assert!(matches!(r, Err(Error::NotMember)), "{r:?}");
+        assert_eq!(wab_attached(&session), 0, "0 BindingAttached");
+        assert_eq!(session.events().unwrap().len(), len0, "log unchanged");
+        assert_eq!(rt.classify(sid, a).unwrap(), Liveness::NeverBound);
+        // Trigger / Timer wakers admit unconditionally.
+        let woke = rt.wake_each_kept(sid, Wake::Timer).unwrap();
+        assert_eq!(woke.len(), 1);
+        assert_eq!(wab_attached(&session), 1);
+    }
+
+    /// M4 (Waker-admit-before-wire): `Runtime::wake` / `wake_with` with a
+    /// non-member `UserQuery` → `Err(NotMember)`, 0 BindingAttached, log
+    /// unchanged (unknown user → `UnknownUser`, also no claim). Tip: claim
+    /// first, then NotMember.
+    #[test]
+    fn wake_with_non_member_no_claim() {
+        let (rt, session, a, mallory) = wab_non_member_fixture();
+        let sid = session.id();
+        let len0 = session.events().unwrap().len();
+        let r = rt.wake(
+            sid,
+            a,
+            Wake::UserQuery {
+                user: mallory,
+                text: "x".into(),
+            },
+        );
+        assert!(matches!(r, Err(Error::NotMember)), "{r:?}");
+        let r = rt.wake_with(
+            sid,
+            a,
+            Wake::UserQuery {
+                user: crate::UserId::new(),
+                text: "x".into(),
+            },
+            &mut ClaimBinding,
+        );
+        assert!(matches!(r, Err(Error::UnknownUser(_))), "{r:?}");
+        assert_eq!(wab_attached(&session), 0, "0 BindingAttached");
+        assert_eq!(session.events().unwrap().len(), len0, "log unchanged");
+        assert_eq!(rt.classify(sid, a).unwrap(), Liveness::NeverBound);
+        // A Trigger waker still claims + wakes.
+        rt.wake(sid, a, Wake::Trigger { name: "t".into() }).unwrap();
+        assert_eq!(wab_attached(&session), 1);
+    }
 }
