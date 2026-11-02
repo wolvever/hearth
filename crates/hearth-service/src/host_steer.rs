@@ -10,10 +10,11 @@ use std::time::Duration;
 
 use hearth::{AgentId, Event, Place, SessionId, Wake};
 use hearth_agent_wire::{
-    complete_host_tool, transport_for_wire, wake_each_kept_through_host_wake, AttachRunner,
-    CompleteHostTool, CompleteHostToolArgs, CompleteHostToolError, HostRemintFullArgs, HostWake,
-    KeptWakeWire, LaunchSpec, OldWire, RemintSession, RpcId, RunnerTransport,
-    WakeEachKeptThroughHost, WakeEachKeptThroughHostArgs, WakeThroughError, WireKind,
+    complete_host_tool, settle_host_wire_after_wake, transport_for_wire,
+    wake_each_kept_through_host_wake, AttachRunner, CompleteHostTool, CompleteHostToolArgs,
+    CompleteHostToolError, HostRemintFullArgs, KeptWakeWire, LaunchSpec, OldWire, RemintSession,
+    RpcId, RunnerTransport, WakeEachKeptThroughHost, WakeEachKeptThroughHostArgs, WakeThroughError,
+    WireKind,
 };
 
 use crate::AppState;
@@ -135,9 +136,12 @@ impl HostWireMap {
 
     /// Single-Agent Host tool completion (not fan-out).
     ///
-    /// Takes the wire out, runs [`complete_host_tool`], puts it back. Updates
-    /// `old_wire` to LiveIdle after a successful remint/reuse so a follow-up
-    /// completion reuses the Binding.
+    /// Takes the wire out, runs [`complete_host_tool`], puts it back.
+    /// Host-wire-remint-settle: after a successful remint/reuse, settles via
+    /// [`settle_host_wire_after_wake`] — `old_wire` → LiveIdle and, on
+    /// Reminted, `old`/`new` runners swap (same as the steer fan-out) so a
+    /// follow-up completion or steer reuses the Binding and `old` is the live
+    /// resumed child.
     pub fn complete_host_tool_for(
         &mut self,
         runtime: &hearth::Runtime,
@@ -171,20 +175,29 @@ impl HostWireMap {
                 },
             },
         );
-        // After remint/reuse, subsequent wakes see LiveIdle (same as steer path).
+        // After remint/reuse, subsequent wakes see LiveIdle and (Reminted)
+        // the resumed runner as `old` — same settle as the steer fan-out.
         if let Ok(CompleteHostTool::Applied { host, .. }) = &result {
-            match host {
-                HostWake::Reminted(_) | HostWake::ReuseLive => {
-                    wire.old_wire = OldWire::LiveIdle;
-                }
-                HostWake::Waiting(_) => {}
-            }
+            settle_host_wire_after_wake(
+                host,
+                &mut wire.old_wire,
+                &mut wire.old,
+                &mut wire.new,
+                &mut wire.old_next_rpc_id,
+                &mut wire.new_next_rpc_id,
+            );
         }
         self.agents.insert((session_id, agent), wire);
         result
     }
 
     /// Drain this Session's wires, run `wake_each_kept_through_host_wake`, put back.
+    ///
+    /// Host-wire-remint-settle: each wire is handed in with `settle:
+    /// Some(&mut old_wire)`, so an Agent that Reminted / ReuseLive is settled
+    /// per Agent at remint time (evidence → LiveIdle; runners swap on
+    /// Reminted) even if a later peer aborts the fan-out. Skipped / Waiting /
+    /// FailClosed Agents keep their prior evidence.
     pub fn wake_each_kept(
         &mut self,
         runtime: &hearth::Runtime,
@@ -221,6 +234,7 @@ impl HostWireMap {
                                 old_next_rpc_id: &mut w.old_next_rpc_id,
                                 new_next_rpc_id: &mut w.new_next_rpc_id,
                             },
+                            settle: Some(&mut w.old_wire),
                         },
                     )
                 })

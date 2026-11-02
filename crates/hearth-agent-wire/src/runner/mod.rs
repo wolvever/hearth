@@ -1330,6 +1330,43 @@ pub struct KeptWakeWire<'a> {
     pub new_transport: &'a mut RunnerTransport,
     pub old_wire: OldWire,
     pub remint: HostRemintFullArgs<'a>,
+    /// Host-wire-remint-settle: the Host's stored `OldWire` evidence for this
+    /// Agent. When `Some`, the fan-out settles it **at remint/reuse time**
+    /// (right after this Agent's [`host_wake`] returns Ok, before any peer
+    /// runs) via [`settle_host_wire_after_wake`]: evidence → LiveIdle, and on
+    /// Reminted `old`/`new` runners (+ rpc counters) swap. Survives a later
+    /// peer abort. Skipped / Waiting / FailClosed Agents keep their evidence.
+    /// `None` keeps the wire-level behaviour (caller settles nothing).
+    pub settle: Option<&'a mut OldWire>,
+}
+
+/// Host-wire-remint-settle: settle a Host wire after [`host_wake`] returned
+/// `Reminted` / `ReuseLive` for it.
+///
+/// - `Reminted` / `ReuseLive` → `*old_wire = LiveIdle`, so the next wake
+///   reuses the live Binding instead of reminting a healthy Agent again.
+/// - `Reminted` only → swap `old`/`new` runners and their next rpc ids, so
+///   `old` is the live resumed child and `new` is the reaped one. A later
+///   genuine loss then kills the live child (one live child per Agent) and
+///   never re-initializes the resumed runner as a "new" wire.
+/// - `Waiting` → no-op (no wire action happened; evidence unchanged).
+pub fn settle_host_wire_after_wake(
+    host: &HostWake,
+    old_wire: &mut OldWire,
+    old: &mut AttachRunner,
+    new: &mut AttachRunner,
+    old_next_rpc_id: &mut u64,
+    new_next_rpc_id: &mut u64,
+) {
+    match host {
+        HostWake::Reminted(_) => {
+            *old_wire = OldWire::LiveIdle;
+            std::mem::swap(old, new);
+            std::mem::swap(old_next_rpc_id, new_next_rpc_id);
+        }
+        HostWake::ReuseLive => *old_wire = OldWire::LiveIdle,
+        HostWake::Waiting(_) => {}
+    }
 }
 
 /// Result of [`wake_each_kept_through_host_wake`].
@@ -1527,17 +1564,54 @@ pub fn wake_each_kept_through_host_wake(
             }
             r => r?,
         }
+        let KeptWakeWire {
+            old,
+            new,
+            new_transport,
+            old_wire,
+            remint,
+            settle,
+        } = w;
+        let HostRemintFullArgs {
+            session,
+            place,
+            mcp_servers,
+            init_rpc_id,
+            old_next_rpc_id,
+            new_next_rpc_id,
+        } = remint;
         match host_wake_with_limited_remint_retry(
-            w.old_wire,
-            w.old,
-            w.new,
-            w.new_transport,
-            w.remint,
+            old_wire,
+            &mut *old,
+            &mut *new,
+            new_transport,
+            HostRemintFullArgs {
+                session,
+                place,
+                mcp_servers,
+                init_rpc_id,
+                old_next_rpc_id: &mut *old_next_rpc_id,
+                new_next_rpc_id: &mut *new_next_rpc_id,
+            },
         ) {
             Ok(HostWake::Waiting(reason)) => {
                 first_wait.get_or_insert(reason);
             }
-            Ok(host) => hosts.push((agent, host)),
+            Ok(host) => {
+                // Host-wire-remint-settle: settle THIS Agent now, so a later
+                // peer abort (`Err` below) cannot lose it.
+                if let Some(evidence) = settle {
+                    settle_host_wire_after_wake(
+                        &host,
+                        evidence,
+                        old,
+                        new,
+                        old_next_rpc_id,
+                        new_next_rpc_id,
+                    );
+                }
+                hosts.push((agent, host));
+            }
             Err(e) if is_caps_refuse_fanout_skip(&e) || is_remint_retryable(&e) => {
                 // FailClosed recorded (caps path inside refuse_if; NewWire
                 // exhaust inside host_wake_with_limited_remint_retry). Unbind
@@ -4440,6 +4514,7 @@ mod tests {
                         old_next_rpc_id: &mut old_next_a,
                         new_next_rpc_id: &mut new_next_a,
                     },
+                    settle: None,
                 },
             ),
             (
@@ -4457,6 +4532,7 @@ mod tests {
                         old_next_rpc_id: &mut old_next_b,
                         new_next_rpc_id: &mut new_next_b,
                     },
+                    settle: None,
                 },
             ),
         ]
