@@ -25,10 +25,12 @@ pub use host_steer::{
 };
 pub use probe::{probe_local, CliStatus};
 
+/// Doorbell only (stream-tails-log): "Session `session`'s EventLog may have
+/// grown". No frame rides the channel; the WS stream tails the log by index,
+/// so a lagged or cross-Session-flooded receiver just re-reads.
 #[derive(Clone)]
 struct LiveEvent {
     session: SessionId,
-    event: EventOut,
 }
 
 #[derive(Clone)]
@@ -107,8 +109,11 @@ impl AppState {
         self.runtime.store()
     }
 
-    fn publish(&self, session: SessionId, event: EventOut) {
-        let _ = self.live.send(LiveEvent { session, event });
+    /// Ring the Session's doorbell. Called on every exit of every
+    /// log-writing handler (Ok and Err): a refused or failed request can
+    /// still have appended events.
+    fn ring(&self, session: SessionId) {
+        let _ = self.live.send(LiveEvent { session });
     }
 }
 
@@ -275,7 +280,8 @@ fn apply_join(
         return Err(StatusCode::BAD_REQUEST);
     };
     drop(names);
-    if let Some(aid) = keep_agent {
+    // The join is on the log: ring on every exit from here (Ok and Err).
+    let kept: Result<(), StatusCode> = keep_agent.map_or(Ok(()), |aid| {
         keep_standin(st, id, aid)?;
         // Explicit declare only — never inferred from tools (DESIGN).
         if let Some(paths) = parallel_safe {
@@ -283,10 +289,11 @@ fn apply_join(
                 .set_parallel_safe(id, aid, Some(hearth::ParallelSafe::paths(paths)))
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         }
-    }
-    let out = event_out(&ev);
-    st.publish(id, out.clone());
-    Ok(out)
+        Ok(())
+    });
+    st.ring(id);
+    kept?;
+    Ok(event_out(&ev))
 }
 
 async fn join_session(
@@ -369,17 +376,19 @@ fn apply_user_message(
     let uid = *names.users.get(&name).ok_or(StatusCode::NOT_FOUND)?;
     drop(names);
     let _agents = ensure_kept_agents(st, id)?;
-    match host_steer::steer_each_kept(st, id, Wake::UserQuery { user: uid, text }) {
+    let res = host_steer::steer_each_kept(st, id, Wake::UserQuery { user: uid, text });
+    // Ring before matching: a 409/500 steer may have appended (remint
+    // Binding events, FailClosed unbinds).
+    st.ring(id);
+    match res {
         Ok(outcome) => {
             let per_agent = outcome.woke();
             let mut um: Option<EventOut> = None;
             for (_agent, evs) in per_agent {
                 for e in evs {
-                    let out = event_out(e);
                     if matches!(e.body, EventBody::UserMessage { .. }) {
-                        um = Some(out.clone());
+                        um = Some(event_out(e));
                     }
-                    st.publish(id, out);
                 }
             }
             um.or_else(|| {
@@ -455,8 +464,8 @@ async fn post_tool_call(
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let input = body.input.unwrap_or_else(|| "{}".into());
     match session.append_host_tool_call(agent, &tool_call_id, &body.name, &input) {
-        Ok(ev) => {
-            st.publish(id, event_out(&ev));
+        Ok(_ev) => {
+            st.ring(id);
             let callback_url = format!("/sessions/{}/agents/{}/tool-result", id.0, agent_name);
             Ok(Json(ToolCallOut {
                 tool_call_id,
@@ -490,8 +499,8 @@ async fn post_end_turn(
         return Err(StatusCode::BAD_REQUEST);
     }
     match st.runtime.end_host_turn(id, agent) {
-        Ok(ev) => {
-            st.publish(id, event_out(&ev));
+        Ok(_ev) => {
+            st.ring(id);
             Ok(Json(EndTurnOut { ended: true }))
         }
         Err(hearth::Error::TurnNotOpen) => Err(StatusCode::CONFLICT),
@@ -553,19 +562,13 @@ async fn post_tool_result(
     let outcome = tokio::task::spawn_blocking(move || {
         host_steer::complete_tool_result(&st_block, id, agent, &tool_call_id, &output)
     })
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    match outcome {
-        Ok(CompleteToolOutcome::Applied {
-            tool_result,
-            wake_events,
-            ..
-        }) => {
+    .await;
+    // Ring before matching: a 409/500 RAP may have appended (the ToolResult
+    // is appended before the wake, plus any remint Binding events).
+    st.ring(id);
+    match outcome.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)? {
+        Ok(CompleteToolOutcome::Applied { tool_result, .. }) => {
             let out = event_out(&tool_result);
-            st.publish(id, out.clone());
-            for e in &wake_events {
-                st.publish(id, event_out(e));
-            }
             Ok(Json(ToolResultOut {
                 applied: true,
                 body: Some(out.body),
@@ -644,16 +647,12 @@ async fn stream_session(
 }
 
 async fn push_stream(mut socket: WebSocket, st: AppState, id: SessionId) {
+    // Subscribe before the first read, so no ring is missed; replay is
+    // just the first tail.
     let mut rx = st.live.subscribe();
-    if let Ok(session) = st.store().session(id) {
-        if let Ok(events) = session.events() {
-            for e in events {
-                let txt = serde_json::to_string(&event_out(&e)).unwrap_or_default();
-                if socket.send(Message::Text(txt.into())).await.is_err() {
-                    return;
-                }
-            }
-        }
+    let mut cursor = 0usize;
+    if tail_log(&mut socket, &st, id, &mut cursor).await.is_err() {
+        return;
     }
     loop {
         tokio::select! {
@@ -692,18 +691,49 @@ async fn push_stream(mut socket: WebSocket, st: AppState, id: SessionId) {
             live = rx.recv() => {
                 match live {
                     Ok(live) if live.session == id => {
-                        let txt = serde_json::to_string(&live.event).unwrap_or_default();
-                        if socket.send(Message::Text(txt.into())).await.is_err() {
+                        if tail_log(&mut socket, &st, id, &mut cursor).await.is_err() {
                             return;
                         }
                     }
                     Ok(_) => {}
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    // A lag may have swallowed this Session's ring (own burst
+                    // or another Session's flood): re-read, never skip.
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        if tail_log(&mut socket, &st, id, &mut cursor).await.is_err() {
+                            return;
+                        }
+                    }
                     Err(broadcast::error::RecvError::Closed) => return,
                 }
             }
         }
     }
+}
+
+/// Send `events[cursor..]` in log order and advance `cursor` per frame sent.
+/// The EventLog is append-only, so an index is a complete, duplicate-free
+/// cursor (`seq` is untouched: it stays `mark_read`-only).
+async fn tail_log(
+    socket: &mut WebSocket,
+    st: &AppState,
+    id: SessionId,
+    cursor: &mut usize,
+) -> Result<(), ()> {
+    let Ok(session) = st.store().session(id) else {
+        return Ok(());
+    };
+    let Ok(events) = session.events() else {
+        return Ok(());
+    };
+    for e in events.iter().skip(*cursor) {
+        let txt = serde_json::to_string(&event_out(e)).unwrap_or_default();
+        socket
+            .send(Message::Text(txt.into()))
+            .await
+            .map_err(|_| ())?;
+        *cursor += 1;
+    }
+    Ok(())
 }
 
 async fn agents_local(State(st): State<AppState>) -> Json<Vec<CliStatus>> {
@@ -8074,5 +8104,263 @@ mod tests {
                 hearth_agent_wire::OldWire::LiveIdle
             );
         }
+    }
+
+    // ---- Stream-tails-log (M1–M8) ----
+    // Each floor drains the WS *before* the action under test, then asserts
+    // the live frames are exactly `log[len0..]` (order, no dup, no miss).
+
+    type StlWs = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    async fn stl_ws(st: &AppState, sid: SessionId) -> StlWs {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(axum::serve(listener, router(st.clone())).into_future());
+        let url = format!("ws://{addr}/sessions/{}/stream", sid.0);
+        let (ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        ws
+    }
+
+    /// Every WS text frame body until `quiet_ms` of silence.
+    async fn stl_drain(ws: &mut StlWs, quiet_ms: u64) -> Vec<String> {
+        let mut out = Vec::new();
+        loop {
+            let next =
+                tokio::time::timeout(std::time::Duration::from_millis(quiet_ms), ws.next()).await;
+            match next {
+                Ok(Some(Ok(WsMsg::Text(t)))) => {
+                    let v: serde_json::Value = serde_json::from_str(t.as_str()).unwrap();
+                    out.push(v["body"].as_str().unwrap_or("").to_string());
+                }
+                Ok(Some(Ok(_))) => continue,
+                _ => return out,
+            }
+        }
+    }
+
+    fn stl_log(st: &AppState, sid: SessionId) -> Vec<String> {
+        st.store()
+            .session(sid)
+            .unwrap()
+            .events()
+            .unwrap()
+            .iter()
+            .map(|e| event_out(e).body)
+            .collect()
+    }
+
+    /// Live frames == `log[len0..]` exactly, and the log grew.
+    fn stl_assert_exact(tag: &str, st: &AppState, sid: SessionId, len0: usize, live: &[String]) {
+        let log = stl_log(st, sid);
+        assert!(log.len() > len0, "{tag}: expected appends after {len0}");
+        assert_eq!(live, &log[len0..], "{tag}: live != log tail");
+    }
+
+    /// M1: RAP tool-result while the Agent is mid-turn → 409; the appended
+    /// ToolResult is streamed live exactly once (re-POST adds nothing).
+    #[tokio::test]
+    async fn ws_rap_409_tool_result_streamed() {
+        let (st, sid, a) = rcb_setup(vec!["agent-0".into()]);
+        let mut ws = stl_ws(&st, sid).await;
+        let _ = stl_drain(&mut ws, 300).await;
+        let (c, b) = steer(&st, sid, "go").await;
+        assert_eq!(c, StatusCode::OK, "{b}");
+        rcb_tool_call(&st, sid, "tc1").await;
+        let _ = stl_drain(&mut ws, 300).await;
+        let len0 = stl_log(&st, sid).len();
+        let (c, b) = rcb_tool_result(&st, sid, "tc1").await;
+        assert_eq!(c, StatusCode::CONFLICT, "{b}");
+        assert_eq!(
+            st.runtime.classify(sid, a).unwrap(),
+            hearth::Liveness::LiveInTurn
+        );
+        let live = stl_drain(&mut ws, 500).await;
+        stl_assert_exact("M1", &st, sid, len0, &live);
+        assert_eq!(live.len(), 1, "{live:?}");
+        assert!(live[0].contains("ToolResult"), "{live:?}");
+        let len1 = stl_log(&st, sid).len();
+        let (c, b) = rcb_tool_result(&st, sid, "tc1").await;
+        assert_eq!(c, StatusCode::OK, "{b}");
+        assert!(b.contains(r#""applied":false"#), "{b}");
+        let live2 = stl_drain(&mut ws, 400).await;
+        assert_eq!(live2, &stl_log(&st, sid)[len1..], "M1 re-POST");
+    }
+
+    /// M2: RAP tool-result → 500 after append (NewWire exhaust): every
+    /// appended event is live.
+    #[tokio::test]
+    async fn ws_rap_500_events_streamed() {
+        let (st, sid, a) = rcb_setup(vec!["agent-0".into()]);
+        rcb_tool_call(&st, sid, "tc1").await;
+        st.set_host_old_wire(sid, a, hearth_agent_wire::OldWire::Exited(1))
+            .unwrap();
+        rrb_set_new_wire(&st, sid, a, rrb_flaky_new_wire(99));
+        let mut ws = stl_ws(&st, sid).await;
+        let _ = stl_drain(&mut ws, 300).await;
+        let len0 = stl_log(&st, sid).len();
+        let (c, b) = rcb_tool_result(&st, sid, "tc1").await;
+        assert_eq!(c, StatusCode::INTERNAL_SERVER_ERROR, "{b}");
+        let live = stl_drain(&mut ws, 500).await;
+        stl_assert_exact("M2", &st, sid, len0, &live);
+        assert!(live.iter().any(|b| b.contains("ToolResult")), "{live:?}");
+    }
+
+    /// M3: steer that remints both lost Agents → 200; Binding events,
+    /// UserMessage and TurnStarts are all live, exact.
+    #[tokio::test]
+    async fn ws_steer_remint_binding_events_streamed() {
+        let st = AppState::new(vec![]);
+        let sid = st.store().create_session().id();
+        let _ = install_two_parallel_safe_host_wires(
+            &st,
+            sid,
+            Some(hearth_agent_wire::OldWire::Exited(1)),
+        );
+        let mut ws = stl_ws(&st, sid).await;
+        let _ = stl_drain(&mut ws, 300).await;
+        let len0 = stl_log(&st, sid).len();
+        let (c, b) = steer(&st, sid, "go").await;
+        assert_eq!(c, StatusCode::OK, "{b}");
+        let live = stl_drain(&mut ws, 500).await;
+        stl_assert_exact("M3", &st, sid, len0, &live);
+        assert!(
+            live.iter().any(|b| b.contains("BindingAttached")),
+            "{live:?}"
+        );
+        assert!(
+            live.iter().any(|b| b.contains("BindingReleased")),
+            "{live:?}"
+        );
+    }
+
+    /// M3 twin: RAP Applied with a remint (yielded A, lost wire).
+    #[tokio::test]
+    async fn ws_rap_applied_remint_events_streamed() {
+        let (st, sid, a) = rcb_setup(vec!["agent-0".into()]);
+        let (c, b) = steer(&st, sid, "go").await;
+        assert_eq!(c, StatusCode::OK, "{b}");
+        rcb_tool_call(&st, sid, "tc1").await;
+        rcb_end_turn(&st, sid).await;
+        st.set_host_old_wire(sid, a, hearth_agent_wire::OldWire::Exited(1))
+            .unwrap();
+        let mut ws = stl_ws(&st, sid).await;
+        let _ = stl_drain(&mut ws, 300).await;
+        let len0 = stl_log(&st, sid).len();
+        let (c, b) = rcb_tool_result(&st, sid, "tc1").await;
+        assert_eq!(c, StatusCode::OK, "{b}");
+        assert!(b.contains(r#""applied":true"#), "{b}");
+        let live = stl_drain(&mut ws, 500).await;
+        stl_assert_exact("M3 twin", &st, sid, len0, &live);
+        assert!(
+            live.iter().any(|b| b.contains("BindingAttached")),
+            "{live:?}"
+        );
+    }
+
+    /// M4: member steer, two lost no-resume Agents → 500 after the
+    /// FailClosed unbinds; the `BindingReleased` events are still live.
+    #[tokio::test]
+    async fn ws_steer_500_failclosed_streamed() {
+        let st = AppState::new(vec![]);
+        let sid = st.store().create_session().id();
+        let _ = install_two_parallel_safe_host_wires_with_caps(
+            &st,
+            sid,
+            Some(hearth_agent_wire::OldWire::Exited(1)),
+            hearth_agent_wire::LiveCaps::default(),
+        );
+        let mut ws = stl_ws(&st, sid).await;
+        let _ = stl_drain(&mut ws, 300).await;
+        let len0 = stl_log(&st, sid).len();
+        let (c, b) = steer(&st, sid, "go").await;
+        assert_eq!(c, StatusCode::INTERNAL_SERVER_ERROR, "{b}");
+        let live = stl_drain(&mut ws, 500).await;
+        stl_assert_exact("M4", &st, sid, len0, &live);
+        assert_eq!(
+            live.iter()
+                .filter(|b| b.contains("BindingReleased"))
+                .count(),
+            2,
+            "{live:?}"
+        );
+    }
+
+    /// M5: one event on Session X, then a 300-join flood on Session Y: X's
+    /// client still gets X's own event (cross-Session isolation).
+    #[tokio::test]
+    async fn ws_other_session_flood_keeps_own_event() {
+        let st = AppState::new(vec![]);
+        let sx = st.store().create_session().id();
+        let sy = st.store().create_session().id();
+        let mut ws = stl_ws(&st, sx).await;
+        let _ = stl_drain(&mut ws, 300).await;
+        let len0 = stl_log(&st, sx).len();
+        apply_join(&st, sx, Some("x0".into()), None, None).unwrap();
+        for i in 0..300 {
+            apply_join(&st, sy, Some(format!("y{i}")), None, None).unwrap();
+        }
+        let live = stl_drain(&mut ws, 800).await;
+        stl_assert_exact("M5", &st, sx, len0, &live);
+        assert_eq!(live.len(), 1, "{live:?}");
+    }
+
+    /// M6: 300 own-Session events in one burst with no yield (over the
+    /// 256-slot doorbell channel): all 300 are live, exact.
+    #[tokio::test]
+    async fn ws_burst_over_capacity_all_streamed() {
+        let st = AppState::new(vec![]);
+        let sid = st.store().create_session().id();
+        let mut ws = stl_ws(&st, sid).await;
+        let _ = stl_drain(&mut ws, 300).await;
+        let len0 = stl_log(&st, sid).len();
+        for i in 0..300 {
+            apply_join(&st, sid, Some(format!("u{i}")), None, None).unwrap();
+        }
+        let live = stl_drain(&mut ws, 800).await;
+        stl_assert_exact("M6", &st, sid, len0, &live);
+        assert_eq!(live.len(), 300);
+    }
+
+    /// M7: two clients, the second connects mid-Session; each client's
+    /// replay + live == the full log, exact, no duplicates.
+    #[tokio::test]
+    async fn ws_two_clients_replay_plus_live_exact() {
+        let (st, sid, _a) = rcb_setup(vec!["agent-0".into()]);
+        let mut ws1 = stl_ws(&st, sid).await;
+        let r1 = stl_drain(&mut ws1, 300).await;
+        let (c, b) = steer(&st, sid, "go").await;
+        assert_eq!(c, StatusCode::OK, "{b}");
+        let mut ws2 = stl_ws(&st, sid).await;
+        let r2 = stl_drain(&mut ws2, 300).await;
+        rcb_tool_call(&st, sid, "tc1").await;
+        let (c, b) = rcb_tool_result(&st, sid, "tc1").await;
+        assert_eq!(c, StatusCode::CONFLICT, "{b}");
+        let l1 = stl_drain(&mut ws1, 500).await;
+        let l2 = stl_drain(&mut ws2, 500).await;
+        let all1: Vec<String> = r1.into_iter().chain(l1).collect();
+        let all2: Vec<String> = r2.into_iter().chain(l2).collect();
+        stl_assert_exact("M7 c1", &st, sid, 0, &all1);
+        stl_assert_exact("M7 c2", &st, sid, 0, &all2);
+    }
+
+    /// M8 (contrast, green on tip): tool-call alone, then end-turn alone,
+    /// each streamed exactly, drained before any later ring.
+    #[tokio::test]
+    async fn ws_tool_call_and_end_turn_streamed_alone() {
+        let (st, sid, _a) = rcb_setup(vec!["agent-0".into()]);
+        let (c, b) = steer(&st, sid, "go").await;
+        assert_eq!(c, StatusCode::OK, "{b}");
+        let mut ws = stl_ws(&st, sid).await;
+        let _ = stl_drain(&mut ws, 300).await;
+        let len0 = stl_log(&st, sid).len();
+        rcb_tool_call(&st, sid, "tc1").await;
+        let l1 = stl_drain(&mut ws, 400).await;
+        stl_assert_exact("M8 tool-call", &st, sid, len0, &l1);
+        let len1 = stl_log(&st, sid).len();
+        rcb_end_turn(&st, sid).await;
+        let l2 = stl_drain(&mut ws, 400).await;
+        stl_assert_exact("M8 end-turn", &st, sid, len1, &l2);
     }
 }
