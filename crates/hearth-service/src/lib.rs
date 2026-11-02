@@ -1270,7 +1270,8 @@ mod tests {
         let mut wires = st.host_wires.lock().unwrap();
         for agent in [a, b] {
             let w = wires.get_mut(sid, agent).unwrap();
-            let raw = std::str::from_utf8(w.new.stdin_log().unwrap()).unwrap();
+            // Host-wire-remint-settle: Reminted swaps runners; resumed child is `old`.
+            let raw = std::str::from_utf8(w.old.stdin_log().unwrap()).unwrap();
             assert!(
                 raw.contains("session/resume"),
                 "Agent {agent:?} must session/resume; got {raw}"
@@ -1617,7 +1618,8 @@ mod tests {
         );
         assert!(w_a.new.stdin_log().unwrap().is_empty(), "A no spawn");
         let w_b = wires.get_mut(sid, b).unwrap();
-        let raw_b = std::str::from_utf8(w_b.new.stdin_log().unwrap()).unwrap();
+        // Host-wire-remint-settle: Reminted swaps runners; resumed child is `old`.
+        let raw_b = std::str::from_utf8(w_b.old.stdin_log().unwrap()).unwrap();
         assert!(raw_b.contains("session/resume"), "B resume: {raw_b}");
         assert!(!raw_b.contains("session/load") && !raw_b.contains("session/new"));
     }
@@ -1839,7 +1841,8 @@ mod tests {
                 !w.remint.turn_in_flight(),
                 "Agent {agent:?} turn cleared after remint (cancel-before-reattach)"
             );
-            let raw = std::str::from_utf8(w.new.stdin_log().unwrap()).unwrap();
+            // Host-wire-remint-settle: Reminted swaps runners; resumed child is `old`.
+            let raw = std::str::from_utf8(w.old.stdin_log().unwrap()).unwrap();
             let frames: Vec<serde_json::Value> = raw
                 .lines()
                 .filter(|l| !l.is_empty())
@@ -2243,7 +2246,8 @@ mod tests {
         let mut wires = st.host_wires.lock().unwrap();
         for (agent, expected_sid) in expected {
             let w = wires.get_mut(sid, agent).unwrap();
-            let raw = std::str::from_utf8(w.new.stdin_log().unwrap()).unwrap();
+            // Host-wire-remint-settle: Reminted swaps runners; resumed child is `old`.
+            let raw = std::str::from_utf8(w.old.stdin_log().unwrap()).unwrap();
             let frames: Vec<serde_json::Value> = raw
                 .lines()
                 .filter(|l| !l.is_empty())
@@ -2489,7 +2493,8 @@ mod tests {
                 !w.remint.turn_in_flight(),
                 "Agent {agent:?} turn cleared after remint (cancel-before-reattach)"
             );
-            let raw = std::str::from_utf8(w.new.stdin_log().unwrap()).unwrap();
+            // Host-wire-remint-settle: Reminted swaps runners; resumed child is `old`.
+            let raw = std::str::from_utf8(w.old.stdin_log().unwrap()).unwrap();
             let frames: Vec<serde_json::Value> = raw
                 .lines()
                 .filter(|l| !l.is_empty())
@@ -2893,7 +2898,8 @@ mod tests {
         let mut wires = st.host_wires.lock().unwrap();
         for (agent, expected_sid) in expected {
             let w = wires.get_mut(sid, agent).unwrap();
-            let raw = std::str::from_utf8(w.new.stdin_log().unwrap()).unwrap();
+            // Host-wire-remint-settle: Reminted swaps runners; resumed child is `old`.
+            let raw = std::str::from_utf8(w.old.stdin_log().unwrap()).unwrap();
             let frames: Vec<serde_json::Value> = raw
                 .lines()
                 .filter(|l| !l.is_empty())
@@ -3411,7 +3417,8 @@ mod tests {
         assert_eq!(after_mints, before_mints + 1);
         let mut wires = st.host_wires.lock().unwrap();
         let w = wires.get_mut(sid, a).unwrap();
-        let raw = std::str::from_utf8(w.new.stdin_log().unwrap()).unwrap();
+        // Host-wire-remint-settle: Reminted swaps runners; resumed child is `old`.
+        let raw = std::str::from_utf8(w.old.stdin_log().unwrap()).unwrap();
         assert!(
             raw.contains("session/resume"),
             "must session/resume; got {raw}"
@@ -5680,6 +5687,493 @@ mod tests {
                     }
                 )),
             "ACP drain must not smuggle Trigger wake"
+        );
+    }
+
+    // ---- Host-wire-remint-settle (M1–M5) ----
+
+    fn count_mints(st: &AppState, sid: SessionId) -> usize {
+        st.store()
+            .session(sid)
+            .unwrap()
+            .events()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e.body, EventBody::BindingAttached { .. }))
+            .count()
+    }
+
+    fn count_user_messages(st: &AppState, sid: SessionId) -> usize {
+        st.store()
+            .session(sid)
+            .unwrap()
+            .events()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e.body, EventBody::UserMessage { .. }))
+            .count()
+    }
+
+    fn count_fail_closed(st: &AppState, sid: SessionId, agent: hearth::AgentId) -> usize {
+        let wires = st.host_wires.lock().unwrap();
+        wires
+            .get(sid, agent)
+            .unwrap()
+            .remint
+            .observe()
+            .iter()
+            .filter(|e| e.kind == hearth_agent_wire::RemintEventKind::FailClosed)
+            .count()
+    }
+
+    fn host_old_wire(
+        st: &AppState,
+        sid: SessionId,
+        agent: hearth::AgentId,
+    ) -> hearth_agent_wire::OldWire {
+        st.host_wires
+            .lock()
+            .unwrap()
+            .get(sid, agent)
+            .unwrap()
+            .old_wire
+            .clone()
+    }
+
+    async fn steer(st: &AppState, sid: SessionId, msg: &str) -> (StatusCode, String) {
+        let id = sid.0.to_string();
+        call(
+            router(st.clone()),
+            Request::post(format!("/sessions/{id}/events"))
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"user":"cheng","message":"{msg}"}}"#
+                )))
+                .unwrap(),
+        )
+        .await
+    }
+
+    /// Attach a lease to the wake-opened turn, then end it (→ LiveIdle).
+    fn end_wake_turn(st: &AppState, sid: SessionId, agent: hearth::AgentId, holder: &str) {
+        let (_t, fence, _) = st
+            .runtime
+            .begin_turn(sid, agent, hearth::HolderId::new(holder))
+            .expect("lease wake-opened turn");
+        st.runtime
+            .end_turn(sid, holder.into(), fence, false)
+            .unwrap();
+        assert_eq!(
+            st.runtime.classify(sid, agent).unwrap(),
+            hearth::Liveness::LiveIdle
+        );
+    }
+
+    /// M1 (Host-wire-remint-settle): steer #1 remints both lost ParallelSafe
+    /// Agents (+2); after both turns end, steer #2 reuses the live Bindings —
+    /// 200, zero new BindingAttached, Binding ids unchanged, both LiveInTurn,
+    /// exactly one new UserMessage, no FailClosed / unbind.
+    /// Tip mutant (no steer-path settle): 500, +6 mints, both unbound.
+    #[tokio::test]
+    async fn http_steer_after_remint_second_steer_reuses_live_no_mint() {
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let (a, b, _) = install_two_parallel_safe_host_wires(
+            &st,
+            sid,
+            Some(hearth_agent_wire::OldWire::Exited(1)),
+        );
+        let m0 = count_mints(&st, sid);
+        let (c1, b1) = steer(&st, sid, "one").await;
+        assert_eq!(c1, StatusCode::OK, "steer #1 body={b1}");
+        assert_eq!(count_mints(&st, sid), m0 + 2, "steer #1 remints both");
+        let bid_a = st.runtime.binding_for(sid, a).unwrap();
+        let bid_b = st.runtime.binding_for(sid, b).unwrap();
+        end_wake_turn(&st, sid, a, "ha");
+        end_wake_turn(&st, sid, b, "hb");
+        let fc_a = count_fail_closed(&st, sid, a);
+        let fc_b = count_fail_closed(&st, sid, b);
+        let m1 = count_mints(&st, sid);
+        let ums1 = count_user_messages(&st, sid);
+
+        let (c2, b2) = steer(&st, sid, "two").await;
+        assert_eq!(
+            c2,
+            StatusCode::OK,
+            "steer #2 must reuse live; body={b2} mints+={} bind_a={:?} bind_b={:?}",
+            count_mints(&st, sid) - m1,
+            st.runtime.binding_for(sid, a).map(|x| x == bid_a),
+            st.runtime.binding_for(sid, b).map(|x| x == bid_b),
+        );
+        assert!(b2.contains("two"), "body={b2}");
+        assert_eq!(
+            count_mints(&st, sid),
+            m1,
+            "steer #2: zero new BindingAttached"
+        );
+        assert_eq!(
+            st.runtime.binding_for(sid, a).unwrap(),
+            bid_a,
+            "A Binding kept"
+        );
+        assert_eq!(
+            st.runtime.binding_for(sid, b).unwrap(),
+            bid_b,
+            "B Binding kept"
+        );
+        for ag in [a, b] {
+            assert_eq!(
+                st.runtime.classify(sid, ag).unwrap(),
+                hearth::Liveness::LiveInTurn
+            );
+        }
+        assert_eq!(
+            count_user_messages(&st, sid),
+            ums1 + 1,
+            "one new UserMessage"
+        );
+        assert_eq!(count_fail_closed(&st, sid, a), fc_a, "no FailClosed A");
+        assert_eq!(count_fail_closed(&st, sid, b), fc_b, "no FailClosed B");
+    }
+
+    /// M2 (Host-wire-remint-settle): steer remints A; A ends its turn; RAP
+    /// tool-call → tool-result → 200 Applied + single-Agent Trigger + A
+    /// LiveInTurn with zero mints and A's Binding unchanged; peer B untouched.
+    /// Tip mutant: 500, +1 mint, A's live Binding replaced.
+    #[tokio::test]
+    async fn http_rap_after_steer_remint_tool_result_reuses_live_no_mint() {
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let id = sid.0.to_string();
+        let (a, b, _) = install_two_parallel_safe_host_wires(
+            &st,
+            sid,
+            Some(hearth_agent_wire::OldWire::Exited(1)),
+        );
+        let m0 = count_mints(&st, sid);
+        let (c1, b1) = steer(&st, sid, "one").await;
+        assert_eq!(c1, StatusCode::OK, "steer body={b1}");
+        assert_eq!(count_mints(&st, sid), m0 + 2);
+        let bid_a = st.runtime.binding_for(sid, a).unwrap();
+        let bid_b = st.runtime.binding_for(sid, b).unwrap();
+        let turn_b = session.current_turn_of(b).unwrap();
+        assert!(turn_b.is_some(), "B LiveInTurn from steer");
+        end_wake_turn(&st, sid, a, "ha");
+        let m1 = count_mints(&st, sid);
+        let triggers0 = count_trigger_wakes(&st, sid);
+
+        let app = router(st.clone());
+        let (c2, b2) = call(
+            app.clone(),
+            Request::post(format!("/sessions/{id}/agents/alpha/tool-call"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"name":"settle","tool_call_id":"tc-settle"}"#,
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(c2, StatusCode::OK, "tool-call body={b2}");
+        let (c3, b3) = call(
+            app,
+            Request::post(format!("/sessions/{id}/agents/alpha/tool-result"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"tool_call_id":"tc-settle","output":"ok"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            c3,
+            StatusCode::OK,
+            "tool-result must reuse live; body={b3} mints+={} bind_a_kept={:?}",
+            count_mints(&st, sid) - m1,
+            st.runtime.binding_for(sid, a).map(|x| x == bid_a),
+        );
+        assert!(b3.contains(r#""applied":true"#), "body={b3}");
+        assert_eq!(
+            count_trigger_wakes(&st, sid),
+            triggers0 + 1,
+            "single Trigger"
+        );
+        assert_eq!(
+            st.runtime.classify(sid, a).unwrap(),
+            hearth::Liveness::LiveInTurn
+        );
+        assert_eq!(count_mints(&st, sid), m1, "RAP after steer remint: 0 mints");
+        assert_eq!(
+            st.runtime.binding_for(sid, a).unwrap(),
+            bid_a,
+            "A Binding kept"
+        );
+        // Peer B untouched.
+        assert_eq!(st.runtime.binding_for(sid, b).unwrap(), bid_b);
+        assert_eq!(session.current_turn_of(b).unwrap(), turn_b);
+        assert_eq!(
+            st.runtime.classify(sid, b).unwrap(),
+            hearth::Liveness::LiveInTurn
+        );
+    }
+
+    /// M3 (Host-wire-remint-settle): settle only Agents that Reminted /
+    /// ReuseLive. A no-resume lost → caps-refuse FailClosed-skip; B resume
+    /// lost → reminted. After steer A's map evidence stays lost, B LiveIdle.
+    /// Follow-up steer: A typed-refused again (no mint for A), B ReuseLive
+    /// (0 mints). Mutant "settle every wire in the Session" fails.
+    #[tokio::test]
+    async fn http_steer_remint_settle_only_reminted_agent_skip_keeps_evidence() {
+        use hearth_agent_wire::{LiveCaps as WireCaps, OldWire, RemintEventKind};
+
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let no_resume = WireCaps {
+            resume: false,
+            load_session: false,
+            cancel: true,
+            close: true,
+        };
+        let (a, b, _) = install_two_parallel_safe_host_wires_with_per_agent_caps(
+            &st,
+            sid,
+            Some(OldWire::Exited(1)),
+            no_resume,
+            resume_capable_caps(),
+        );
+        let m0 = count_mints(&st, sid);
+        let (c1, b1) = steer(&st, sid, "one").await;
+        assert_eq!(c1, StatusCode::OK, "B remint keeps steer 200; body={b1}");
+        assert_eq!(count_mints(&st, sid), m0 + 1, "only B minted");
+        assert_eq!(
+            host_old_wire(&st, sid, a),
+            OldWire::Exited(1),
+            "A skipped (caps-refuse FailClosed): evidence unchanged, not LiveIdle"
+        );
+        assert_eq!(host_old_wire(&st, sid, b), OldWire::LiveIdle, "B settled");
+        let bid_b = st.runtime.binding_for(sid, b).unwrap();
+        end_wake_turn(&st, sid, b, "hb");
+        let refuse_a = |st: &AppState| {
+            st.host_wires
+                .lock()
+                .unwrap()
+                .get(sid, a)
+                .unwrap()
+                .remint
+                .observe()
+                .iter()
+                .filter(|e| e.kind == RemintEventKind::FailClosed && e.text == "ResumeNotSupported")
+                .count()
+        };
+        let fc_a = refuse_a(&st);
+        assert!(fc_a >= 1, "A FailClosed on steer #1");
+        let fc_b = count_fail_closed(&st, sid, b);
+        let m1 = count_mints(&st, sid);
+
+        let (c2, b2) = steer(&st, sid, "two").await;
+        assert_eq!(c2, StatusCode::OK, "B ReuseLive keeps steer 200; body={b2}");
+        assert_eq!(
+            count_mints(&st, sid),
+            m1,
+            "steer #2: 0 mints (A refused, B reuse)"
+        );
+        assert_eq!(
+            refuse_a(&st),
+            fc_a + 1,
+            "A typed-refused again (lost evidence kept)"
+        );
+        assert_eq!(host_old_wire(&st, sid, a), OldWire::Exited(1));
+        {
+            let wires = st.host_wires.lock().unwrap();
+            assert!(
+                wires
+                    .get(sid, a)
+                    .unwrap()
+                    .new
+                    .stdin_log()
+                    .unwrap()
+                    .is_empty(),
+                "A never spawned / initialized a new wire"
+            );
+        }
+        assert!(st.runtime.binding_for(sid, a).is_err(), "A still unbound");
+        assert_eq!(st.runtime.binding_for(sid, b).unwrap(), bid_b, "B reused");
+        assert_eq!(count_fail_closed(&st, sid, b), fc_b, "B no FailClosed");
+        assert_eq!(
+            st.runtime.classify(sid, b).unwrap(),
+            hearth::Liveness::LiveInTurn
+        );
+    }
+
+    /// M4 (Host-wire-remint-settle): settle survives a peer abort. A lost +
+    /// Place, B lost with no Place (ResumeNoPlace still aborts the fan-out —
+    /// abort semantics unchanged). Steer #1 → 500 with A minted exactly once
+    /// and A's evidence LiveIdle. Install B's Place; steer #2 → A ReuseLive
+    /// (0 mints for A), B remints once. Mutant "settle from the Woke return"
+    /// fails (lost on Err).
+    #[tokio::test]
+    async fn http_steer_remint_settle_survives_peer_abort() {
+        use hearth_agent_wire::OldWire;
+
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let (a, b, place) =
+            install_two_parallel_safe_host_wires(&st, sid, Some(OldWire::Exited(1)));
+        assert_eq!(st.runtime.kept_agents(sid), vec![a, b], "A runs before B");
+        st.host_wires.lock().unwrap().get_mut(sid, b).unwrap().place = None;
+        let bid_b0 = st.runtime.binding_for(sid, b).unwrap();
+        let m0 = count_mints(&st, sid);
+
+        let (c1, b1) = steer(&st, sid, "one").await;
+        assert_eq!(
+            c1,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "B ResumeNoPlace aborts fan-out (unchanged); body={b1}"
+        );
+        assert_eq!(count_mints(&st, sid), m0 + 1, "A minted exactly once");
+        assert_eq!(
+            host_old_wire(&st, sid, a),
+            OldWire::LiveIdle,
+            "A settled at remint time despite peer abort"
+        );
+        assert_eq!(
+            host_old_wire(&st, sid, b),
+            OldWire::Exited(1),
+            "B unsettled"
+        );
+        assert_eq!(
+            st.runtime.binding_for(sid, b).unwrap(),
+            bid_b0,
+            "B untouched"
+        );
+        let bid_a = st.runtime.binding_for(sid, a).unwrap();
+
+        st.host_wires.lock().unwrap().get_mut(sid, b).unwrap().place = Some(place);
+        let (c2, b2) = steer(&st, sid, "two").await;
+        assert_eq!(c2, StatusCode::OK, "body={b2}");
+        assert_eq!(
+            count_mints(&st, sid),
+            m0 + 2,
+            "steer #2: B remints once; A 0 mints"
+        );
+        assert_eq!(
+            st.runtime.binding_for(sid, a).unwrap(),
+            bid_a,
+            "A ReuseLive"
+        );
+        assert_ne!(
+            st.runtime.binding_for(sid, b).unwrap(),
+            bid_b0,
+            "B reminted"
+        );
+        for ag in [a, b] {
+            assert_eq!(host_old_wire(&st, sid, ag), OldWire::LiveIdle);
+            assert_eq!(
+                st.runtime.classify(sid, ag).unwrap(),
+                hearth::Liveness::LiveInTurn
+            );
+        }
+    }
+
+    /// Runner-swap pins for M5: after a Reminted settle the map's `old` is the
+    /// resumed Fake child (session/resume on its stdin, never Exited(code)),
+    /// `new` is the reaped Real child (Exited(code)).
+    fn assert_runner_swapped(st: &AppState, sid: SessionId, agent: hearth::AgentId, code: i32) {
+        let mut wires = st.host_wires.lock().unwrap();
+        let w = wires.get_mut(sid, agent).unwrap();
+        assert_eq!(w.old_wire, hearth_agent_wire::OldWire::LiveIdle);
+        assert_ne!(
+            w.old.probe_exit(),
+            hearth_agent_wire::OldWire::Exited(code),
+            "map old must be the resumed runner, not the killed Real child"
+        );
+        let raw = std::str::from_utf8(w.old.stdin_log().expect("old is the Fake resumed runner"))
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            raw.matches("session/resume").count(),
+            1,
+            "old resumed once: {raw}"
+        );
+        assert!(!raw.contains("session/load") && !raw.contains("session/new"));
+        assert!(w.new.stdin_log().is_none(), "new is the reaped Real child");
+        assert_eq!(
+            w.new.probe_exit(),
+            hearth_agent_wire::OldWire::Exited(code),
+            "reaped Real child parked as new"
+        );
+    }
+
+    /// M5 (Host-wire-remint-settle): Real-exited steer remint swaps runners.
+    /// Map `old` is the resumed child; a later forced loss acts on it (kills
+    /// the resumed runner) and never re-initializes it as `new`.
+    /// Mutant "settle old_wire without swapping runners" fails.
+    #[tokio::test]
+    async fn http_steer_remint_swaps_runner_old_is_resumed_child() {
+        use hearth_agent_wire::OldWire;
+
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let (a, b, _) = install_two_parallel_safe_real_exited_host_wires(&st, sid);
+        let (c1, b1) = steer(&st, sid, "one").await;
+        assert_eq!(c1, StatusCode::OK, "body={b1}");
+        assert_runner_swapped(&st, sid, a, 7);
+        assert_runner_swapped(&st, sid, b, 8);
+
+        // Later forced loss on A: host_wake must kill the resumed runner
+        // (one live child per Agent) and must not re-initialize it as `new`.
+        end_wake_turn(&st, sid, a, "ha");
+        end_wake_turn(&st, sid, b, "hb");
+        st.set_host_old_wire(sid, a, OldWire::Exited(7)).unwrap();
+        let (_c2, _b2) = steer(&st, sid, "two").await;
+        let mut wires = st.host_wires.lock().unwrap();
+        let w = wires.get_mut(sid, a).unwrap();
+        // Soft (parked): `new` is the reaped child, so the remint itself fails
+        // honestly; this floor only pins which runner the loss acted on.
+        let (old_exit, old_raw) = (
+            w.old.try_wait().unwrap(),
+            std::str::from_utf8(w.old.stdin_log().unwrap())
+                .unwrap()
+                .to_string(),
+        );
+        assert_eq!(old_exit, Some(9), "forced loss killed the resumed runner");
+        assert_eq!(
+            old_raw.matches("\"initialize\"").count(),
+            1,
+            "resumed runner never re-initialized as new: {old_raw}"
+        );
+        assert_eq!(old_raw.matches("session/resume").count(), 1, "{old_raw}");
+    }
+
+    /// M5 (tool-result twin): `complete_host_tool_for` Reminted settle swaps
+    /// runners too. Mutant "drop the complete_host_tool_for swap" fails.
+    #[tokio::test]
+    async fn http_tool_result_remint_swaps_runner_old_is_resumed_child() {
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let id = sid.0.to_string();
+        let (a, b, _) = install_two_parallel_safe_real_exited_host_wires(&st, sid);
+        record_host_tool_call(&st, sid, a, "tc-swap", "swap_tool");
+        let m0 = count_mints(&st, sid);
+        let (code, body) = call(
+            router(st.clone()),
+            Request::post(format!("/sessions/{id}/agents/alpha/tool-result"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"tool_call_id":"tc-swap","output":"ok"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "body={body}");
+        assert!(body.contains(r#""applied":true"#), "body={body}");
+        assert_eq!(count_mints(&st, sid), m0 + 1, "A reminted once");
+        assert_runner_swapped(&st, sid, a, 7);
+        // Peer B untouched: still the Real lost child, evidence unchanged.
+        assert_eq!(
+            host_old_wire(&st, sid, b),
+            hearth_agent_wire::OldWire::Exited(8)
         );
     }
 
