@@ -25,10 +25,12 @@ pub use host_steer::{
 };
 pub use probe::{probe_local, CliStatus};
 
+/// Doorbell only (stream-tails-log): "Session `session`'s EventLog may have
+/// grown". No frame rides the channel; the WS stream tails the log by index,
+/// so a lagged or cross-Session-flooded receiver just re-reads.
 #[derive(Clone)]
 struct LiveEvent {
     session: SessionId,
-    event: EventOut,
 }
 
 #[derive(Clone)]
@@ -107,8 +109,11 @@ impl AppState {
         self.runtime.store()
     }
 
-    fn publish(&self, session: SessionId, event: EventOut) {
-        let _ = self.live.send(LiveEvent { session, event });
+    /// Ring the Session's doorbell. Called on every exit of every
+    /// log-writing handler (Ok and Err): a refused or failed request can
+    /// still have appended events.
+    fn ring(&self, session: SessionId) {
+        let _ = self.live.send(LiveEvent { session });
     }
 }
 
@@ -275,7 +280,8 @@ fn apply_join(
         return Err(StatusCode::BAD_REQUEST);
     };
     drop(names);
-    if let Some(aid) = keep_agent {
+    // The join is on the log: ring on every exit from here (Ok and Err).
+    let kept: Result<(), StatusCode> = keep_agent.map_or(Ok(()), |aid| {
         keep_standin(st, id, aid)?;
         // Explicit declare only — never inferred from tools (DESIGN).
         if let Some(paths) = parallel_safe {
@@ -283,10 +289,11 @@ fn apply_join(
                 .set_parallel_safe(id, aid, Some(hearth::ParallelSafe::paths(paths)))
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         }
-    }
-    let out = event_out(&ev);
-    st.publish(id, out.clone());
-    Ok(out)
+        Ok(())
+    });
+    st.ring(id);
+    kept?;
+    Ok(event_out(&ev))
 }
 
 async fn join_session(
@@ -369,17 +376,19 @@ fn apply_user_message(
     let uid = *names.users.get(&name).ok_or(StatusCode::NOT_FOUND)?;
     drop(names);
     let _agents = ensure_kept_agents(st, id)?;
-    match host_steer::steer_each_kept(st, id, Wake::UserQuery { user: uid, text }) {
+    let res = host_steer::steer_each_kept(st, id, Wake::UserQuery { user: uid, text });
+    // Ring before matching: a 409/500 steer may have appended (remint
+    // Binding events, FailClosed unbinds).
+    st.ring(id);
+    match res {
         Ok(outcome) => {
             let per_agent = outcome.woke();
             let mut um: Option<EventOut> = None;
             for (_agent, evs) in per_agent {
                 for e in evs {
-                    let out = event_out(e);
                     if matches!(e.body, EventBody::UserMessage { .. }) {
-                        um = Some(out.clone());
+                        um = Some(event_out(e));
                     }
-                    st.publish(id, out);
                 }
             }
             um.or_else(|| {
@@ -455,8 +464,8 @@ async fn post_tool_call(
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let input = body.input.unwrap_or_else(|| "{}".into());
     match session.append_host_tool_call(agent, &tool_call_id, &body.name, &input) {
-        Ok(ev) => {
-            st.publish(id, event_out(&ev));
+        Ok(_ev) => {
+            st.ring(id);
             let callback_url = format!("/sessions/{}/agents/{}/tool-result", id.0, agent_name);
             Ok(Json(ToolCallOut {
                 tool_call_id,
@@ -490,8 +499,8 @@ async fn post_end_turn(
         return Err(StatusCode::BAD_REQUEST);
     }
     match st.runtime.end_host_turn(id, agent) {
-        Ok(ev) => {
-            st.publish(id, event_out(&ev));
+        Ok(_ev) => {
+            st.ring(id);
             Ok(Json(EndTurnOut { ended: true }))
         }
         Err(hearth::Error::TurnNotOpen) => Err(StatusCode::CONFLICT),
@@ -553,19 +562,13 @@ async fn post_tool_result(
     let outcome = tokio::task::spawn_blocking(move || {
         host_steer::complete_tool_result(&st_block, id, agent, &tool_call_id, &output)
     })
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    match outcome {
-        Ok(CompleteToolOutcome::Applied {
-            tool_result,
-            wake_events,
-            ..
-        }) => {
+    .await;
+    // Ring before matching: a 409/500 RAP may have appended (the ToolResult
+    // is appended before the wake, plus any remint Binding events).
+    st.ring(id);
+    match outcome.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)? {
+        Ok(CompleteToolOutcome::Applied { tool_result, .. }) => {
             let out = event_out(&tool_result);
-            st.publish(id, out.clone());
-            for e in &wake_events {
-                st.publish(id, event_out(e));
-            }
             Ok(Json(ToolResultOut {
                 applied: true,
                 body: Some(out.body),
@@ -644,16 +647,12 @@ async fn stream_session(
 }
 
 async fn push_stream(mut socket: WebSocket, st: AppState, id: SessionId) {
+    // Subscribe before the first read, so no ring is missed; replay is
+    // just the first tail.
     let mut rx = st.live.subscribe();
-    if let Ok(session) = st.store().session(id) {
-        if let Ok(events) = session.events() {
-            for e in events {
-                let txt = serde_json::to_string(&event_out(&e)).unwrap_or_default();
-                if socket.send(Message::Text(txt.into())).await.is_err() {
-                    return;
-                }
-            }
-        }
+    let mut cursor = 0usize;
+    if tail_log(&mut socket, &st, id, &mut cursor).await.is_err() {
+        return;
     }
     loop {
         tokio::select! {
@@ -692,18 +691,49 @@ async fn push_stream(mut socket: WebSocket, st: AppState, id: SessionId) {
             live = rx.recv() => {
                 match live {
                     Ok(live) if live.session == id => {
-                        let txt = serde_json::to_string(&live.event).unwrap_or_default();
-                        if socket.send(Message::Text(txt.into())).await.is_err() {
+                        if tail_log(&mut socket, &st, id, &mut cursor).await.is_err() {
                             return;
                         }
                     }
                     Ok(_) => {}
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    // A lag may have swallowed this Session's ring (own burst
+                    // or another Session's flood): re-read, never skip.
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        if tail_log(&mut socket, &st, id, &mut cursor).await.is_err() {
+                            return;
+                        }
+                    }
                     Err(broadcast::error::RecvError::Closed) => return,
                 }
             }
         }
     }
+}
+
+/// Send `events[cursor..]` in log order and advance `cursor` per frame sent.
+/// The EventLog is append-only, so an index is a complete, duplicate-free
+/// cursor (`seq` is untouched: it stays `mark_read`-only).
+async fn tail_log(
+    socket: &mut WebSocket,
+    st: &AppState,
+    id: SessionId,
+    cursor: &mut usize,
+) -> Result<(), ()> {
+    let Ok(session) = st.store().session(id) else {
+        return Ok(());
+    };
+    let Ok(events) = session.events() else {
+        return Ok(());
+    };
+    for e in events.iter().skip(*cursor) {
+        let txt = serde_json::to_string(&event_out(e)).unwrap_or_default();
+        socket
+            .send(Message::Text(txt.into()))
+            .await
+            .map_err(|_| ())?;
+        *cursor += 1;
+    }
+    Ok(())
 }
 
 async fn agents_local(State(st): State<AppState>) -> Json<Vec<CliStatus>> {
