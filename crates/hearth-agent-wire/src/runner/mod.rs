@@ -7607,4 +7607,145 @@ mod tests {
             .unwrap()
             .contains("session/resume"));
     }
+
+    // ---- RAP-classify-before-remint ----
+
+    /// One wire-level `complete_host_tool` for `agent`'s `tc` on a lost
+    /// (`Exited(1)`) wire.
+    fn rcb_complete(
+        rt: &hearth::Runtime,
+        sid: hearth::SessionId,
+        remint: &RemintSession,
+        place: &hearth::Place,
+        tc: &str,
+        old: &mut AttachRunner,
+        new: &mut AttachRunner,
+    ) -> CompleteHostTool {
+        let agent = remint.host_agent_id();
+        rt.store()
+            .session(sid)
+            .unwrap()
+            .append(hearth::EventBody::ToolCall {
+                agent,
+                tool_call_id: tc.into(),
+                name: "t".into(),
+                input: "{}".into(),
+                parent_tool_call_id: None,
+            })
+            .expect("host ToolCall");
+        let mut transport = transport_for_wire(WireKind::JsonlRpc);
+        let (mut old_next, mut new_next) = (10u64, 2u64);
+        complete_host_tool(
+            old,
+            new,
+            &mut transport,
+            CompleteHostToolArgs {
+                runtime: rt,
+                session_id: sid,
+                agent,
+                tool_call_id: tc,
+                output: "o",
+                old_wire: OldWire::Exited(1),
+                remint: HostRemintFullArgs {
+                    session: remint,
+                    place: Some(place),
+                    mcp_servers: &[],
+                    init_rpc_id: &RpcId::Num(1),
+                    old_next_rpc_id: &mut old_next,
+                    new_next_rpc_id: &mut new_next,
+                },
+            },
+        )
+        .expect("AppliedWakeWaiting, not Err")
+    }
+
+    /// M4 (RAP-classify-before-remint): A declares the empty ParallelSafe set
+    /// (never self-conflicts at the gate) and is kernel LiveInTurn; its wire
+    /// is `Exited(1)`. `complete_host_tool` → `AppliedWakeWaiting(TurnOpen)`
+    /// with the ToolResult appended (M8) and **zero wire action**: 0 mints,
+    /// Binding unchanged, old/new stdin untouched, old child not killed.
+    /// Pin: A kernel LiveIdle (also `[]`) with a peer's non-ParallelSafe turn
+    /// open → still `AppliedWakeWaiting` before any wire action, via the gate
+    /// (order: classify → gate, both pre-wire). Tip / "classify after
+    /// host_wake": the RAP step reminted under the turn (+1 mint).
+    #[test]
+    fn complete_host_tool_open_turn_waits_before_wire_action() {
+        // (1) Own open turn, empty declaration → classify refuses.
+        let (rt, sid, uid, a, _b, remint_a, _remint_b, place) = shared_runtime_two_agents();
+        rt.set_parallel_safe(sid, a, Some(hearth::ParallelSafe::default()))
+            .expect("declare []");
+        rt.wake(
+            sid,
+            a,
+            hearth::Wake::UserQuery {
+                user: uid,
+                text: "go".into(),
+            },
+        )
+        .expect("open A's turn");
+        assert_eq!(rt.classify(sid, a).unwrap(), hearth::Liveness::LiveInTurn);
+        rt.check_turn_gate(sid, a)
+            .expect("[] never self-conflicts: the gate alone is not the guard");
+        let session = rt.store().session(sid).unwrap();
+        let turn0 = session.current_turn_of(a).unwrap();
+        let bid0 = rt.binding_for(sid, a).unwrap();
+        let before = binding_attached_count(&rt, sid);
+        let mut old = initialized_fake(Vec::new());
+        let old_log = old.stdin_log().unwrap().to_vec();
+        let mut new = new_wire_fake();
+        let r = rcb_complete(&rt, sid, &remint_a, &place, "tc-own", &mut old, &mut new);
+        let CompleteHostTool::AppliedWakeWaiting {
+            tool_result,
+            reason,
+        } = r
+        else {
+            panic!("expected AppliedWakeWaiting, got {r:?}");
+        };
+        assert_eq!(reason, hearth::WaitReason::TurnOpen);
+        assert!(matches!(
+            &tool_result.body,
+            hearth::EventBody::ToolResult { tool_call_id, .. } if tool_call_id == "tc-own"
+        ));
+        assert_eq!(binding_attached_count(&rt, sid), before, "0 mints");
+        assert_eq!(rt.binding_for(sid, a).unwrap(), bid0, "Binding unchanged");
+        assert_eq!(session.current_turn_of(a).unwrap(), turn0);
+        assert_eq!(old.stdin_log().unwrap(), &old_log[..], "old untouched");
+        assert!(new.stdin_log().unwrap().is_empty(), "no session/resume");
+        assert_ne!(old.try_wait().unwrap(), Some(9), "old child not killed");
+        assert!(!remint_a
+            .observe()
+            .iter()
+            .any(|e| e.kind == RemintEventKind::FailClosed));
+
+        // (2) Pin: A LiveIdle, peer B's non-ParallelSafe turn open → gate.
+        let (rt, sid, uid, a, b, remint_a, _remint_b, place) = shared_runtime_two_agents();
+        rt.set_parallel_safe(sid, a, Some(hearth::ParallelSafe::default()))
+            .expect("declare []");
+        rt.wake(
+            sid,
+            b,
+            hearth::Wake::UserQuery {
+                user: uid,
+                text: "peer".into(),
+            },
+        )
+        .expect("open B's turn");
+        assert_eq!(rt.classify(sid, a).unwrap(), hearth::Liveness::LiveIdle);
+        assert_eq!(rt.classify(sid, b).unwrap(), hearth::Liveness::LiveInTurn);
+        let bid0 = rt.binding_for(sid, a).unwrap();
+        let before = binding_attached_count(&rt, sid);
+        let mut old = initialized_fake(Vec::new());
+        let old_log = old.stdin_log().unwrap().to_vec();
+        let mut new = new_wire_fake();
+        let r = rcb_complete(&rt, sid, &remint_a, &place, "tc-peer", &mut old, &mut new);
+        let CompleteHostTool::AppliedWakeWaiting { reason, .. } = r else {
+            panic!("expected AppliedWakeWaiting (gate), got {r:?}");
+        };
+        assert_eq!(reason, hearth::WaitReason::TurnOpen);
+        assert_eq!(binding_attached_count(&rt, sid), before, "0 mints");
+        assert_eq!(rt.binding_for(sid, a).unwrap(), bid0);
+        assert_eq!(old.stdin_log().unwrap(), &old_log[..]);
+        assert!(new.stdin_log().unwrap().is_empty());
+        assert_ne!(old.try_wait().unwrap(), Some(9));
+    }
 }

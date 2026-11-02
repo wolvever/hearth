@@ -7538,4 +7538,237 @@ mod tests {
         assert!(rrb_fail_closed_texts(&st_s, sid_s, a_s).is_empty());
         assert!(rrb_fail_closed_texts(&st_r, sid_r, a_r).is_empty());
     }
+
+    // ---- RAP-classify-before-remint (M1–M5) ----
+
+    /// A joins with `parallel_safe: []` (documented: parallel-safe, touches
+    /// no paths — never self-conflicts at the gate), B with `["agent-1"]`.
+    fn rcb_setup(paths_a: Vec<String>) -> (AppState, SessionId, hearth::AgentId) {
+        let st = AppState::new(vec![]);
+        let sid = st.store().create_session().id();
+        let (a, _b, _) = install_two_host_wires_with_declare_caps(
+            &st,
+            sid,
+            None,
+            Some(paths_a),
+            Some(vec!["agent-1".into()]),
+            resume_capable_caps(),
+            resume_capable_caps(),
+        );
+        (st, sid, a)
+    }
+
+    async fn rcb_post(st: &AppState, path: String, body: &str) -> (StatusCode, String) {
+        call(
+            router(st.clone()),
+            Request::post(path)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+    }
+
+    async fn rcb_tool_call(st: &AppState, sid: SessionId, tc: &str) {
+        let id = sid.0.to_string();
+        let (c, b) = rcb_post(
+            st,
+            format!("/sessions/{id}/agents/alpha/tool-call"),
+            &format!(r#"{{"name":"t","tool_call_id":"{tc}"}}"#),
+        )
+        .await;
+        assert_eq!(c, StatusCode::OK, "{b}");
+    }
+
+    async fn rcb_tool_result(st: &AppState, sid: SessionId, tc: &str) -> (StatusCode, String) {
+        let id = sid.0.to_string();
+        rcb_post(
+            st,
+            format!("/sessions/{id}/agents/alpha/tool-result"),
+            &format!(r#"{{"tool_call_id":"{tc}","output":"o"}}"#),
+        )
+        .await
+    }
+
+    async fn rcb_end_turn(st: &AppState, sid: SessionId) {
+        let id = sid.0.to_string();
+        let (c, b) = rcb_post(st, format!("/sessions/{id}/agents/alpha/end-turn"), "{}").await;
+        assert_eq!(c, StatusCode::OK, "{b}");
+    }
+
+    /// HTTP steer → A LiveInTurn; Host tool-call tc1 mid-turn; A's CLI dies
+    /// (evidence `Exited(1)`, same injection as #84–#87 floors).
+    async fn rcb_open_turn_lost(st: &AppState, sid: SessionId, a: hearth::AgentId) {
+        let (c, b) = steer(st, sid, "go").await;
+        assert_eq!(c, StatusCode::OK, "{b}");
+        assert_eq!(
+            st.runtime.classify(sid, a).unwrap(),
+            hearth::Liveness::LiveInTurn
+        );
+        rcb_tool_call(st, sid, "tc1").await;
+        st.set_host_old_wire(sid, a, hearth_agent_wire::OldWire::Exited(1))
+            .unwrap();
+    }
+
+    /// Zero-wire footprint of A: (mints, A Binding, A turn, old stdin,
+    /// new stdin, evidence, FailClosed texts). Old-child exit checked apart
+    /// (a Fake child may exit 0 on its own; killed+reaped is 9).
+    #[allow(clippy::type_complexity)]
+    fn rcb_footprint(
+        st: &AppState,
+        sid: SessionId,
+        a: hearth::AgentId,
+    ) -> (
+        usize,
+        Option<hearth::BindingId>,
+        Option<u64>,
+        String,
+        String,
+        hearth_agent_wire::OldWire,
+        Vec<String>,
+    ) {
+        (
+            count_mints(st, sid),
+            st.runtime.binding_for(sid, a).ok(),
+            st.store().session(sid).unwrap().current_turn_of(a).unwrap(),
+            rrb_runner_log(st, sid, a, true),
+            rrb_runner_log(st, sid, a, false),
+            host_old_wire(st, sid, a),
+            rrb_fail_closed_texts(st, sid, a),
+        )
+    }
+
+    fn rcb_old_exit(st: &AppState, sid: SessionId, a: hearth::AgentId) -> Option<i32> {
+        let sw = session_wires_arc(st, sid);
+        let mut wires = sw.lock().unwrap();
+        wires.get_mut(a).unwrap().old.try_wait().ok().flatten()
+    }
+
+    /// M1 (RAP-classify-before-remint): A (`parallel_safe: []`) under its own
+    /// open turn with a lost wire. POST tool-result tc1 → 409, exactly one
+    /// ToolResult (M8: append before wake), Trigger 0, and **zero wire
+    /// action**: no mint, A Binding + turn unchanged, old child not killed,
+    /// new wire stdin empty, evidence still `Exited(1)`, no FailClosed.
+    /// Tip: gate passes (`[]` never self-conflicts) → remint under the turn
+    /// (+1 mint, old exit 9, Binding swapped, session/resume on new) → 409.
+    #[tokio::test]
+    async fn http_tool_result_open_turn_empty_parallel_safe_no_remint() {
+        let (st, sid, a) = rcb_setup(vec![]);
+        rcb_open_turn_lost(&st, sid, a).await;
+        let before = rcb_footprint(&st, sid, a);
+        let (mints0, bid0, turn0, ..) = before.clone();
+        assert!(bid0.is_some() && turn0.is_some());
+
+        let (c, b) = rcb_tool_result(&st, sid, "tc1").await;
+        assert_eq!(c, StatusCode::CONFLICT, "{b}");
+        assert_eq!(count_tool_results(&st, sid, "tc1"), 1, "M8: Result lands");
+        assert_eq!(count_trigger_wakes(&st, sid), 0);
+        let after = rcb_footprint(&st, sid, a);
+        assert_eq!(after.0, mints0, "0 mints under an open turn");
+        assert_eq!(after.1, bid0, "A Binding unchanged");
+        assert_eq!(after.2, turn0, "A's turn still open on the same Binding");
+        assert!(after.4.is_empty(), "new wire untouched: {}", after.4);
+        assert_eq!(after.5, hearth_agent_wire::OldWire::Exited(1));
+        assert!(after.6.is_empty(), "no FailClosed: {:?}", after.6);
+        assert_eq!(after, before, "zero wire action");
+        assert_ne!(rcb_old_exit(&st, sid, a), Some(9), "old child not killed");
+        assert_eq!(
+            st.runtime.classify(sid, a).unwrap(),
+            hearth::Liveness::LiveInTurn
+        );
+    }
+
+    /// M2 (RAP-classify-before-remint): after M1, Host `end-turn` A → 200;
+    /// user steer → 200, A reminted **exactly once**, LiveInTurn, resumed
+    /// child settled on `old` (session/resume), evidence LiveIdle, 0
+    /// FailClosed, A still bound, +1 UserMessage. Tip: stale map → steer
+    /// 500, +3 mints, FailClosed NewWire, A unbound (PositivelyDead).
+    #[tokio::test]
+    async fn http_open_turn_rap_then_end_turn_steer_remints_once() {
+        let (st, sid, a) = rcb_setup(vec![]);
+        rcb_open_turn_lost(&st, sid, a).await;
+        let (c, b) = rcb_tool_result(&st, sid, "tc1").await;
+        assert_eq!(c, StatusCode::CONFLICT, "{b}");
+        rcb_end_turn(&st, sid).await;
+        let m0 = count_mints(&st, sid);
+        let u0 = count_user_messages(&st, sid);
+
+        let (c, b) = steer(&st, sid, "next").await;
+        assert_eq!(c, StatusCode::OK, "{b}");
+        assert_eq!(count_mints(&st, sid), m0 + 1, "reminted exactly once");
+        assert_eq!(count_user_messages(&st, sid), u0 + 1);
+        assert_eq!(
+            st.runtime.classify(sid, a).unwrap(),
+            hearth::Liveness::LiveInTurn
+        );
+        assert!(st.runtime.binding_for(sid, a).is_ok(), "A not unbound");
+        let old_log = rrb_runner_log(&st, sid, a, true);
+        assert!(
+            old_log.contains("session/resume"),
+            "resumed child: {old_log}"
+        );
+        assert!(!old_log.contains("session/load") && !old_log.contains("session/new"));
+        assert_eq!(
+            host_old_wire(&st, sid, a),
+            hearth_agent_wire::OldWire::LiveIdle
+        );
+        assert!(rrb_fail_closed_texts(&st, sid, a).is_empty());
+    }
+
+    /// M3 (RAP-classify-before-remint): after M1 + `end-turn`, a new RAP
+    /// tool-call tc2 → tool-result tc2 → 200 applied:true, Trigger 1, +1
+    /// mint, evidence LiveIdle, 0 FailClosed. tc1 stays at one ToolResult
+    /// (no redelivery: parked G3). Tip: 500, Trigger 0, +3 mints.
+    #[tokio::test]
+    async fn http_open_turn_rap_then_end_turn_rap_remints_once() {
+        let (st, sid, a) = rcb_setup(vec![]);
+        rcb_open_turn_lost(&st, sid, a).await;
+        let (c, b) = rcb_tool_result(&st, sid, "tc1").await;
+        assert_eq!(c, StatusCode::CONFLICT, "{b}");
+        rcb_end_turn(&st, sid).await;
+        rcb_tool_call(&st, sid, "tc2").await;
+        let m0 = count_mints(&st, sid);
+
+        let (c, b) = rcb_tool_result(&st, sid, "tc2").await;
+        assert_eq!(c, StatusCode::OK, "{b}");
+        let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+        assert_eq!(v["applied"], true, "{b}");
+        assert_eq!(count_trigger_wakes(&st, sid), 1);
+        assert_eq!(count_mints(&st, sid), m0 + 1, "one remint");
+        assert_eq!(
+            host_old_wire(&st, sid, a),
+            hearth_agent_wire::OldWire::LiveIdle
+        );
+        assert!(rrb_fail_closed_texts(&st, sid, a).is_empty());
+        assert_eq!(count_tool_results(&st, sid, "tc1"), 1);
+        assert_eq!(count_tool_results(&st, sid, "tc2"), 1);
+    }
+
+    /// M5 (RAP-classify-before-remint): steer and RAP on the same M1
+    /// evidence both → 409 with identical zero-wire footprints. Contrast
+    /// (non-empty `["agent-0"]` declaration: own-turn gate) unchanged: 409,
+    /// zero wire action. Tip: steer zero-wire but RAP remints → disagree.
+    #[tokio::test]
+    async fn http_steer_and_rap_open_turn_same_zero_wire_footprint() {
+        for paths_a in [vec![], vec!["agent-0".to_string()]] {
+            let (st, sid, a) = rcb_setup(paths_a.clone());
+            rcb_open_turn_lost(&st, sid, a).await;
+            let fp0 = rcb_footprint(&st, sid, a);
+            let u0 = count_user_messages(&st, sid);
+
+            let (cs, bs) = steer(&st, sid, "contrast").await;
+            assert_eq!(cs, StatusCode::CONFLICT, "{paths_a:?} steer: {bs}");
+            let fp_steer = rcb_footprint(&st, sid, a);
+            assert_eq!(fp_steer, fp0, "{paths_a:?}: steer zero wire action");
+            assert_eq!(count_user_messages(&st, sid), u0);
+
+            let (cr, br) = rcb_tool_result(&st, sid, "tc1").await;
+            assert_eq!(cr, StatusCode::CONFLICT, "{paths_a:?} rap: {br}");
+            let fp_rap = rcb_footprint(&st, sid, a);
+            assert_eq!(fp_rap, fp_steer, "{paths_a:?}: RAP footprint == steer");
+            assert_ne!(rcb_old_exit(&st, sid, a), Some(9), "{paths_a:?}");
+            assert_eq!(count_tool_results(&st, sid, "tc1"), 1);
+            assert_eq!(count_trigger_wakes(&st, sid), 0);
+        }
+    }
 }
