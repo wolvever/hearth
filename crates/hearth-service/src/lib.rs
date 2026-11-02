@@ -5683,6 +5683,232 @@ mod tests {
         );
     }
 
+    // ---- Host-wire-remint-settle (M1–M5) ----
+
+    fn count_mints(st: &AppState, sid: SessionId) -> usize {
+        st.store()
+            .session(sid)
+            .unwrap()
+            .events()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e.body, EventBody::BindingAttached { .. }))
+            .count()
+    }
+
+    fn count_user_messages(st: &AppState, sid: SessionId) -> usize {
+        st.store()
+            .session(sid)
+            .unwrap()
+            .events()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e.body, EventBody::UserMessage { .. }))
+            .count()
+    }
+
+    fn count_fail_closed(st: &AppState, sid: SessionId, agent: hearth::AgentId) -> usize {
+        let wires = st.host_wires.lock().unwrap();
+        wires
+            .get(sid, agent)
+            .unwrap()
+            .remint
+            .observe()
+            .iter()
+            .filter(|e| e.kind == hearth_agent_wire::RemintEventKind::FailClosed)
+            .count()
+    }
+
+    fn host_old_wire(
+        st: &AppState,
+        sid: SessionId,
+        agent: hearth::AgentId,
+    ) -> hearth_agent_wire::OldWire {
+        st.host_wires
+            .lock()
+            .unwrap()
+            .get(sid, agent)
+            .unwrap()
+            .old_wire
+            .clone()
+    }
+
+    async fn steer(st: &AppState, sid: SessionId, msg: &str) -> (StatusCode, String) {
+        let id = sid.0.to_string();
+        call(
+            router(st.clone()),
+            Request::post(format!("/sessions/{id}/events"))
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"user":"cheng","message":"{msg}"}}"#
+                )))
+                .unwrap(),
+        )
+        .await
+    }
+
+    /// Attach a lease to the wake-opened turn, then end it (→ LiveIdle).
+    fn end_wake_turn(st: &AppState, sid: SessionId, agent: hearth::AgentId, holder: &str) {
+        let (_t, fence, _) = st
+            .runtime
+            .begin_turn(sid, agent, hearth::HolderId::new(holder))
+            .expect("lease wake-opened turn");
+        st.runtime
+            .end_turn(sid, holder.into(), fence, false)
+            .unwrap();
+        assert_eq!(
+            st.runtime.classify(sid, agent).unwrap(),
+            hearth::Liveness::LiveIdle
+        );
+    }
+
+    /// M1 (Host-wire-remint-settle): steer #1 remints both lost ParallelSafe
+    /// Agents (+2); after both turns end, steer #2 reuses the live Bindings —
+    /// 200, zero new BindingAttached, Binding ids unchanged, both LiveInTurn,
+    /// exactly one new UserMessage, no FailClosed / unbind.
+    /// Tip mutant (no steer-path settle): 500, +6 mints, both unbound.
+    #[tokio::test]
+    async fn http_steer_after_remint_second_steer_reuses_live_no_mint() {
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let (a, b, _) = install_two_parallel_safe_host_wires(
+            &st,
+            sid,
+            Some(hearth_agent_wire::OldWire::Exited(1)),
+        );
+        let m0 = count_mints(&st, sid);
+        let (c1, b1) = steer(&st, sid, "one").await;
+        assert_eq!(c1, StatusCode::OK, "steer #1 body={b1}");
+        assert_eq!(count_mints(&st, sid), m0 + 2, "steer #1 remints both");
+        let bid_a = st.runtime.binding_for(sid, a).unwrap();
+        let bid_b = st.runtime.binding_for(sid, b).unwrap();
+        end_wake_turn(&st, sid, a, "ha");
+        end_wake_turn(&st, sid, b, "hb");
+        let fc_a = count_fail_closed(&st, sid, a);
+        let fc_b = count_fail_closed(&st, sid, b);
+        let m1 = count_mints(&st, sid);
+        let ums1 = count_user_messages(&st, sid);
+
+        let (c2, b2) = steer(&st, sid, "two").await;
+        assert_eq!(
+            c2,
+            StatusCode::OK,
+            "steer #2 must reuse live; body={b2} mints+={} bind_a={:?} bind_b={:?}",
+            count_mints(&st, sid) - m1,
+            st.runtime.binding_for(sid, a).map(|x| x == bid_a),
+            st.runtime.binding_for(sid, b).map(|x| x == bid_b),
+        );
+        assert!(b2.contains("two"), "body={b2}");
+        assert_eq!(
+            count_mints(&st, sid),
+            m1,
+            "steer #2: zero new BindingAttached"
+        );
+        assert_eq!(
+            st.runtime.binding_for(sid, a).unwrap(),
+            bid_a,
+            "A Binding kept"
+        );
+        assert_eq!(
+            st.runtime.binding_for(sid, b).unwrap(),
+            bid_b,
+            "B Binding kept"
+        );
+        for ag in [a, b] {
+            assert_eq!(
+                st.runtime.classify(sid, ag).unwrap(),
+                hearth::Liveness::LiveInTurn
+            );
+        }
+        assert_eq!(
+            count_user_messages(&st, sid),
+            ums1 + 1,
+            "one new UserMessage"
+        );
+        assert_eq!(count_fail_closed(&st, sid, a), fc_a, "no FailClosed A");
+        assert_eq!(count_fail_closed(&st, sid, b), fc_b, "no FailClosed B");
+    }
+
+    /// M2 (Host-wire-remint-settle): steer remints A; A ends its turn; RAP
+    /// tool-call → tool-result → 200 Applied + single-Agent Trigger + A
+    /// LiveInTurn with zero mints and A's Binding unchanged; peer B untouched.
+    /// Tip mutant: 500, +1 mint, A's live Binding replaced.
+    #[tokio::test]
+    async fn http_rap_after_steer_remint_tool_result_reuses_live_no_mint() {
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let id = sid.0.to_string();
+        let (a, b, _) = install_two_parallel_safe_host_wires(
+            &st,
+            sid,
+            Some(hearth_agent_wire::OldWire::Exited(1)),
+        );
+        let m0 = count_mints(&st, sid);
+        let (c1, b1) = steer(&st, sid, "one").await;
+        assert_eq!(c1, StatusCode::OK, "steer body={b1}");
+        assert_eq!(count_mints(&st, sid), m0 + 2);
+        let bid_a = st.runtime.binding_for(sid, a).unwrap();
+        let bid_b = st.runtime.binding_for(sid, b).unwrap();
+        let turn_b = session.current_turn_of(b).unwrap();
+        assert!(turn_b.is_some(), "B LiveInTurn from steer");
+        end_wake_turn(&st, sid, a, "ha");
+        let m1 = count_mints(&st, sid);
+        let triggers0 = count_trigger_wakes(&st, sid);
+
+        let app = router(st.clone());
+        let (c2, b2) = call(
+            app.clone(),
+            Request::post(format!("/sessions/{id}/agents/alpha/tool-call"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"name":"settle","tool_call_id":"tc-settle"}"#,
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(c2, StatusCode::OK, "tool-call body={b2}");
+        let (c3, b3) = call(
+            app,
+            Request::post(format!("/sessions/{id}/agents/alpha/tool-result"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"tool_call_id":"tc-settle","output":"ok"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            c3,
+            StatusCode::OK,
+            "tool-result must reuse live; body={b3} mints+={} bind_a_kept={:?}",
+            count_mints(&st, sid) - m1,
+            st.runtime.binding_for(sid, a).map(|x| x == bid_a),
+        );
+        assert!(b3.contains(r#""applied":true"#), "body={b3}");
+        assert_eq!(
+            count_trigger_wakes(&st, sid),
+            triggers0 + 1,
+            "single Trigger"
+        );
+        assert_eq!(
+            st.runtime.classify(sid, a).unwrap(),
+            hearth::Liveness::LiveInTurn
+        );
+        assert_eq!(count_mints(&st, sid), m1, "RAP after steer remint: 0 mints");
+        assert_eq!(
+            st.runtime.binding_for(sid, a).unwrap(),
+            bid_a,
+            "A Binding kept"
+        );
+        // Peer B untouched.
+        assert_eq!(st.runtime.binding_for(sid, b).unwrap(), bid_b);
+        assert_eq!(session.current_turn_of(b).unwrap(), turn_b);
+        assert_eq!(
+            st.runtime.classify(sid, b).unwrap(),
+            hearth::Liveness::LiveInTurn
+        );
+    }
+
     #[allow(clippy::result_large_err)] // tungstenite::Error is upstream; test-only helper
     async fn expect_text(
         ws: &mut (impl StreamExt<Item = Result<WsMsg, tokio_tungstenite::tungstenite::Error>> + Unpin),
