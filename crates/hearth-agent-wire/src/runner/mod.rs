@@ -895,6 +895,8 @@ pub struct WakeThroughHostArgs<'a> {
 /// Production Host wake: splice [`hearth::Runtime`] through [`host_wake`].
 ///
 /// Order (load-bearing):
+/// 0. [`hearth::Runtime::admit_wake`] (non-member / unknown `UserQuery` →
+///    typed error, zero wire action), then the parallel-safe gate.
 /// 1. [`host_wake`] — proven-lost remints once via [`host_remint_full_path`];
 ///    live → [`HostWake::ReuseLive`]; unknown → [`HostWake::Waiting`].
 /// 2. On Reminted / ReuseLive → [`hearth::Runtime::wake_with`]
@@ -924,6 +926,8 @@ pub fn wake_through_host_wake(
     } = args;
     // The wire's Host Agent picks the kept recipe: waking A never uses B's.
     let agent = remint.session.host_agent_id();
+    // Waker admit first: a refused UserQuery is zero wire action.
+    runtime.admit_wake(session_id, &wake)?;
     // Parallel-safe conflict gate before any wire action.
     match runtime.check_turn_gate(session_id, agent) {
         Err(hearth::Error::Waiting(reason)) => return Ok(WakeThroughHost::Waiting(reason)),
@@ -1572,6 +1576,11 @@ fn host_wake_with_limited_remint_retry(
 ///
 /// Closes the #56 Soft residual (Host was per-Agent `wake_through_host_wake`
 /// / first-only). Order (load-bearing):
+/// 0. [`hearth::Runtime::admit_wake`] once: a `UserQuery` from an unknown
+///    user or a non-member of this Session → that typed error (HTTP 404 /
+///    403) with **zero** wire action on every Agent — no classify, gate,
+///    kill, remint, FailClosed or unbind (Waker-admit-before-wire).
+///    `Timer` / `Trigger` admit unconditionally.
 /// 1. For each kept Agent in keep order:
 ///    - No [`KeptWakeWire`] / Host Agent mismatch → skip (no wire evidence).
 ///    - Read-only [`hearth::Runtime::classify`]: `LiveInTurn` / `Unknown` →
@@ -1611,6 +1620,10 @@ pub fn wake_each_kept_through_host_wake(
     if agents.is_empty() {
         return Err(hearth::Error::NotKept(session_id).into());
     }
+    // Waker-admit-before-wire: refuse a non-member / unknown UserQuery
+    // before any classify / gate / host_wake (kill, remint, FailClosed,
+    // unbind) on any Agent. Timer / Trigger admit unconditionally.
+    runtime.admit_wake(session_id, &wake)?;
 
     let mut hosts: Vec<(hearth::AgentId, HostWake)> = Vec::new();
     let mut first_wait: Option<hearth::WaitReason> = None;

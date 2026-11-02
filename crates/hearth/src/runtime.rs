@@ -382,6 +382,18 @@ impl Runtime {
         Ok(())
     }
 
+    /// Read-only waker admission (Waker-admit-before-wire): a
+    /// [`Wake::UserQuery`] whose user is unknown or not a member of
+    /// `session` is refused ([`Error::UnknownUser`] / [`Error::NotMember`])
+    /// **before** any classify, gate, claim or wire action. `Timer` /
+    /// `Trigger` admit unconditionally. Wire seams call this first, so a
+    /// refused waker costs zero wire action; [`Self::wake_with`] and
+    /// [`Self::wake_each_kept_only_with`] run the same check before any
+    /// claim. `record_wake` still rechecks (it is the write).
+    pub fn admit_wake(&self, session: SessionId, wake: &Wake) -> Result<()> {
+        admit_wake_on(&self.store.session(session)?, wake)
+    }
+
     /// Read-only conflict gate for a new turn of kept `agent` with its
     /// declaration ([`Self::set_parallel_safe`]; [`Session::check_turn_gate`]).
     /// Wire seams call this before `host_wake` so a refused turn costs
@@ -501,6 +513,9 @@ impl Runtime {
         let decl = self.kept_parallel_safe(session, agent)?;
         let sess = self.store.session(session)?;
         let start_len = sess.events()?.len();
+        // Waker admit before classify / gate / claim (no claim for a
+        // refused waker).
+        admit_wake_on(&sess, &wake)?;
         ensure_agent_member(&sess, agent)?;
 
         let needs_claim = needs_claim(classify_session(&sess, agent)?)?;
@@ -583,6 +598,8 @@ impl Runtime {
         };
         let sess = self.store.session(session)?;
         let start_len = sess.events()?.len();
+        // Waker admit before any Agent's classify / gate / claim.
+        admit_wake_on(&sess, &wake)?;
 
         // Keep order: classify / gate / claim / turn_start per Agent, like
         // [`Self::wake`], but the wake record is shared. Re-check the gate
@@ -1117,6 +1134,15 @@ fn needs_claim(l: Liveness) -> Result<bool> {
         Liveness::Unknown => Err(Error::Waiting(WaitReason::LivenessUnknown)),
         Liveness::LiveIdle => Ok(false),
         Liveness::NeverBound | Liveness::PositivelyDead => Ok(true),
+    }
+}
+
+/// [`Runtime::admit_wake`]: `UserQuery` → joined member of `session`;
+/// `Timer` / `Trigger` always admitted.
+fn admit_wake_on(session: &Session, wake: &Wake) -> Result<()> {
+    match wake {
+        Wake::UserQuery { user, .. } => session.require_user(*user),
+        Wake::Timer | Wake::Trigger { .. } => Ok(()),
     }
 }
 
