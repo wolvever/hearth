@@ -531,10 +531,10 @@ impl Runtime {
     /// gate concurrent turns; without them only the first ready Agent fires.
     ///
     /// Production wire Host: `wake_each_kept_through_host_wake` runs
-    /// `host_wake` per kept Agent, then [`Self::wake_each_kept_with`]
-    /// [`AlreadyBound`] — never [`ClaimBinding`] on the same path as
-    /// `host_wake`. Claim [`Error::Waiting`] (e.g. no Binding after a
-    /// skipped host_wake) skips that Agent without aborting the fan-out.
+    /// `host_wake` per kept Agent, then [`Self::wake_each_kept_only_with`]
+    /// [`AlreadyBound`] over only the Agents `host_wake` admitted — never
+    /// [`ClaimBinding`] on the same path as `host_wake`, and never a TurnStart
+    /// for an Agent the Host skipped (Host-fanout-wire-wins).
     pub fn wake_each_kept(
         &self,
         session: SessionId,
@@ -548,6 +548,27 @@ impl Runtime {
     pub fn wake_each_kept_with<C: WakeClaim>(
         &self,
         session: SessionId,
+        wake: Wake,
+        claim: &mut C,
+    ) -> Result<Vec<(AgentId, Vec<Event>)>> {
+        self.wake_each_kept_only_with(session, None, wake, claim)
+    }
+
+    /// [`Self::wake_each_kept_with`] restricted to `only` (keep order kept).
+    ///
+    /// `None` → every kept Agent (kernel / Goose path, unchanged).
+    /// `Some(admitted)` → Agents not in `admitted` get **zero** Runtime
+    /// writes: no classify-driven claim, no TurnStart, and they do not
+    /// count toward the shared wake record. Host-fanout-wire-wins: the
+    /// production wire Host passes only the Agents `host_wake` admitted
+    /// (Reminted / ReuseLive) this call, so a skipped Agent whose kernel
+    /// Binding is still live never gets a ghost turn. An empty `admitted`
+    /// set returns [`Error::Waiting`] and appends nothing. The gate re-check
+    /// after each `turn_start` (#56) applies among the admitted Agents.
+    pub fn wake_each_kept_only_with<C: WakeClaim>(
+        &self,
+        session: SessionId,
+        only: Option<&[AgentId]>,
         wake: Wake,
         claim: &mut C,
     ) -> Result<Vec<(AgentId, Vec<Event>)>> {
@@ -573,6 +594,9 @@ impl Runtime {
         let mut wake_recorded = false;
         let mut first_wait: Option<WaitReason> = None;
         for (agent, host, decl) in recipes {
+            if only.is_some_and(|only| !only.contains(&agent)) {
+                continue;
+            }
             ensure_agent_member(&sess, agent)?;
             let needs = match needs_claim(classify_session(&sess, agent)?) {
                 Ok(needs) => needs,
@@ -2746,6 +2770,70 @@ mod tests {
         // B never claimed: still NeverBound (first-ready skip, not a borrowed
         // recipe — B's recipe stays B's when it later wakes alone).
         assert_eq!(rt.classify(sid, b.id).unwrap(), Liveness::NeverBound);
+    }
+
+    /// Host-fanout-wire-wins seam: `wake_each_kept_only_with(Some(&[a]))`
+    /// with both Agents bound LiveIdle → only A turns; B (live Binding, not
+    /// admitted) gets zero writes (no TurnStart, Binding unchanged). Empty
+    /// admitted set → Waiting, nothing appended. `None` is the kernel path
+    /// (every kept Agent).
+    #[test]
+    fn wake_each_kept_only_with_skips_unadmitted_live_agent() {
+        let rt = Runtime::new();
+        let a = rt.store().create_agent("a", "");
+        let b = rt.store().create_agent("b", "");
+        let user = rt.store().create_user("cheng");
+        let session = rt.create_session();
+        let sid = session.id();
+        session.join(Member::User(user.id)).unwrap();
+        session.join(Member::Agent(a.id)).unwrap();
+        session.join(Member::Agent(b.id)).unwrap();
+        session.rebind(None, a.id, goose()).unwrap();
+        session.rebind(None, b.id, codex()).unwrap();
+        rt.keep(sid, a.id, goose()).unwrap();
+        rt.keep(sid, b.id, codex()).unwrap();
+        opt_in(&rt, sid, &[a.id, b.id]);
+        assert_eq!(rt.classify(sid, b.id).unwrap(), Liveness::LiveIdle);
+        let bid_b = rt.binding_for(sid, b.id).unwrap();
+        let q = |text: &str| Wake::UserQuery {
+            user: user.id,
+            text: text.into(),
+        };
+
+        // Empty admitted set: Waiting, log unchanged.
+        let len0 = session.events().unwrap().len();
+        assert!(matches!(
+            rt.wake_each_kept_only_with(sid, Some(&[]), q("none"), &mut AlreadyBound),
+            Err(Error::Waiting(_))
+        ));
+        assert_eq!(
+            session.events().unwrap().len(),
+            len0,
+            "empty admitted appends nothing"
+        );
+
+        let woke = rt
+            .wake_each_kept_only_with(sid, Some(&[a.id]), q("only-a"), &mut AlreadyBound)
+            .unwrap();
+        let who: Vec<_> = woke.iter().map(|(ag, _)| *ag).collect();
+        assert_eq!(who, vec![a.id], "B live but not admitted → no TurnStart");
+        assert!(session.current_turn_of(b.id).unwrap().is_none());
+        assert_eq!(rt.classify(sid, b.id).unwrap(), Liveness::LiveIdle);
+        assert_eq!(rt.binding_for(sid, b.id).unwrap(), bid_b);
+        let ums = session
+            .events()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e.body, EventBody::UserMessage { .. }))
+            .count();
+        assert_eq!(ums, 1, "one shared wake record for the admitted set");
+
+        // `None` (kernel path) still reaches every ready kept Agent.
+        let woke = rt
+            .wake_each_kept_only_with(sid, None, q("all"), &mut AlreadyBound)
+            .unwrap();
+        let who: Vec<_> = woke.iter().map(|(ag, _)| *ag).collect();
+        assert_eq!(who, vec![b.id], "A busy; B now woken via None");
     }
 
     /// Claim-before-record (closes #56 Soft Should M7): Host `AlreadyBound` +
