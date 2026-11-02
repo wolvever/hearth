@@ -7225,4 +7225,317 @@ mod tests {
         }
         assert_eq!(fww_turn_starts(&st, ksid), ks);
     }
+
+    // ---- RAP-remint-retry-budget (M1–M5) ----
+
+    /// Resume-capable Fake new wire whose first `fail` stdin writes fail
+    /// (transient `RemintError::NewWire`).
+    fn rrb_flaky_new_wire(fail: usize) -> hearth_agent_wire::AttachRunner {
+        let init = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": { "protocolVersion": 1,
+                "agentCapabilities": { "session": { "resume": true, "cancel": true, "close": true } } }
+        });
+        hearth_agent_wire::AttachRunner::spawn_fake_with_stdin_failures(
+            hearth_agent_wire::WireKind::JsonlRpc,
+            hearth_agent_wire::JsonlRpcTransport::encode_jsonl(&init).unwrap(),
+            fail,
+        )
+    }
+
+    fn rrb_set_new_wire(
+        st: &AppState,
+        sid: SessionId,
+        agent: hearth::AgentId,
+        new: hearth_agent_wire::AttachRunner,
+    ) {
+        let sw = session_wires_arc(st, sid);
+        let mut wires = sw.lock().unwrap();
+        wires.get_mut(agent).unwrap().new = new;
+    }
+
+    async fn rrb_tool_result(st: &AppState, sid: SessionId, tc: &str) -> (StatusCode, String) {
+        let id = sid.0.to_string();
+        call(
+            router(st.clone()),
+            Request::post(format!("/sessions/{id}/agents/alpha/tool-result"))
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"tool_call_id":"{tc}","output":"o"}}"#
+                )))
+                .unwrap(),
+        )
+        .await
+    }
+
+    fn rrb_runner_log(st: &AppState, sid: SessionId, agent: hearth::AgentId, old: bool) -> String {
+        let sw = session_wires_arc(st, sid);
+        let wires = sw.lock().unwrap();
+        let w = wires.get(agent).unwrap();
+        let r = if old { &w.old } else { &w.new };
+        String::from_utf8_lossy(r.stdin_log().unwrap_or_default()).into_owned()
+    }
+
+    fn rrb_fail_closed_texts(st: &AppState, sid: SessionId, agent: hearth::AgentId) -> Vec<String> {
+        let sw = session_wires_arc(st, sid);
+        let wires = sw.lock().unwrap();
+        wires
+            .get(agent)
+            .unwrap()
+            .remint
+            .observe()
+            .iter()
+            .filter(|e| e.kind == hearth_agent_wire::RemintEventKind::FailClosed)
+            .map(|e| e.text.clone())
+            .collect()
+    }
+
+    /// M1 (RAP-remint-retry-budget): A's wire `Exited(1)`, resume-capable;
+    /// A's new wire fails its first stdin write once. POST tool-result →
+    /// 200 applied:true, 1 ToolResult, 1 Trigger, A LiveInTurn, evidence
+    /// settled LiveIdle, resumed child (`old` after swap) has session/resume
+    /// (no load/new). Re-POST → applied:false, still 1 Trigger.
+    /// Tip (single-shot host_wake): 500 with the ToolResult appended,
+    /// Trigger 0; every RAP-spec retry applied:false → Trigger lost.
+    #[tokio::test]
+    async fn http_tool_result_transient_new_wire_retries_then_triggers() {
+        let st = AppState::new(vec![]);
+        let sid = st.store().create_session().id();
+        let (a, b, _) = install_two_parallel_safe_host_wires(
+            &st,
+            sid,
+            Some(hearth_agent_wire::OldWire::Exited(1)),
+        );
+        rrb_set_new_wire(&st, sid, a, rrb_flaky_new_wire(1));
+        record_host_tool_call(&st, sid, a, "tc-rrb1", "t");
+        let m0 = count_mints(&st, sid);
+
+        let (code, body) = rrb_tool_result(&st, sid, "tc-rrb1").await;
+        assert_eq!(code, StatusCode::OK, "body={body}");
+        assert!(body.contains(r#""applied":true"#), "body={body}");
+        assert_eq!(count_tool_results(&st, sid, "tc-rrb1"), 1);
+        assert_eq!(count_trigger_wakes(&st, sid), 1, "Trigger recorded");
+        assert_eq!(
+            st.runtime.classify(sid, a).unwrap(),
+            hearth::Liveness::LiveInTurn
+        );
+        assert_eq!(
+            host_old_wire(&st, sid, a),
+            hearth_agent_wire::OldWire::LiveIdle,
+            "#84 settle on Applied"
+        );
+        assert!(count_mints(&st, sid) > m0, "A reminted");
+        let raw = rrb_runner_log(&st, sid, a, true);
+        assert!(raw.contains("session/resume"), "resumed child: {raw}");
+        assert!(
+            !raw.contains("session/load") && !raw.contains("session/new"),
+            "no load/new: {raw}"
+        );
+        assert!(
+            rrb_fail_closed_texts(&st, sid, a).is_empty(),
+            "within budget: no FailClosed"
+        );
+        // Peer B untouched (single-Agent path, never fan-out).
+        assert_eq!(
+            host_old_wire(&st, sid, b),
+            hearth_agent_wire::OldWire::Exited(1)
+        );
+
+        let (code2, body2) = rrb_tool_result(&st, sid, "tc-rrb1").await;
+        assert_eq!(code2, StatusCode::OK, "body={body2}");
+        assert!(body2.contains(r#""applied":false"#), "body={body2}");
+        assert_eq!(count_tool_results(&st, sid, "tc-rrb1"), 1);
+        assert_eq!(count_trigger_wakes(&st, sid), 1, "still 1 Trigger");
+    }
+
+    /// M3 (RAP-remint-retry-budget): new wire fails
+    /// `HOST_WAKE_REMINT_RETRY_BUDGET + 1` writes → typed Remint(NewWire) /
+    /// HTTP 500; exactly one FailClosed `NewWire`; no successful resume;
+    /// ToolResult 1 / Trigger 0 (honest M8); A **not** unbound by the RAP
+    /// path; peer B Binding / evidence / lease / fence unchanged.
+    /// Kills: unbounded retry, FailClosed per attempt, reused fan-out unbind.
+    #[tokio::test]
+    async fn http_tool_result_new_wire_retry_exhausted_fail_closed_once() {
+        let st = AppState::new(vec![]);
+        let sid = st.store().create_session().id();
+        let (a, b, _) = install_two_parallel_safe_host_wires(
+            &st,
+            sid,
+            Some(hearth_agent_wire::OldWire::Exited(1)),
+        );
+        rrb_set_new_wire(
+            &st,
+            sid,
+            a,
+            rrb_flaky_new_wire(hearth_agent_wire::HOST_WAKE_REMINT_RETRY_BUDGET as usize + 1),
+        );
+        record_host_tool_call(&st, sid, a, "tc-rrb3", "t");
+        let session = st.store().session(sid).unwrap();
+        let bid_b = st.runtime.binding_for(sid, b).unwrap();
+        let lease_b = format!("{:?}", st.runtime.turn_lease_of(sid, b));
+        let fence_b = format!("{:?}", session.turn_fence_of(b));
+
+        let (code, body) = rrb_tool_result(&st, sid, "tc-rrb3").await;
+        assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR, "body={body}");
+        assert_eq!(
+            rrb_fail_closed_texts(&st, sid, a),
+            vec!["NewWire".to_string()],
+            "exactly one FailClosed NewWire on exhaust"
+        );
+        let new_raw = rrb_runner_log(&st, sid, a, false);
+        assert!(
+            !new_raw.contains("session/resume"),
+            "exhausted: no successful resume: {new_raw}"
+        );
+        assert_eq!(count_tool_results(&st, sid, "tc-rrb3"), 1, "M8: appended");
+        assert_eq!(count_trigger_wakes(&st, sid), 0, "M8: no Trigger");
+        assert!(
+            st.runtime.binding_for(sid, a).is_ok(),
+            "RAP exhaust must not unbind A (no fan-out unbind)"
+        );
+        assert!(session.current_turn_of(a).unwrap().is_none());
+        assert_eq!(st.runtime.binding_for(sid, b).unwrap(), bid_b);
+        assert_eq!(format!("{:?}", st.runtime.turn_lease_of(sid, b)), lease_b);
+        assert_eq!(format!("{:?}", session.turn_fence_of(b)), fence_b);
+        assert_eq!(
+            host_old_wire(&st, sid, b),
+            hearth_agent_wire::OldWire::Exited(1)
+        );
+        assert!(session.current_turn_of(b).unwrap().is_none());
+    }
+
+    /// M4 (RAP-remint-retry-budget): caps refuse and no-place never retry.
+    /// (1) resume:false caps + Exited → typed 500, FailClosed once, no new
+    /// wire writes / spawn / mint. (2) ResumeNoPlace → typed 500, no FailClosed
+    /// added, old child not killed (place check before kill), no mint.
+    /// Kills "retry every RemintError".
+    #[tokio::test]
+    async fn http_tool_result_caps_refuse_and_no_place_never_retry() {
+        // (1) caps no-resume.
+        let st = AppState::new(vec![]);
+        let sid = st.store().create_session().id();
+        let caps = hearth_agent_wire::LiveCaps {
+            resume: false,
+            load_session: false,
+            cancel: true,
+            close: true,
+        };
+        let (a, _b, _) = install_two_parallel_safe_host_wires_with_caps(
+            &st,
+            sid,
+            Some(hearth_agent_wire::OldWire::Exited(1)),
+            caps,
+        );
+        record_host_tool_call(&st, sid, a, "tc-rrb4c", "t");
+        let m0 = count_mints(&st, sid);
+        let (code, body) = rrb_tool_result(&st, sid, "tc-rrb4c").await;
+        assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR, "body={body}");
+        assert_eq!(
+            rrb_fail_closed_texts(&st, sid, a),
+            vec!["ResumeNotSupported".to_string()],
+            "caps refuse: one attempt, FailClosed once"
+        );
+        assert!(
+            rrb_runner_log(&st, sid, a, false).is_empty(),
+            "no new-wire writes after caps refuse"
+        );
+        assert_eq!(count_mints(&st, sid), m0, "no mint on caps refuse");
+        assert_eq!(count_tool_results(&st, sid, "tc-rrb4c"), 1);
+        assert_eq!(count_trigger_wakes(&st, sid), 0);
+
+        // (2) ResumeNoPlace.
+        let st = AppState::new(vec![]);
+        let sid = st.store().create_session().id();
+        let (a, _b, _) = install_two_parallel_safe_host_wires(
+            &st,
+            sid,
+            Some(hearth_agent_wire::OldWire::Exited(1)),
+        );
+        {
+            let sw = session_wires_arc(&st, sid);
+            let mut wires = sw.lock().unwrap();
+            wires.get_mut(a).unwrap().place = None;
+        }
+        record_host_tool_call(&st, sid, a, "tc-rrb4p", "t");
+        let m0 = count_mints(&st, sid);
+        let fc0 = rrb_fail_closed_texts(&st, sid, a);
+        let (code, body) = rrb_tool_result(&st, sid, "tc-rrb4p").await;
+        assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR, "body={body}");
+        assert_eq!(
+            rrb_fail_closed_texts(&st, sid, a),
+            fc0,
+            "no-place: no retry-exhaust FailClosed"
+        );
+        assert!(rrb_runner_log(&st, sid, a, false).is_empty(), "no new wire");
+        assert_eq!(count_mints(&st, sid), m0, "no mint on no-place");
+        {
+            let sw = session_wires_arc(&st, sid);
+            let mut wires = sw.lock().unwrap();
+            let w = wires.get_mut(a).unwrap();
+            // Fake child may exit on its own (0); killed+reaped would be 9.
+            assert_ne!(w.old.try_wait().unwrap(), Some(9), "old child not killed");
+        }
+        assert_eq!(count_tool_results(&st, sid, "tc-rrb4p"), 1);
+        assert_eq!(count_trigger_wakes(&st, sid), 0);
+    }
+
+    /// M5 (RAP-remint-retry-budget): steer and RAP agree on the same wire
+    /// evidence + one-time transient NewWire: both end Woke/Applied, with the
+    /// same attempt footprint on A's resumed wire (initialize + resume) and
+    /// no FailClosed. Tip: steer 200, RAP 500 (parity broken).
+    #[tokio::test]
+    async fn http_steer_and_rap_same_transient_both_remint() {
+        // Steer.
+        let st_s = AppState::new(vec![]);
+        let sid_s = st_s.store().create_session().id();
+        let (a_s, _, _) = install_two_parallel_safe_host_wires(
+            &st_s,
+            sid_s,
+            Some(hearth_agent_wire::OldWire::Exited(1)),
+        );
+        rrb_set_new_wire(&st_s, sid_s, a_s, rrb_flaky_new_wire(1));
+        let (cs, bs) = steer(&st_s, sid_s, "rrb-steer").await;
+        assert_eq!(cs, StatusCode::OK, "steer body={bs}");
+        assert_eq!(
+            st_s.runtime.classify(sid_s, a_s).unwrap(),
+            hearth::Liveness::LiveInTurn
+        );
+
+        // RAP.
+        let st_r = AppState::new(vec![]);
+        let sid_r = st_r.store().create_session().id();
+        let (a_r, _, _) = install_two_parallel_safe_host_wires(
+            &st_r,
+            sid_r,
+            Some(hearth_agent_wire::OldWire::Exited(1)),
+        );
+        rrb_set_new_wire(&st_r, sid_r, a_r, rrb_flaky_new_wire(1));
+        record_host_tool_call(&st_r, sid_r, a_r, "tc-rrb5", "t");
+        let (cr, br) = rrb_tool_result(&st_r, sid_r, "tc-rrb5").await;
+        assert_eq!(cr, StatusCode::OK, "RAP body={br}");
+        assert!(br.contains(r#""applied":true"#), "RAP body={br}");
+        assert_eq!(count_trigger_wakes(&st_r, sid_r), 1);
+        assert_eq!(
+            st_r.runtime.classify(sid_r, a_r).unwrap(),
+            hearth::Liveness::LiveInTurn
+        );
+
+        // Same footprint on A's resumed (settled → `old`) wire.
+        let ls = rrb_runner_log(&st_s, sid_s, a_s, true);
+        let lr = rrb_runner_log(&st_r, sid_r, a_r, true);
+        for m in ["\"initialize\"", "session/resume"] {
+            assert_eq!(
+                ls.matches(m).count(),
+                lr.matches(m).count(),
+                "{m} parity: steer={ls} rap={lr}"
+            );
+        }
+        assert_eq!(lr.matches("session/resume").count(), 1, "{lr}");
+        assert_eq!(
+            host_old_wire(&st_s, sid_s, a_s),
+            host_old_wire(&st_r, sid_r, a_r)
+        );
+        assert!(rrb_fail_closed_texts(&st_s, sid_s, a_s).is_empty());
+        assert!(rrb_fail_closed_texts(&st_r, sid_r, a_r).is_empty());
+    }
 }

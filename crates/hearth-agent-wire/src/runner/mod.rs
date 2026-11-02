@@ -7423,4 +7423,92 @@ mod tests {
         assert!(new.stdin_log().unwrap().is_empty());
         assert_ne!(old.try_wait().unwrap(), Some(9));
     }
+
+    // ---- RAP-remint-retry-budget ----
+
+    /// M2 (RAP-remint-retry-budget): wire-level `complete_host_tool` on a
+    /// resume-capable lost wire whose new wire fails its first stdin write
+    /// once (transient `NewWire`) retries within
+    /// [`HOST_WAKE_REMINT_RETRY_BUDGET`] — same law as the steer fan-out —
+    /// and records the `tool_result` Trigger. Tip single-shot `host_wake`
+    /// returned `Remint(NewWire)` with the ToolResult already appended;
+    /// "retry only in Service" (wire stays single-shot) also fails here.
+    #[test]
+    fn complete_host_tool_transient_new_wire_retries_within_budget() {
+        let (rt, sid, _uid, remint, place) = shared_runtime_remint();
+        let agent = remint.host_agent_id();
+        rt.store()
+            .session(sid)
+            .unwrap()
+            .append(hearth::EventBody::ToolCall {
+                agent,
+                tool_call_id: "tc-rrb".into(),
+                name: "t".into(),
+                input: "{}".into(),
+                parent_tool_call_id: None,
+            })
+            .expect("host ToolCall");
+        let mut old = initialized_fake(Vec::new());
+        let mut new = new_wire_fake_with_stdin_failures(1);
+        let mut transport = transport_for_wire(WireKind::JsonlRpc);
+        let (mut old_next, mut new_next) = (10u64, 2u64);
+        let r = complete_host_tool(
+            &mut old,
+            &mut new,
+            &mut transport,
+            CompleteHostToolArgs {
+                runtime: &rt,
+                session_id: sid,
+                agent,
+                tool_call_id: "tc-rrb",
+                output: "o",
+                old_wire: OldWire::Exited(1),
+                remint: HostRemintFullArgs {
+                    session: &remint,
+                    place: Some(&place),
+                    mcp_servers: &[],
+                    init_rpc_id: &RpcId::Num(1),
+                    old_next_rpc_id: &mut old_next,
+                    new_next_rpc_id: &mut new_next,
+                },
+            },
+        )
+        .expect("transient NewWire must retry within budget, not Err");
+        let CompleteHostTool::Applied {
+            tool_result,
+            host,
+            wake_events,
+        } = r
+        else {
+            panic!("expected Applied, got {r:?}");
+        };
+        assert!(matches!(host, HostWake::Reminted(_)), "host={host:?}");
+        assert!(matches!(
+            &tool_result.body,
+            hearth::EventBody::ToolResult { tool_call_id, .. } if tool_call_id == "tc-rrb"
+        ));
+        assert!(
+            wake_events.iter().any(|e| matches!(
+                &e.body,
+                hearth::EventBody::Wake {
+                    source: hearth::WakeSource::Trigger { name }
+                } if name == "tool_result"
+            )),
+            "Trigger recorded: {wake_events:?}"
+        );
+        assert!(wake_events
+            .iter()
+            .any(|e| matches!(&e.body, hearth::EventBody::TurnStart { agent: a } if *a == agent)));
+        let raw = std::str::from_utf8(new.stdin_log().unwrap()).unwrap();
+        assert!(raw.contains("session/resume"), "retry reminted: {raw}");
+        assert!(!raw.contains("session/load") && !raw.contains("session/new"));
+        assert!(
+            !remint
+                .observe()
+                .iter()
+                .any(|e| e.kind == RemintEventKind::FailClosed),
+            "within budget: no FailClosed: {:?}",
+            remint.observe()
+        );
+    }
 }
