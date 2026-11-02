@@ -6808,4 +6808,421 @@ mod tests {
             .unwrap_or(0);
         (code, rest.to_string())
     }
+
+    // ── Host-fanout-wire-wins ───────────────────────────────────────────
+    // The Host steer fan-out turn_starts only Agents admitted by host_wake
+    // THIS call (Reminted / ReuseLive). Skipped Agents (no wire, mismatch,
+    // classify / gate skip, host_wake Waiting) get zero Runtime writes even
+    // when their kernel Binding is live. Never unbind on Waiting.
+
+    fn fww_mints(st: &AppState, sid: SessionId) -> usize {
+        st.store()
+            .session(sid)
+            .unwrap()
+            .events()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e.body, EventBody::BindingAttached { .. }))
+            .count()
+    }
+
+    fn fww_user_messages(st: &AppState, sid: SessionId) -> usize {
+        st.store()
+            .session(sid)
+            .unwrap()
+            .events()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e.body, EventBody::UserMessage { .. }))
+            .count()
+    }
+
+    /// Agents of every TurnStart on the log, in log order.
+    fn fww_turn_starts(st: &AppState, sid: SessionId) -> Vec<hearth::AgentId> {
+        st.store()
+            .session(sid)
+            .unwrap()
+            .events()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e.body {
+                EventBody::TurnStart { agent } => Some(agent),
+                _ => None,
+            })
+            .collect()
+    }
+
+    async fn fww_steer(st: &AppState, sid: SessionId, msg: &str) -> (StatusCode, String) {
+        let id = sid.0.to_string();
+        call(
+            router(st.clone()),
+            Request::post(format!("/sessions/{id}/events"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "user": "cheng", "message": msg }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+    }
+
+    /// Two ParallelSafe Agents, both Host-bound (kernel LiveIdle), but only
+    /// A gets its own wire installed. Returns (a, b, place, cheng).
+    fn fww_install_two_bound_only_a_wired(
+        st: &AppState,
+        sid: SessionId,
+    ) -> (
+        hearth::AgentId,
+        hearth::AgentId,
+        hearth::Place,
+        hearth::UserId,
+    ) {
+        use hearth::{Host, PlaceAttach};
+        use hearth_agent_wire::RemintSession;
+
+        apply_join(st, sid, Some("cheng".into()), None, None).unwrap();
+        apply_join(
+            st,
+            sid,
+            None,
+            Some("alpha".into()),
+            Some(vec!["agent-0".into()]),
+        )
+        .unwrap();
+        apply_join(
+            st,
+            sid,
+            None,
+            Some("beta".into()),
+            Some(vec!["agent-1".into()]),
+        )
+        .unwrap();
+        let agents = st.runtime.kept_agents(sid);
+        let (a, b) = (agents[0], agents[1]);
+        let session = st.store().session(sid).unwrap();
+        let place = hearth::Place::local_dir(
+            std::env::temp_dir().to_string_lossy().as_ref(),
+            PlaceAttach::MustExist,
+        );
+        session.attach_place(place.clone()).unwrap();
+        let uid = *st.names.lock().unwrap().users.get("cheng").unwrap();
+        for (ag, resume_id) in [(a, "S-a"), (b, "S-b")] {
+            session
+                .rebind(
+                    None,
+                    ag,
+                    Host::from_bind("acp", Some(resume_id.into()), None),
+                )
+                .unwrap();
+        }
+        let remint_a =
+            RemintSession::on_host_session(session.clone(), a, uid, "S-a", resume_capable_caps())
+                .expect("remint A");
+        st.install_host_wire(
+            sid,
+            a,
+            AgentHostWire::fake_live(remint_a, Some(place.clone())),
+        )
+        .unwrap();
+        (a, b, place, uid)
+    }
+
+    /// M1: ParallelSafe A LiveIdle wire; B **bound** LiveIdle + wire Unknown
+    /// (no unbind). Steer → 200; A turns; B no turn, still LiveIdle, Binding
+    /// id unchanged; one UserMessage; 0 mints; TurnStart agents == [A]
+    /// (woke ⊆ hosts). Tip mutant: B ghost-turns. "Unbind Waiting" mutant:
+    /// B Binding changes / not LiveIdle.
+    #[tokio::test]
+    async fn http_steer_unknown_bound_peer_no_ghost_turn() {
+        let st = AppState::new(vec![]);
+        let sid = st.store().create_session().id();
+        let (a, b, _) = install_two_parallel_safe_host_wires(&st, sid, None);
+        st.set_host_old_wire(sid, b, hearth_agent_wire::OldWire::Unknown)
+            .unwrap();
+        let bid_b = st.runtime.binding_for(sid, b).unwrap();
+        assert_eq!(
+            st.runtime.classify(sid, b).unwrap(),
+            hearth::Liveness::LiveIdle,
+            "precondition: B kernel Binding live (no unbind)"
+        );
+        let (m0, u0) = (fww_mints(&st, sid), fww_user_messages(&st, sid));
+
+        let (code, body) = fww_steer(&st, sid, "m1").await;
+        assert_eq!(code, StatusCode::OK, "body={body}");
+        assert!(body.contains("m1"));
+
+        let session = st.store().session(sid).unwrap();
+        assert!(session.current_turn_of(a).unwrap().is_some(), "A turns");
+        assert!(
+            session.current_turn_of(b).unwrap().is_none(),
+            "B Unknown: no ghost TurnStart"
+        );
+        assert_eq!(
+            st.runtime.classify(sid, b).unwrap(),
+            hearth::Liveness::LiveIdle,
+            "B stays LiveIdle (never unbind on Waiting)"
+        );
+        assert_eq!(
+            st.runtime.binding_for(sid, b).unwrap(),
+            bid_b,
+            "B Binding id unchanged"
+        );
+        assert_eq!(fww_user_messages(&st, sid), u0 + 1, "one UserMessage");
+        assert_eq!(fww_mints(&st, sid), m0, "0 new BindingAttached");
+        assert_eq!(fww_turn_starts(&st, sid), vec![a], "woke == hosts == [A]");
+    }
+
+    /// M2: serialize (no parallel_safe). A first in keep order, bound, wire
+    /// Unknown; B LiveIdle wire. Steer → 200, B turns, A none. B end-turn,
+    /// steer again → B turns again, A still none; never 409-wedged.
+    #[tokio::test]
+    async fn http_steer_unknown_first_agent_does_not_steal_gate() {
+        let st = AppState::new(vec![]);
+        let sid = st.store().create_session().id();
+        let id = sid.0.to_string();
+        let (a, b, _) =
+            install_two_host_wires_with_declare(&st, sid, None, None, None, resume_capable_caps());
+        st.set_host_old_wire(sid, a, hearth_agent_wire::OldWire::Unknown)
+            .unwrap();
+        let bid_a = st.runtime.binding_for(sid, a).unwrap();
+
+        let (code, body) = fww_steer(&st, sid, "m2-0").await;
+        assert_eq!(code, StatusCode::OK, "body={body}");
+        let session = st.store().session(sid).unwrap();
+        assert!(
+            session.current_turn_of(a).unwrap().is_none(),
+            "Unknown A must not take the turn / gate"
+        );
+        assert!(
+            session.current_turn_of(b).unwrap().is_some(),
+            "healthy ReuseLive B gets the turn"
+        );
+
+        let (code, body) = call(
+            router(st.clone()),
+            Request::post(format!("/sessions/{id}/agents/beta/end-turn"))
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "body={body}");
+
+        let (code, body) = fww_steer(&st, sid, "m2-1").await;
+        assert_eq!(code, StatusCode::OK, "not 409-wedged; body={body}");
+        let session = st.store().session(sid).unwrap();
+        assert!(
+            session.current_turn_of(a).unwrap().is_none(),
+            "A still none"
+        );
+        assert!(session.current_turn_of(b).unwrap().is_some(), "B again");
+        assert_eq!(fww_turn_starts(&st, sid), vec![b, b]);
+        assert_eq!(
+            st.runtime.classify(sid, a).unwrap(),
+            hearth::Liveness::LiveIdle
+        );
+        assert_eq!(st.runtime.binding_for(sid, a).unwrap(), bid_a);
+    }
+
+    /// M3: wired Session; kept B bound but (i) no wire of its own, or (ii) its
+    /// slot holds a wire whose host_agent_id is A (mismatch). Steer → A turns;
+    /// B no turn, no claim, no mint.
+    #[tokio::test]
+    async fn http_steer_unwired_or_mismatched_bound_peer_no_turn() {
+        for mismatched in [false, true] {
+            let st = AppState::new(vec![]);
+            let sid = st.store().create_session().id();
+            let (a, b, place, uid) = fww_install_two_bound_only_a_wired(&st, sid);
+            if mismatched {
+                let session = st.store().session(sid).unwrap();
+                let remint_for_a = hearth_agent_wire::RemintSession::on_host_session(
+                    session,
+                    a,
+                    uid,
+                    "S-a",
+                    resume_capable_caps(),
+                )
+                .expect("remint for A");
+                st.install_host_wire(sid, b, AgentHostWire::fake_live(remint_for_a, Some(place)))
+                    .unwrap();
+            }
+            let bid_b = st.runtime.binding_for(sid, b).unwrap();
+            assert_eq!(
+                st.runtime.classify(sid, b).unwrap(),
+                hearth::Liveness::LiveIdle
+            );
+            let m0 = fww_mints(&st, sid);
+
+            let (code, body) = fww_steer(&st, sid, "m3").await;
+            assert_eq!(code, StatusCode::OK, "mismatched={mismatched} body={body}");
+            let session = st.store().session(sid).unwrap();
+            assert!(session.current_turn_of(a).unwrap().is_some());
+            assert!(
+                session.current_turn_of(b).unwrap().is_none(),
+                "mismatched={mismatched}: B has no wire evidence → no turn"
+            );
+            assert_eq!(st.runtime.binding_for(sid, b).unwrap(), bid_b, "no claim");
+            assert_eq!(fww_mints(&st, sid), m0, "no mint");
+            assert_eq!(fww_turn_starts(&st, sid), vec![a]);
+        }
+    }
+
+    /// M4 (HTTP): both bound, both wires Unknown → every host_wake Waiting →
+    /// 409, 0 UserMessage, 0 TurnStart, 0 mints; Bindings unchanged.
+    #[tokio::test]
+    async fn http_steer_all_host_wake_waiting_409_no_append() {
+        let st = AppState::new(vec![]);
+        let sid = st.store().create_session().id();
+        let (a, b, _) = install_two_parallel_safe_host_wires(&st, sid, None);
+        for ag in [a, b] {
+            st.set_host_old_wire(sid, ag, hearth_agent_wire::OldWire::Unknown)
+                .unwrap();
+        }
+        let (bid_a, bid_b) = (
+            st.runtime.binding_for(sid, a).unwrap(),
+            st.runtime.binding_for(sid, b).unwrap(),
+        );
+        let (m0, u0, len0) = (
+            fww_mints(&st, sid),
+            fww_user_messages(&st, sid),
+            st.store().session(sid).unwrap().events().unwrap().len(),
+        );
+
+        let (code, body) = fww_steer(&st, sid, "m4").await;
+        assert_eq!(code, StatusCode::CONFLICT, "body={body}");
+        assert_eq!(fww_user_messages(&st, sid), u0, "0 UserMessage");
+        assert!(fww_turn_starts(&st, sid).is_empty(), "0 TurnStart");
+        assert_eq!(fww_mints(&st, sid), m0, "0 mints");
+        assert_eq!(
+            st.store().session(sid).unwrap().events().unwrap().len(),
+            len0,
+            "nothing appended"
+        );
+        assert_eq!(st.runtime.binding_for(sid, a).unwrap(), bid_a);
+        assert_eq!(st.runtime.binding_for(sid, b).unwrap(), bid_b);
+    }
+
+    /// M4 (WS twin): same all-Waiting setup over the WS stream → {"error":409}
+    /// and nothing appended.
+    #[tokio::test]
+    async fn ws_steer_all_host_wake_waiting_409_no_append() {
+        let st = AppState::new(vec![]);
+        let sid = st.store().create_session().id();
+        let id = sid.0.to_string();
+        let (a, b, _) = install_two_parallel_safe_host_wires(&st, sid, None);
+        for ag in [a, b] {
+            st.set_host_old_wire(sid, ag, hearth_agent_wire::OldWire::Unknown)
+                .unwrap();
+        }
+        let len0 = st.store().session(sid).unwrap().events().unwrap().len();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(axum::serve(listener, router(st.clone())).into_future());
+        let url = format!("ws://{addr}/sessions/{id}/stream");
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        ws.send(WsMsg::Text(
+            r#"{"type":"message","user":"cheng","message":"m4-ws"}"#.into(),
+        ))
+        .await
+        .unwrap();
+        expect_text(&mut ws, r#"{"error":409}"#).await;
+
+        assert_eq!(fww_user_messages(&st, sid), 0, "0 UserMessage");
+        assert!(fww_turn_starts(&st, sid).is_empty(), "0 TurnStart");
+        assert_eq!(
+            st.store().session(sid).unwrap().events().unwrap().len(),
+            len0,
+            "nothing appended"
+        );
+        let _ = ws.close(None).await;
+    }
+
+    /// M6 compose: lost A Reminted + Unknown bound B → A turns once (+1 mint),
+    /// B none; RAP tool-result on the same Unknown B → 409 (steer and RAP
+    /// agree); an unwired Session still wakes every kept Agent via the kernel
+    /// path (not filtered).
+    #[tokio::test]
+    async fn http_steer_reminted_plus_unknown_peer_admits_reminted_only() {
+        let st = AppState::new(vec![]);
+        let sid = st.store().create_session().id();
+        let id = sid.0.to_string();
+        let (a, b, _) = install_two_parallel_safe_host_wires(
+            &st,
+            sid,
+            Some(hearth_agent_wire::OldWire::StdoutEof),
+        );
+        st.set_host_old_wire(sid, b, hearth_agent_wire::OldWire::Unknown)
+            .unwrap();
+        let bid_a = st.runtime.binding_for(sid, a).unwrap();
+        let bid_b = st.runtime.binding_for(sid, b).unwrap();
+        let m0 = fww_mints(&st, sid);
+
+        let (code, body) = fww_steer(&st, sid, "m6").await;
+        assert_eq!(code, StatusCode::OK, "body={body}");
+        let session = st.store().session(sid).unwrap();
+        assert!(
+            session.current_turn_of(a).unwrap().is_some(),
+            "Reminted A turns"
+        );
+        assert!(
+            session.current_turn_of(b).unwrap().is_none(),
+            "Unknown B none"
+        );
+        assert_eq!(fww_mints(&st, sid), m0 + 1, "exactly one mint (A remint)");
+        assert_ne!(st.runtime.binding_for(sid, a).unwrap(), bid_a);
+        assert_eq!(st.runtime.binding_for(sid, b).unwrap(), bid_b);
+        assert_eq!(fww_turn_starts(&st, sid), vec![a]);
+        assert_eq!(fww_user_messages(&st, sid), 1);
+
+        // RAP on the same Unknown evidence → 409, no turn (paths agree).
+        record_host_tool_call(&st, sid, b, "fww-t1", "x");
+        let (code, body) = call(
+            router(st.clone()),
+            Request::post(format!("/sessions/{id}/agents/beta/tool-result"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"tool_call_id":"fww-t1","output":"ok"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CONFLICT, "body={body}");
+        assert!(st
+            .store()
+            .session(sid)
+            .unwrap()
+            .current_turn_of(b)
+            .unwrap()
+            .is_none());
+
+        // Kernel path (unwired Session) unchanged: every kept Agent wakes.
+        let ksid = st.store().create_session().id();
+        apply_join(&st, ksid, Some("cheng".into()), None, None).unwrap();
+        apply_join(
+            &st,
+            ksid,
+            None,
+            Some("alpha".into()),
+            Some(vec!["k-0".into()]),
+        )
+        .unwrap();
+        apply_join(
+            &st,
+            ksid,
+            None,
+            Some("beta".into()),
+            Some(vec!["k-1".into()]),
+        )
+        .unwrap();
+        let ks = st.runtime.kept_agents(ksid);
+        let (code, body) = fww_steer(&st, ksid, "m6-kernel").await;
+        assert_eq!(code, StatusCode::OK, "body={body}");
+        let ksession = st.store().session(ksid).unwrap();
+        for ag in &ks {
+            assert!(
+                ksession.current_turn_of(*ag).unwrap().is_some(),
+                "kernel fan-out not filtered"
+            );
+        }
+        assert_eq!(fww_turn_starts(&st, ksid), ks);
+    }
 }
