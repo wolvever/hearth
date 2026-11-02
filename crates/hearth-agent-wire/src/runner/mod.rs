@@ -1022,7 +1022,11 @@ pub struct CompleteHostToolArgs<'a> {
 /// 2. Already terminal → [`CompleteHostTool::NotApplied`] (duplicate / late after
 ///    Interrupted) — no wake.
 /// 3. Append ToolResult (name from matching ToolCall).
-/// 4. Wake **this Agent only** (never fan-out / `wake_each_kept`): conflict
+/// 4. Wake **this Agent only** (never fan-out / `wake_each_kept`):
+///    read-only [`hearth::Runtime::classify`] (RAP-classify-before-remint:
+///    `LiveInTurn` → Waiting `TurnOpen`, `Unknown` → Waiting
+///    `LivenessUnknown`, zero wire action — never remint under an open
+///    turn, even when an empty ParallelSafe set passes the gate) → conflict
 ///    gate → [`host_wake`] with limited remint retry
 ///    (RAP-remint-retry-budget: transient [`RemintError::NewWire`] on a
 ///    resume-capable Binding retries up to [`HOST_WAKE_REMINT_RETRY_BUDGET`],
@@ -1100,8 +1104,9 @@ pub fn complete_host_tool(
 /// RAP-remint-retry-budget: [`wake_through_host_wake`] with
 /// [`host_wake_with_limited_remint_retry`] in place of the single-shot
 /// [`host_wake`]. Used **only** by [`complete_host_tool`]; tick and explicit
-/// single wake stay single-shot. Same gate → host wake → `wake_with`
-/// ([`hearth::AlreadyBound`]) order. On exhaust the typed
+/// single wake stay single-shot. Order: classify (`LiveInTurn` / `Unknown`
+/// → Waiting, zero wire action; RAP-classify-before-remint) → gate → host
+/// wake → `wake_with` ([`hearth::AlreadyBound`]). On exhaust the typed
 /// `Remint(NewWire)` returns with FailClosed recorded once and the Binding
 /// left bound (single Agent: no ghost-turn risk, so no fan-out unbind).
 fn wake_through_host_wake_with_retry(
@@ -1118,6 +1123,22 @@ fn wake_through_host_wake_with_retry(
         remint,
     } = args;
     let agent = remint.session.host_agent_id();
+    // RAP-classify-before-remint: same read-only classify as the fan-out /
+    // tick / begin_turn / remint paths, before the gate and any wire action.
+    // The gate alone is not the guard: an empty ParallelSafe set never
+    // self-conflicts, so without this a lost wire would remint under the
+    // Agent's own open turn.
+    match runtime.classify(session_id, agent)? {
+        hearth::Liveness::LiveInTurn => {
+            return Ok(WakeThroughHost::Waiting(hearth::WaitReason::TurnOpen));
+        }
+        hearth::Liveness::Unknown => {
+            return Ok(WakeThroughHost::Waiting(
+                hearth::WaitReason::LivenessUnknown,
+            ));
+        }
+        _ => {}
+    }
     match runtime.check_turn_gate(session_id, agent) {
         Err(hearth::Error::Waiting(reason)) => return Ok(WakeThroughHost::Waiting(reason)),
         r => r?,
