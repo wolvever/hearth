@@ -4,8 +4,17 @@
 //! HTTP-visible orch path. Keep recipe stays a Host ticket per Agent; wires
 //! are a HostAttach / RemintSession map keyed by Agent (Fake / Loopback / Real OK).
 //! SoftExpiring / fleet / ToolResult parent / v2 / durable EventLog parked.
+//!
+//! Host-wire-session-isolation: HostWireMap locks **per Session**. The
+//! cross-Session index is held only for lookup/insert — never across
+//! `host_wake` I/O — so a hung remint on Session X cannot stall steer /
+//! RAP on Session Y. Same-Session steer / tool-result still serialize on
+//! that Session's lock and never fall back to Goose ClaimBinding for an
+//! Agent whose wire is installed (an unwired Agent keeps the base Goose
+//! stand-in tool-result path).
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hearth::{AgentId, Event, Place, SessionId, Wake};
@@ -111,27 +120,27 @@ impl AgentHostWire {
     }
 }
 
-/// Registry of Host wires keyed by `(Session, Agent)`.
+/// Per-Session Host wires. Lock held across `host_wake` for this Session only.
 #[derive(Default)]
-pub struct HostWireMap {
-    agents: HashMap<(SessionId, AgentId), AgentHostWire>,
+pub struct SessionWires {
+    agents: HashMap<AgentId, AgentHostWire>,
 }
 
-impl HostWireMap {
-    pub fn insert(&mut self, session: SessionId, agent: AgentId, wire: AgentHostWire) {
-        self.agents.insert((session, agent), wire);
+impl SessionWires {
+    pub fn insert(&mut self, agent: AgentId, wire: AgentHostWire) {
+        self.agents.insert(agent, wire);
     }
 
-    pub fn get_mut(&mut self, session: SessionId, agent: AgentId) -> Option<&mut AgentHostWire> {
-        self.agents.get_mut(&(session, agent))
+    pub fn get_mut(&mut self, agent: AgentId) -> Option<&mut AgentHostWire> {
+        self.agents.get_mut(&agent)
     }
 
-    pub fn has_any_for_session(&self, session: SessionId) -> bool {
-        self.agents.keys().any(|(s, _)| *s == session)
+    pub fn get(&self, agent: AgentId) -> Option<&AgentHostWire> {
+        self.agents.get(&agent)
     }
 
-    pub fn get(&self, session: SessionId, agent: AgentId) -> Option<&AgentHostWire> {
-        self.agents.get(&(session, agent))
+    pub fn is_empty(&self) -> bool {
+        self.agents.is_empty()
     }
 
     /// Single-Agent Host tool completion (not fan-out).
@@ -152,7 +161,7 @@ impl HostWireMap {
     ) -> Result<CompleteHostTool, CompleteHostToolError> {
         let mut wire = self
             .agents
-            .remove(&(session_id, agent))
+            .remove(&agent)
             .ok_or(CompleteHostToolError::Orphan)?;
         let result = complete_host_tool(
             &mut wire.old,
@@ -187,7 +196,7 @@ impl HostWireMap {
                 &mut wire.new_next_rpc_id,
             );
         }
-        self.agents.insert((session_id, agent), wire);
+        self.agents.insert(agent, wire);
         result
     }
 
@@ -198,20 +207,20 @@ impl HostWireMap {
     /// per Agent at remint time (evidence → LiveIdle; runners swap on
     /// Reminted) even if a later peer aborts the fan-out. Skipped / Waiting /
     /// FailClosed Agents keep their prior evidence.
+    ///
+    /// Wires are always reinserted — including on `WakeThroughError` (e.g.
+    /// ResumeNoPlace abort) — so the Session never falls through to Goose
+    /// ClaimBinding while it still has Host wires.
     pub fn wake_each_kept(
         &mut self,
         runtime: &hearth::Runtime,
         session_id: SessionId,
         wake: Wake,
     ) -> Result<WakeEachKeptThroughHost, WakeThroughError> {
-        let keys: Vec<AgentId> = self
-            .agents
-            .keys()
-            .filter_map(|(s, a)| (*s == session_id).then_some(*a))
-            .collect();
+        let keys: Vec<AgentId> = self.agents.keys().copied().collect();
         let mut owned: Vec<(AgentId, AgentHostWire)> = Vec::with_capacity(keys.len());
         for a in keys {
-            if let Some(w) = self.agents.remove(&(session_id, a)) {
+            if let Some(w) = self.agents.remove(&a) {
                 owned.push((a, w));
             }
         }
@@ -249,38 +258,85 @@ impl HostWireMap {
             )
         };
         for (a, w) in owned {
-            self.agents.insert((session_id, a), w);
+            self.agents.insert(a, w);
         }
         result
     }
 }
 
+/// Cross-Session index of per-Session wire locks.
+///
+/// Outer `AppState.host_wires` Mutex is held only for lookup / insert of
+/// [`SessionWires`] Arcs — never across `host_wake` I/O
+/// (Host-wire-session-isolation).
+#[derive(Default)]
+pub struct HostWireMap {
+    sessions: HashMap<SessionId, Arc<Mutex<SessionWires>>>,
+}
+
+impl HostWireMap {
+    /// Get or create this Session's wire lock (clone the Arc; drop outer after).
+    pub fn session_arc(&mut self, session: SessionId) -> Arc<Mutex<SessionWires>> {
+        self.sessions
+            .entry(session)
+            .or_insert_with(|| Arc::new(Mutex::new(SessionWires::default())))
+            .clone()
+    }
+
+    /// Lookup only — `None` if no wires have ever been installed for `session`.
+    pub fn try_session_arc(&self, session: SessionId) -> Option<Arc<Mutex<SessionWires>>> {
+        self.sessions.get(&session).cloned()
+    }
+}
+
 /// Thin service wrapper: Host path when wires are installed for the Session;
 /// otherwise Goose stand-in [`hearth::Runtime::wake_each_kept`] (ClaimBinding).
+///
+/// Host-wire-session-isolation: outer index lock is dropped before the
+/// Session lock is taken for `host_wake`. Same-Session callers serialize on
+/// that Session lock; a Session with wires never falls through to Goose
+/// while the Session entry still holds them (including mid-fan-out drain).
 pub fn steer_each_kept(
     st: &AppState,
     session_id: SessionId,
     wake: Wake,
 ) -> Result<SteerOutcome, SteerError> {
-    let mut wires = st.host_wires.lock().map_err(|_| SteerError::Lock)?;
-    if wires.has_any_for_session(session_id) {
-        match wires.wake_each_kept(&st.runtime, session_id, wake) {
-            Ok(WakeEachKeptThroughHost::Woke { hosts, woke }) => {
-                Ok(SteerOutcome::Host { hosts, woke })
+    let session_arc = {
+        let map = st.host_wires.lock().map_err(|_| SteerError::Lock)?;
+        map.try_session_arc(session_id)
+    };
+    if let Some(arc) = session_arc {
+        let mut wires = arc.lock().map_err(|_| SteerError::Lock)?;
+        if !wires.is_empty() {
+            match wires.wake_each_kept(&st.runtime, session_id, wake) {
+                Ok(WakeEachKeptThroughHost::Woke { hosts, woke }) => {
+                    Ok(SteerOutcome::Host { hosts, woke })
+                }
+                Ok(WakeEachKeptThroughHost::Waiting(reason)) => Err(SteerError::Waiting(reason)),
+                Err(WakeThroughError::Runtime(hearth::Error::Waiting(reason))) => {
+                    Err(SteerError::Waiting(reason))
+                }
+                Err(WakeThroughError::Runtime(e)) => Err(SteerError::Runtime(e)),
+                Err(WakeThroughError::Remint(e)) => Err(SteerError::Remint(e)),
             }
-            Ok(WakeEachKeptThroughHost::Waiting(reason)) => Err(SteerError::Waiting(reason)),
-            Err(WakeThroughError::Runtime(hearth::Error::Waiting(reason))) => {
-                Err(SteerError::Waiting(reason))
-            }
-            Err(WakeThroughError::Runtime(e)) => Err(SteerError::Runtime(e)),
-            Err(WakeThroughError::Remint(e)) => Err(SteerError::Remint(e)),
+        } else {
+            drop(wires);
+            kernel_steer_each_kept(st, session_id, wake)
         }
     } else {
-        match st.runtime.wake_each_kept(session_id, wake) {
-            Ok(woke) => Ok(SteerOutcome::Kernel { woke }),
-            Err(hearth::Error::Waiting(reason)) => Err(SteerError::Waiting(reason)),
-            Err(e) => Err(SteerError::Runtime(e)),
-        }
+        kernel_steer_each_kept(st, session_id, wake)
+    }
+}
+
+fn kernel_steer_each_kept(
+    st: &AppState,
+    session_id: SessionId,
+    wake: Wake,
+) -> Result<SteerOutcome, SteerError> {
+    match st.runtime.wake_each_kept(session_id, wake) {
+        Ok(woke) => Ok(SteerOutcome::Kernel { woke }),
+        Err(hearth::Error::Waiting(reason)) => Err(SteerError::Waiting(reason)),
+        Err(e) => Err(SteerError::Runtime(e)),
     }
 }
 
@@ -334,16 +390,18 @@ pub enum CompleteToolError {
     Waiting(hearth::WaitReason),
     Runtime(hearth::Error),
     Remint(hearth_agent_wire::RemintError),
-    /// Agent has no Host wire and kernel path refused.
-    NoWire,
 }
 
 /// Service Host-owned tool completion → ToolResult + single-Agent Trigger wake.
 ///
-/// Wired Sessions: [`complete_host_tool`] via that Agent's wire only (never
-/// `wake_each_kept`). Unwired Goose stand-in: Session append + `Runtime::wake`
-/// Trigger. Orphan → Orphan; terminal → NotApplied; wake Waiting → Waiting
+/// Agent with a Host wire: [`complete_host_tool`] via that Agent's wire only
+/// (never `wake_each_kept`). Agent without a Host wire (unwired Session, or a
+/// peers-only wired Session): Goose stand-in, Session append + `Runtime::wake`
+/// Trigger (base semantics). Orphan → Orphan; terminal → NotApplied; wake Waiting → Waiting
 /// (Result may already be on the log — M8).
+///
+/// Host-wire-session-isolation: Session lock held across the wire path; outer
+/// index never held across I/O. Same-Session serialize with steer.
 pub fn complete_tool_result(
     st: &AppState,
     session_id: SessionId,
@@ -351,60 +409,80 @@ pub fn complete_tool_result(
     tool_call_id: &str,
     output: &str,
 ) -> Result<CompleteToolOutcome, CompleteToolError> {
-    let mut wires = st.host_wires.lock().map_err(|_| CompleteToolError::Lock)?;
-    if wires.get(session_id, agent).is_some() {
-        match wires.complete_host_tool_for(&st.runtime, session_id, agent, tool_call_id, output) {
-            Ok(CompleteHostTool::Applied {
-                tool_result,
-                wake_events,
-                ..
-            }) => Ok(CompleteToolOutcome::Applied {
-                tool_result,
-                wake_events,
-            }),
-            Ok(CompleteHostTool::NotApplied) => Ok(CompleteToolOutcome::NotApplied),
-            Ok(CompleteHostTool::AppliedWakeWaiting { reason, .. }) => {
-                Err(CompleteToolError::Waiting(reason))
+    let session_arc = {
+        let map = st.host_wires.lock().map_err(|_| CompleteToolError::Lock)?;
+        map.try_session_arc(session_id)
+    };
+    if let Some(arc) = session_arc {
+        let mut wires = arc.lock().map_err(|_| CompleteToolError::Lock)?;
+        if wires.get(agent).is_some() {
+            match wires.complete_host_tool_for(&st.runtime, session_id, agent, tool_call_id, output)
+            {
+                Ok(CompleteHostTool::Applied {
+                    tool_result,
+                    wake_events,
+                    ..
+                }) => Ok(CompleteToolOutcome::Applied {
+                    tool_result,
+                    wake_events,
+                }),
+                Ok(CompleteHostTool::NotApplied) => Ok(CompleteToolOutcome::NotApplied),
+                Ok(CompleteHostTool::AppliedWakeWaiting { reason, .. }) => {
+                    Err(CompleteToolError::Waiting(reason))
+                }
+                Err(CompleteHostToolError::Orphan) => Err(CompleteToolError::Orphan),
+                Err(CompleteHostToolError::Remint(e)) => Err(CompleteToolError::Remint(e)),
+                Err(CompleteHostToolError::Runtime(hearth::Error::Waiting(r))) => {
+                    Err(CompleteToolError::Waiting(r))
+                }
+                Err(CompleteHostToolError::Runtime(e)) => Err(CompleteToolError::Runtime(e)),
             }
-            Err(CompleteHostToolError::Orphan) => Err(CompleteToolError::Orphan),
-            Err(CompleteHostToolError::Remint(e)) => Err(CompleteToolError::Remint(e)),
-            Err(CompleteHostToolError::Runtime(hearth::Error::Waiting(r))) => {
-                Err(CompleteToolError::Waiting(r))
-            }
-            Err(CompleteHostToolError::Runtime(e)) => Err(CompleteToolError::Runtime(e)),
+        } else {
+            // This Agent has no Host wire (Session empty or peers-only) —
+            // Goose stand-in, same as base (#84).
+            drop(wires);
+            kernel_complete_tool_result(st, session_id, agent, tool_call_id, output)
         }
     } else {
-        // Goose stand-in: append then Runtime::wake (ClaimBinding).
-        drop(wires);
-        let sess = st
-            .runtime
-            .store()
-            .session(session_id)
-            .map_err(CompleteToolError::Runtime)?;
-        let append = match sess.append_host_tool_result(agent, tool_call_id, output) {
-            Ok(a) => a,
-            Err(hearth::HostToolResultError::Orphan) => return Err(CompleteToolError::Orphan),
-        };
-        let tool_result = match append {
-            hearth::HostToolResultAppend::AlreadyTerminal => {
-                return Ok(CompleteToolOutcome::NotApplied);
-            }
-            hearth::HostToolResultAppend::Applied(ev) => ev,
-        };
-        match st.runtime.wake(
-            session_id,
-            agent,
-            Wake::Trigger {
-                name: "tool_result".into(),
-            },
-        ) {
-            Ok(wake_events) => Ok(CompleteToolOutcome::Applied {
-                tool_result,
-                wake_events,
-            }),
-            Err(hearth::Error::Waiting(reason)) => Err(CompleteToolError::Waiting(reason)),
-            Err(e) => Err(CompleteToolError::Runtime(e)),
+        kernel_complete_tool_result(st, session_id, agent, tool_call_id, output)
+    }
+}
+
+fn kernel_complete_tool_result(
+    st: &AppState,
+    session_id: SessionId,
+    agent: AgentId,
+    tool_call_id: &str,
+    output: &str,
+) -> Result<CompleteToolOutcome, CompleteToolError> {
+    let sess = st
+        .runtime
+        .store()
+        .session(session_id)
+        .map_err(CompleteToolError::Runtime)?;
+    let append = match sess.append_host_tool_result(agent, tool_call_id, output) {
+        Ok(a) => a,
+        Err(hearth::HostToolResultError::Orphan) => return Err(CompleteToolError::Orphan),
+    };
+    let tool_result = match append {
+        hearth::HostToolResultAppend::AlreadyTerminal => {
+            return Ok(CompleteToolOutcome::NotApplied);
         }
+        hearth::HostToolResultAppend::Applied(ev) => ev,
+    };
+    match st.runtime.wake(
+        session_id,
+        agent,
+        Wake::Trigger {
+            name: "tool_result".into(),
+        },
+    ) {
+        Ok(wake_events) => Ok(CompleteToolOutcome::Applied {
+            tool_result,
+            wake_events,
+        }),
+        Err(hearth::Error::Waiting(reason)) => Err(CompleteToolError::Waiting(reason)),
+        Err(e) => Err(CompleteToolError::Runtime(e)),
     }
 }
 
