@@ -402,6 +402,32 @@ impl AttachRunner {
         self.write_value(&v)
     }
 
+    /// Encode an ACP request [`AgentCommand`] (e.g. `UserMessage` →
+    /// `session/prompt`) and write it as a JSON-RPC **request**: the id is
+    /// taken from `*next_rpc_id`, which is bumped. Gated like
+    /// [`Self::write_value`] (never before `initialize`); a gate refusal
+    /// consumes no id. Returns the id written.
+    pub fn write_command_request(
+        &mut self,
+        cmd: &AgentCommand,
+        next_rpc_id: &mut u64,
+    ) -> Result<u64, BusError> {
+        if !self.initialized {
+            return Err(BusError::NotInitialized);
+        }
+        let frame = acp::encode_frame(cmd)?;
+        let WireFrame::Json(mut v) = frame else {
+            return Err(BusError::Encode(
+                "ACP command encode produced a non-JSON frame".into(),
+            ));
+        };
+        let id = *next_rpc_id;
+        *next_rpc_id = next_rpc_id.saturating_add(1);
+        v["id"] = serde_json::json!(id);
+        self.write_value(&v)?;
+        Ok(id)
+    }
+
     /// Live ACP attach handshake: send `initialize` advertising
     /// [`ClientCapabilities::HOST`] (all false today), pump until the matching
     /// JSON-RPC result lands, then return [`LiveCaps`].
@@ -2632,6 +2658,46 @@ mod tests {
         assert_eq!(methods, vec![serde_json::json!("initialize")]);
         assert!(runner.is_initialized());
         runner.write_value(&prompt).unwrap();
+    }
+
+    /// Steer-delivers-prompt: `write_command_request` writes a JSON-RPC
+    /// request (`id` from `next_rpc_id`, bumped). Before initialize it is
+    /// refused typed and consumes no id.
+    #[test]
+    fn write_command_request_gated_and_bumps_rpc_id() {
+        let init_ok = JsonlRpcTransport::encode_jsonl(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "result": { "protocolVersion": 1 }
+        }))
+        .unwrap();
+        let mut runner = AttachRunner::spawn_fake(WireKind::JsonlRpc, init_ok);
+        let cmd = AgentCommand::UserMessage {
+            session_id: "S1".into(),
+            text: "hi".into(),
+        };
+        let mut next = 7;
+        assert!(matches!(
+            runner.write_command_request(&cmd, &mut next),
+            Err(BusError::NotInitialized)
+        ));
+        assert_eq!(next, 7, "gate refusal consumes no id");
+        assert!(runner.stdin_log().unwrap().is_empty());
+        let mut t = transport_for_wire(WireKind::JsonlRpc);
+        runner.initialize_host(&mut t, &RpcId::Num(1)).unwrap();
+        assert_eq!(runner.write_command_request(&cmd, &mut next).unwrap(), 7);
+        assert_eq!(runner.write_command_request(&cmd, &mut next).unwrap(), 8);
+        assert_eq!(next, 9);
+        let log = std::str::from_utf8(runner.stdin_log().unwrap()).unwrap();
+        let lines: Vec<serde_json::Value> = log
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 3);
+        for (l, id) in lines[1..].iter().zip([7, 8]) {
+            assert_eq!(l["method"], "session/prompt");
+            assert_eq!(l["id"], id);
+            assert_eq!(l["params"]["sessionId"], "S1");
+            assert_eq!(l["params"]["prompt"][0]["text"], "hi");
+        }
     }
 
     /// Failed initialize keeps the gate closed.
