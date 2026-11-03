@@ -130,6 +130,12 @@ impl AttachRunner {
         if let Some(out) = stdout.as_mut() {
             set_nonblocking(out)?;
         }
+        // deliver-prompt-bounded-write: agent-bound stdin is non-blocking so
+        // every Real write is bounded by [`STDIN_WRITE_TIMEOUT`] (a deaf CLI
+        // must not wedge the per-Session wire lock).
+        if let Some(inp) = stdin.as_ref() {
+            set_fd_nonblocking(inp.as_raw_fd())?;
+        }
         Ok(Self {
             io: ChildIo::Real {
                 child,
@@ -226,19 +232,20 @@ impl AttachRunner {
     }
 
     /// Handshake-only write (initialize + replies during the wait).
+    ///
+    /// Every Real write (initialize, resume, teardown, prompt) goes through
+    /// here and is bounded by [`STDIN_WRITE_TIMEOUT`]: a CLI that stops
+    /// reading stdin yields `BusError::Transport("write stdin: timed out …")`
+    /// instead of blocking. A timeout may leave a partial frame on the pipe,
+    /// so callers must treat any error as proof the wire is lost
+    /// ([`OldWire::TransportError`]). Fake arm unchanged.
     fn write_bytes_ungated(&mut self, bytes: &[u8]) -> Result<(), BusError> {
         match &mut self.io {
             ChildIo::Real { stdin, .. } => {
                 let Some(stdin) = stdin.as_mut() else {
                     return Err(BusError::Transport("child stdin closed".into()));
                 };
-                stdin
-                    .write_all(bytes)
-                    .map_err(|e| BusError::Transport(format!("write stdin: {e}")))?;
-                stdin
-                    .flush()
-                    .map_err(|e| BusError::Transport(format!("flush stdin: {e}")))?;
-                Ok(())
+                write_all_bounded(stdin, bytes, STDIN_WRITE_TIMEOUT)
             }
             ChildIo::Fake {
                 stdin_log,
@@ -1775,8 +1782,82 @@ pub fn wake_each_kept_through_host_wake(
     }
 }
 
+/// Deadline for one agent-bound Real stdin frame write
+/// ([`AttachRunner::write_bytes`] and the handshake / teardown writes).
+///
+/// deliver-prompt-bounded-write: Real stdin is `O_NONBLOCK`; a write that
+/// cannot finish (CLI not reading, pipe full) within this deadline fails
+/// with [`BusError::Transport`] instead of holding the per-Session wire lock
+/// forever. 2 s: well above a reading CLI's drain time for multi-MiB frames,
+/// small enough that one deaf Agent costs a steer / RAP at most this long
+/// per Agent. Total per frame (not reset on progress), so the lock hold is
+/// bounded even against a trickling reader.
+pub const STDIN_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Write all of `bytes` to a non-blocking `w`, looping on short writes,
+/// retrying `Interrupted`, and `poll(POLLOUT)`-ing on `WouldBlock` until
+/// `timeout` elapses (then `Transport("write stdin: timed out …")`).
+fn write_all_bounded(
+    w: &mut ChildStdin,
+    mut bytes: &[u8],
+    timeout: Duration,
+) -> Result<(), BusError> {
+    let deadline = std::time::Instant::now() + timeout;
+    let total = bytes.len();
+    while !bytes.is_empty() {
+        match w.write(bytes) {
+            Ok(0) => return Err(BusError::Transport("write stdin: wrote 0 bytes".into())),
+            Ok(n) => bytes = &bytes[n..],
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    return Err(BusError::Transport(format!(
+                        "write stdin: timed out after {timeout:?} ({} of {total} bytes written)",
+                        total - bytes.len()
+                    )));
+                }
+                poll_writable(w.as_raw_fd(), deadline - now)?;
+            }
+            Err(e) => return Err(BusError::Transport(format!("write stdin: {e}"))),
+        }
+    }
+    Ok(())
+}
+
+/// Wait up to `timeout` for `fd` to accept a write (or report HUP/ERR, which
+/// the next `write` surfaces as EPIPE). A plain timeout is `Ok(())`: the
+/// caller re-checks its deadline.
+fn poll_writable(fd: libc::c_int, timeout: Duration) -> Result<(), BusError> {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    // Round up so a sub-ms remainder still waits instead of spinning.
+    let ms = timeout
+        .as_micros()
+        .div_ceil(1000)
+        .clamp(1, i32::MAX as u128) as libc::c_int;
+    let rc = unsafe { libc::poll(&mut pfd, 1, ms) };
+    if rc < 0 {
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::Interrupted {
+            return Ok(());
+        }
+        return Err(BusError::Transport(format!("poll stdin: {err}")));
+    }
+    if rc > 0 && (pfd.revents & libc::POLLNVAL) != 0 {
+        return Err(BusError::Transport("poll stdin: invalid fd".into()));
+    }
+    Ok(())
+}
+
 fn set_nonblocking(out: &ChildStdout) -> Result<(), BusError> {
-    let fd = out.as_raw_fd();
+    set_fd_nonblocking(out.as_raw_fd())
+}
+
+fn set_fd_nonblocking(fd: libc::c_int) -> Result<(), BusError> {
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if flags < 0 {
         return Err(BusError::Transport(format!(
@@ -7847,5 +7928,99 @@ mod tests {
         assert_eq!(old.stdin_log().unwrap(), &old_log[..]);
         assert!(new.stdin_log().unwrap().is_empty());
         assert_ne!(old.try_wait().unwrap(), Some(9));
+    }
+
+    // ---- deliver-prompt-bounded-write (M5 wire floor) ----
+
+    /// Floor bound: `STDIN_WRITE_TIMEOUT` + 3 s slack (5 s literal in the
+    /// floors-only RED commit, before the const existed).
+    const DPBW_BOUND: Duration = STDIN_WRITE_TIMEOUT.saturating_add(Duration::from_secs(3));
+
+    fn dpbw_real_initialized(tail: &str) -> AttachRunner {
+        let script = format!(
+            "IFS= read -r l; printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{{\"protocolVersion\":1}}}}'; {tail}"
+        );
+        let mut r = AttachRunner::spawn(LaunchSpec {
+            program: "sh".into(),
+            args: vec!["-c".into(), script],
+            cwd: None,
+            env: Vec::new(),
+            wire: WireKind::JsonlRpc,
+        })
+        .expect("spawn Real CLI");
+        r.initialize_host(&mut transport_for_wire(WireKind::JsonlRpc), &RpcId::Num(0))
+            .expect("initialize Real CLI");
+        r
+    }
+
+    /// Run one Real agent-bound write on a thread; `None` = still blocked
+    /// after `DPBW_BOUND` (the runner and its child are leaked to the thread,
+    /// which ends when the finite-sleep child exits).
+    fn dpbw_write_on_thread(
+        mut r: AttachRunner,
+        bytes: Vec<u8>,
+    ) -> Option<(Result<(), BusError>, Duration, AttachRunner)> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let t0 = std::time::Instant::now();
+            let res = r.write_bytes(&bytes);
+            let _ = tx.send((res, t0.elapsed(), r));
+        });
+        rx.recv_timeout(DPBW_BOUND).ok()
+    }
+
+    /// M5 (wire): a never-reading pipe → agent-bound write returns
+    /// `Transport(.. timed out ..)` within the deadline (not instantly, not
+    /// forever); a pipe drained after ~300 ms completes and the reader gets
+    /// every byte. Kills: (a) blocking write_all; (e) first WouldBlock =
+    /// error / zero deadline; partial-write loss (no short-write loop).
+    #[test]
+    fn write_bounded_times_out_on_deaf_pipe_and_completes_on_slow_reader() {
+        let big: Vec<u8> = {
+            let mut v = vec![b'x'; 256 * 1024];
+            v.push(b'\n');
+            v
+        };
+
+        // Deaf: initialized, never reads stdin again.
+        let deaf = dpbw_real_initialized("exec sleep 10");
+        let (res, elapsed, _deaf) = dpbw_write_on_thread(deaf, big.clone())
+            .unwrap_or_else(|| panic!("deaf write blocked > {DPBW_BOUND:?} (unbounded)"));
+        match &res {
+            Err(BusError::Transport(m)) => assert!(m.contains("timed out"), "msg={m}"),
+            other => panic!("deaf write must be Transport(timed out), got {other:?}"),
+        }
+        assert!(elapsed <= DPBW_BOUND, "elapsed={elapsed:?}");
+        assert!(
+            elapsed + Duration::from_millis(50) >= STDIN_WRITE_TIMEOUT,
+            "waited the deadline, not a zero-deadline fail-fast: {elapsed:?}"
+        );
+        assert!(
+            (Duration::from_secs(1)..=Duration::from_secs(2)).contains(&STDIN_WRITE_TIMEOUT),
+            "stamp: deadline about 1-2 s"
+        );
+
+        // Slow reader: starts draining after ~300 ms.
+        let out = std::env::temp_dir().join(format!("hearth-dpbw-wire-{}", std::process::id()));
+        let _ = std::fs::remove_file(&out);
+        let slow = dpbw_real_initialized(&format!(
+            "sleep 0.3; head -c {} > {}; exec sleep 5",
+            big.len(),
+            out.display()
+        ));
+        let (res, _, _slow) = dpbw_write_on_thread(slow, big.clone())
+            .unwrap_or_else(|| panic!("slow-reader write blocked > {DPBW_BOUND:?}"));
+        res.expect("slow reader: no false timeout");
+        let mut got = Vec::new();
+        for _ in 0..100 {
+            got = std::fs::read(&out).unwrap_or_default();
+            if got.len() >= big.len() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = std::fs::remove_file(&out);
+        assert_eq!(got.len(), big.len(), "every byte reached the reader");
+        assert!(got == big, "bytes exact");
     }
 }

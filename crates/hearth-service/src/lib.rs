@@ -8991,4 +8991,358 @@ mod tests {
         assert_ne!(pa[0]["id"], pa[1]["id"], "rpc id bumped");
         assert_eq!(sdp_prompt_count(&st, sid, b), (1, 0), "B (in turn) none");
     }
+
+    // ---- deliver-prompt-bounded-write (M1–M5) ----
+    //
+    // One deaf Real CLI (answered `initialize`, never reads stdin again) must
+    // not wedge its Session: the agent-bound stdin write is bounded, peers
+    // still get their prompt, and a failed delivery marks THAT wire lost so
+    // the next wake (after end-turn) remints. Real `sh -c` children only:
+    // the Fake arm has no pipe and cannot show the wedge.
+
+    /// Floor bound: `STDIN_WRITE_TIMEOUT` + 3 s slack (5 s literal in the
+    /// floors-only RED commit, before the const existed).
+    const DPBW_BOUND: std::time::Duration =
+        hearth_agent_wire::STDIN_WRITE_TIMEOUT.saturating_add(std::time::Duration::from_secs(3));
+
+    /// Real JSONL child that answers `initialize` (id 0), then runs `tail`.
+    fn dpbw_real_initialized(tail: &str) -> hearth_agent_wire::AttachRunner {
+        use hearth_agent_wire::{transport_for_wire, AttachRunner, LaunchSpec, RpcId, WireKind};
+        let script = format!(
+            "IFS= read -r l; printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{{\"protocolVersion\":1}}}}'; {tail}"
+        );
+        let mut r = AttachRunner::spawn(LaunchSpec {
+            program: "sh".into(),
+            args: vec!["-c".into(), script],
+            cwd: None,
+            env: Vec::new(),
+            wire: WireKind::JsonlRpc,
+        })
+        .expect("spawn Real CLI");
+        r.initialize_host(&mut transport_for_wire(WireKind::JsonlRpc), &RpcId::Num(0))
+            .expect("initialize Real CLI");
+        r
+    }
+
+    /// Deaf CLI: initialized, then never reads stdin; lives `secs` (finite so
+    /// a RED run on the blocking write still ends).
+    fn dpbw_deaf(secs: u32) -> hearth_agent_wire::AttachRunner {
+        dpbw_real_initialized(&format!("exec sleep {secs}"))
+    }
+
+    fn dpbw_swap_old(
+        st: &AppState,
+        sid: SessionId,
+        agent: hearth::AgentId,
+        r: hearth_agent_wire::AttachRunner,
+    ) {
+        let sw = session_wires_arc(st, sid);
+        sw.lock().unwrap().get_mut(agent).unwrap().old = r;
+    }
+
+    fn dpbw_lock_free(st: &AppState, sid: SessionId) -> bool {
+        session_wires_arc(st, sid).try_lock().is_ok()
+    }
+
+    /// HTTP steer on a spawned task, bounded by `DPBW_BOUND`. `None` = wedged.
+    async fn dpbw_steer(
+        st: &AppState,
+        sid: SessionId,
+        text: String,
+    ) -> (Option<(StatusCode, String)>, std::time::Duration) {
+        let st2 = st.clone();
+        let t0 = std::time::Instant::now();
+        let h = tokio::spawn(async move { sdp_steer(&st2, sid, "cheng", &text).await });
+        let r = tokio::time::timeout(DPBW_BOUND, h).await;
+        (r.ok().map(|j| j.unwrap()), t0.elapsed())
+    }
+
+    async fn dpbw_tool_result(
+        st: &AppState,
+        sid: SessionId,
+        agent_name: &'static str,
+        tool_call_id: &'static str,
+        output: String,
+    ) -> (Option<(StatusCode, String)>, std::time::Duration) {
+        let st2 = st.clone();
+        let t0 = std::time::Instant::now();
+        let h = tokio::spawn(async move {
+            sdp_tool_result(&st2, sid, agent_name, tool_call_id, &output).await
+        });
+        let r = tokio::time::timeout(DPBW_BOUND, h).await;
+        (r.ok().map(|j| j.unwrap()), t0.elapsed())
+    }
+
+    async fn dpbw_end_turn(
+        st: &AppState,
+        sid: SessionId,
+        agent_name: &'static str,
+    ) -> Option<(StatusCode, String)> {
+        let st2 = st.clone();
+        let h = tokio::spawn(async move { sdp_end_turn(&st2, sid, agent_name).await });
+        tokio::time::timeout(DPBW_BOUND, h)
+            .await
+            .ok()
+            .map(|j| j.unwrap())
+    }
+
+    /// M1: deaf Real A + Fake live B (ParallelSafe). A ≥256 KiB steer returns
+    /// 200 within the bound; both LiveInTurn; B's `old` has exactly one
+    /// `session/prompt` with the exact text; Session wire lock free after.
+    /// Kills: (a) blocking write_all; (b) stop peers on first send error;
+    /// (g) send error → 500.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn http_steer_deaf_cli_bounded_peer_still_prompted() {
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let (a, b, _) = install_two_parallel_safe_host_wires(&st, sid, None);
+        dpbw_swap_old(&st, sid, a, dpbw_deaf(10));
+        let big = "x".repeat(256 * 1024);
+        let (r, elapsed) = dpbw_steer(&st, sid, big.clone()).await;
+        let (code, body) =
+            r.unwrap_or_else(|| panic!("steer wedged > {DPBW_BOUND:?} on a deaf CLI"));
+        assert_eq!(code, StatusCode::OK, "body len={}", body.len());
+        assert!(elapsed <= DPBW_BOUND, "elapsed={elapsed:?}");
+        assert!(dpbw_lock_free(&st, sid), "Session wire lock free");
+        for ag in [a, b] {
+            assert_eq!(
+                st.runtime.classify(sid, ag).unwrap(),
+                hearth::Liveness::LiveInTurn
+            );
+        }
+        let (old_b, new_b, _, _) = sdp_wire(&st, sid, b);
+        let pb = sdp_prompts(&old_b);
+        assert_eq!(pb.len(), 1, "peer B gets exactly one prompt");
+        assert_eq!(sdp_prompt_text(&pb[0]), big, "B prompt text exact");
+        assert!(new_b.is_empty());
+    }
+
+    /// M2: RAP with a deaf Real A and an unmatched Host ToolCall; a ≥200 KiB
+    /// tool-result output returns 200 applied:true within the bound;
+    /// ToolResult + TurnStart on the log; lock free; A's evidence
+    /// TransportError. Kills: (a); bounding only the steer path; RAP send
+    /// error not marking the wire lost.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn http_rap_deaf_cli_large_output_bounded() {
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let (a, _b, _) = install_two_parallel_safe_host_wires(&st, sid, None);
+        record_host_tool_call(&st, sid, a, "tc-dpbw", "read_file");
+        dpbw_swap_old(&st, sid, a, dpbw_deaf(10));
+        let turns0 = sdp_count(
+            &st,
+            sid,
+            |e| matches!(e, EventBody::TurnStart { agent, .. } if *agent == a),
+        );
+        let out = "y".repeat(200 * 1024);
+        let (r, elapsed) = dpbw_tool_result(&st, sid, "alpha", "tc-dpbw", out).await;
+        let (code, body) =
+            r.unwrap_or_else(|| panic!("RAP tool-result wedged > {DPBW_BOUND:?} on a deaf CLI"));
+        assert_eq!(code, StatusCode::OK, "body={body}");
+        assert!(body.contains(r#""applied":true"#), "body={body}");
+        assert!(elapsed <= DPBW_BOUND, "elapsed={elapsed:?}");
+        assert!(dpbw_lock_free(&st, sid), "Session wire lock free");
+        assert_eq!(
+            sdp_count(&st, sid, |e| matches!(
+                e,
+                EventBody::ToolResult { tool_call_id, .. } if tool_call_id == "tc-dpbw"
+            )),
+            1,
+            "ToolResult on the log"
+        );
+        assert_eq!(
+            sdp_count(
+                &st,
+                sid,
+                |e| matches!(e, EventBody::TurnStart { agent, .. } if *agent == a)
+            ),
+            turns0 + 1,
+            "Trigger TurnStart on the log"
+        );
+        assert_eq!(
+            st.runtime.classify(sid, a).unwrap(),
+            hearth::Liveness::LiveInTurn
+        );
+        let ev = host_old_wire(&st, sid, a);
+        assert!(
+            matches!(ev, hearth_agent_wire::OldWire::TransportError(_)),
+            "RAP send timeout marks A lost, got {ev:?}"
+        );
+    }
+
+    /// M3: while A's CLI stays deaf (child alive), the same Session is not
+    /// wedged: after the big steer, `end-turn` B then a steer that reaches
+    /// only B (A LiveInTurn → skipped) both finish within the bound; B has 2
+    /// prompts. A cross-Session steer also finishes. Kills: (a); an
+    /// HTTP-handler-only timeout (spawn_blocking keeps holding the lock).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn http_deaf_cli_does_not_block_same_session_followups() {
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let (a, b, _) = install_two_parallel_safe_host_wires(&st, sid, None);
+        dpbw_swap_old(&st, sid, a, dpbw_deaf(15));
+        // Cross-Session control: a second Session with its own Fake wires.
+        let other = st.store().create_session().id();
+        let _ = install_two_parallel_safe_host_wires(&st, other, None);
+
+        let big = "x".repeat(256 * 1024);
+        let (first, _) = dpbw_steer(&st, sid, big).await;
+        let end_b = dpbw_end_turn(&st, sid, "beta").await;
+        let (second, el2) = dpbw_steer(&st, sid, "dpbw-m3-two".into()).await;
+        let (ctrl, _) = dpbw_steer(&st, other, "dpbw-m3-other".into()).await;
+
+        assert!(
+            ctrl.as_ref().is_some_and(|(c, _)| *c == StatusCode::OK),
+            "cross-Session steer finishes"
+        );
+        let (ce, be) = end_b.expect("end-turn B wedged");
+        assert_eq!(ce, StatusCode::OK, "end-turn B body={be}");
+        let (c2, b2) = second.unwrap_or_else(|| {
+            panic!("same-Session follow-up steer wedged > {DPBW_BOUND:?} behind deaf A")
+        });
+        assert_eq!(c2, StatusCode::OK, "body={b2}");
+        assert!(el2 <= DPBW_BOUND, "follow-up elapsed={el2:?}");
+        assert!(
+            first.as_ref().is_some_and(|(c, _)| *c == StatusCode::OK),
+            "first steer wedged on a deaf CLI"
+        );
+        assert!(
+            st.runtime.classify(sid, a).unwrap() == hearth::Liveness::LiveInTurn,
+            "A still in its open turn (skipped, never reminted under it)"
+        );
+        let (old_b, _, _, _) = sdp_wire(&st, sid, b);
+        let pb = sdp_prompts(&old_b);
+        assert_eq!(pb.len(), 2, "B: big prompt + follow-up");
+        assert_eq!(sdp_prompt_text(&pb[1]), "dpbw-m3-two");
+        // A's child is still alive (deaf, not dead) through the follow-ups.
+        let sw = session_wires_arc(&st, sid);
+        let mut wires = sw.lock().unwrap();
+        assert_eq!(wires.get_mut(a).unwrap().old.try_wait().unwrap(), None);
+    }
+
+    /// M4: failed delivery ⇒ `OldWire::TransportError` on THAT Agent only.
+    /// (i) EPIPE: A's Real CLI exited after init while evidence says
+    /// LiveIdle. (ii) timeout: deaf A + big steer. In both, B stays LiveIdle;
+    /// `end-turn` A → next steer remints A (+1 mint), the resumed runner gets
+    /// `session/resume` then exactly one `session/prompt`; never ReuseLive
+    /// on the poisoned wire. Kills: (c) no mark; (d) mark peer / all;
+    /// (f) mark Unknown; immediate remint under the open turn.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn http_send_error_marks_wire_lost_then_remints_after_end_turn() {
+        use hearth_agent_wire::OldWire;
+        for case in ["epipe", "timeout"] {
+            let st = AppState::new(vec![]);
+            let session = st.store().create_session();
+            let sid = session.id();
+            let (a, b, _) = install_two_parallel_safe_host_wires(&st, sid, None);
+            let (deaf, text) = match case {
+                "epipe" => (dpbw_deaf(0), "dpbw-m4-one".to_string()),
+                _ => (dpbw_deaf(10), "x".repeat(256 * 1024)),
+            };
+            dpbw_swap_old(&st, sid, a, deaf);
+            if case == "epipe" {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            }
+            assert_eq!(host_old_wire(&st, sid, a), OldWire::LiveIdle, "{case}");
+            let m0 = count_mints(&st, sid);
+
+            let (r1, _) = dpbw_steer(&st, sid, text).await;
+            let (c1, _) = r1.unwrap_or_else(|| panic!("{case}: steer 1 wedged"));
+            assert_eq!(c1, StatusCode::OK, "{case}");
+            let ev_a = host_old_wire(&st, sid, a);
+            assert!(
+                matches!(ev_a, OldWire::TransportError(_)),
+                "{case}: failed delivery marks A TransportError, got {ev_a:?}"
+            );
+            assert_eq!(
+                host_old_wire(&st, sid, b),
+                OldWire::LiveIdle,
+                "{case}: peer B untouched"
+            );
+            assert_eq!(
+                count_mints(&st, sid),
+                m0,
+                "{case}: no remint under the open turn"
+            );
+            assert_eq!(
+                st.runtime.classify(sid, a).unwrap(),
+                hearth::Liveness::LiveInTurn,
+                "{case}: A's turn stays open until end-turn"
+            );
+
+            let (ce, be) = dpbw_end_turn(&st, sid, "alpha")
+                .await
+                .unwrap_or_else(|| panic!("{case}: end-turn wedged"));
+            assert_eq!(ce, StatusCode::OK, "{case}: end-turn body={be}");
+            let (r2, _) = dpbw_steer(&st, sid, "dpbw-m4-two".into()).await;
+            let (c2, b2) = r2.unwrap_or_else(|| panic!("{case}: steer 2 wedged"));
+            assert_eq!(c2, StatusCode::OK, "{case}: body={b2}");
+            assert_eq!(
+                count_mints(&st, sid),
+                m0 + 1,
+                "{case}: A reminted once (never ReuseLive on the poisoned wire)"
+            );
+            assert_eq!(host_old_wire(&st, sid, a), OldWire::LiveIdle, "{case}");
+            let (old_a, _, _, _) = sdp_wire(&st, sid, a);
+            assert_eq!(
+                sdp_methods(&old_a),
+                vec![
+                    "initialize".to_string(),
+                    "session/resume".to_string(),
+                    "session/prompt".to_string()
+                ],
+                "{case}: resumed runner gets resume then exactly one prompt"
+            );
+            assert_eq!(sdp_prompt_text(&sdp_prompts(&old_a)[0]), "dpbw-m4-two");
+        }
+    }
+
+    /// M5: no false timeout. A slow-but-reading Real CLI (reads after
+    /// ~300 ms) gets the full ≥256 KiB prompt byte for byte; evidence stays
+    /// LiveIdle. Kills: (e) first WouldBlock = error / zero deadline;
+    /// partial-write loss.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn http_slow_reader_gets_full_prompt_no_false_timeout() {
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let (a, _b, _) = install_two_parallel_safe_host_wires(&st, sid, None);
+        let out =
+            std::env::temp_dir().join(format!("hearth-dpbw-slow-{}-{}", std::process::id(), sid.0));
+        let _ = std::fs::remove_file(&out);
+        dpbw_swap_old(
+            &st,
+            sid,
+            a,
+            dpbw_real_initialized(&format!(
+                "sleep 0.3; IFS= read -r p; printf '%s' \"$p\" > {}; exec sleep 5",
+                out.display()
+            )),
+        );
+        let big = "z".repeat(256 * 1024);
+        let (r, _) = dpbw_steer(&st, sid, big.clone()).await;
+        let (c, body) = r.expect("slow-reader steer bounded");
+        assert_eq!(c, StatusCode::OK, "body len={}", body.len());
+        let mut got = String::new();
+        for _ in 0..100 {
+            got = std::fs::read_to_string(&out).unwrap_or_default();
+            if serde_json::from_str::<serde_json::Value>(&got).is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let _ = std::fs::remove_file(&out);
+        let v: serde_json::Value = serde_json::from_str(&got)
+            .unwrap_or_else(|e| panic!("full prompt frame ({} bytes): {e}", got.len()));
+        assert_eq!(v["method"], "session/prompt");
+        assert_eq!(sdp_prompt_text(&v), big, "full prompt byte for byte");
+        assert_eq!(
+            host_old_wire(&st, sid, a),
+            hearth_agent_wire::OldWire::LiveIdle,
+            "no false timeout"
+        );
+    }
 }

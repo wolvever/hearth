@@ -134,6 +134,25 @@ impl AgentHostWire {
         self.old
             .write_command_request(&cmd, &mut self.old_next_rpc_id)
     }
+
+    /// deliver-prompt-bounded-write: [`Self::deliver_prompt`], and on a send
+    /// error mark THIS wire lost (`OldWire::TransportError`). The bounded
+    /// Real write may have left a partial JSONL frame, so the wire must not
+    /// be ReuseLive again; the next wake (after `end-turn`) remints through
+    /// the existing `host_wake` lost path. `NotInitialized` (unreachable
+    /// after settle; nothing was written) leaves evidence unchanged.
+    pub fn deliver_prompt_or_mark_lost(
+        &mut self,
+        text: &str,
+    ) -> Result<u64, hearth_agent_wire::BusError> {
+        let r = self.deliver_prompt(text);
+        if let Err(e) = &r {
+            if !matches!(e, hearth_agent_wire::BusError::NotInitialized) {
+                self.old_wire = OldWire::TransportError(e.to_string());
+            }
+        }
+        r
+    }
 }
 
 /// Per-Session Host wires. Lock held across `host_wake` for this Session only.
@@ -215,8 +234,11 @@ impl SessionWires {
             // Trigger turn_start and the settle (Reminted ⇒ `old` is the
             // resumed runner, strictly after `session/resume`). One
             // ToolResult-shaped `session/prompt`. AppliedWakeWaiting /
-            // NotApplied / Err send nothing. No drain.
-            let _ = wire.deliver_prompt(&tool_result_prompt_text(tool_call_id, output));
+            // NotApplied / Err send nothing. No drain. A send error marks
+            // this wire lost (deliver-prompt-bounded-write); the response
+            // stays Applied (the Trigger TurnStart is already on the log).
+            let _ =
+                wire.deliver_prompt_or_mark_lost(&tool_result_prompt_text(tool_call_id, output));
         }
         self.agents.insert(agent, wire);
         result
@@ -295,10 +317,13 @@ impl SessionWires {
         // nothing. One Agent's send error never skips its peers and never
         // turns the steer into an error (its TurnStart is already on the
         // log; the turn closes via end-turn like any Host turn — Soft).
+        // deliver-prompt-bounded-write: the Real write is bounded by
+        // `STDIN_WRITE_TIMEOUT`, and a send error marks only THAT Agent's
+        // wire `OldWire::TransportError` (next wake after end-turn remints).
         if let (Ok(WakeEachKeptThroughHost::Woke { woke, .. }), Some(text)) = (&result, &prompt) {
             for (agent, _) in woke {
                 if let Some(w) = self.agents.get_mut(agent) {
-                    let _ = w.deliver_prompt(text);
+                    let _ = w.deliver_prompt_or_mark_lost(text);
                 }
             }
         }
