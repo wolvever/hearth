@@ -20,10 +20,10 @@ use std::time::Duration;
 use hearth::{AgentId, Event, Place, SessionId, Wake};
 use hearth_agent_wire::{
     complete_host_tool, settle_host_wire_after_wake, transport_for_wire,
-    wake_each_kept_through_host_wake, AttachRunner, CompleteHostTool, CompleteHostToolArgs,
-    CompleteHostToolError, HostRemintFullArgs, KeptWakeWire, LaunchSpec, OldWire, RemintSession,
-    RpcId, RunnerTransport, WakeEachKeptThroughHost, WakeEachKeptThroughHostArgs, WakeThroughError,
-    WireKind,
+    wake_each_kept_through_host_wake, AgentCommand, AttachRunner, CompleteHostTool,
+    CompleteHostToolArgs, CompleteHostToolError, HostRemintFullArgs, KeptWakeWire, LaunchSpec,
+    OldWire, RemintSession, RpcId, RunnerTransport, WakeEachKeptThroughHost,
+    WakeEachKeptThroughHostArgs, WakeThroughError, WireKind,
 };
 
 use crate::AppState;
@@ -120,6 +120,22 @@ impl AgentHostWire {
     }
 }
 
+impl AgentHostWire {
+    /// Steer-delivers-prompt (A1): write one ACP `session/prompt`
+    /// ([`AgentCommand::UserMessage`]) on the settled `old` runner, addressed
+    /// to this wire's [`RemintSession::agent_session_id`], with a JSON-RPC id
+    /// from `old_next_rpc_id` (bumped). Gated write (never before
+    /// `initialize`). Call only after settle. No drain.
+    pub fn deliver_prompt(&mut self, text: &str) -> Result<u64, hearth_agent_wire::BusError> {
+        let cmd = AgentCommand::UserMessage {
+            session_id: self.remint.agent_session_id(),
+            text: text.to_string(),
+        };
+        self.old
+            .write_command_request(&cmd, &mut self.old_next_rpc_id)
+    }
+}
+
 /// Per-Session Host wires. Lock held across `host_wake` for this Session only.
 #[derive(Default)]
 pub struct SessionWires {
@@ -195,6 +211,12 @@ impl SessionWires {
                 &mut wire.old_next_rpc_id,
                 &mut wire.new_next_rpc_id,
             );
+            // Steer-delivers-prompt (A1): Applied only, after the kernel
+            // Trigger turn_start and the settle (Reminted ⇒ `old` is the
+            // resumed runner, strictly after `session/resume`). One
+            // ToolResult-shaped `session/prompt`. AppliedWakeWaiting /
+            // NotApplied / Err send nothing. No drain.
+            let _ = wire.deliver_prompt(&tool_result_prompt_text(tool_call_id, output));
         }
         self.agents.insert(agent, wire);
         result
@@ -217,6 +239,12 @@ impl SessionWires {
         session_id: SessionId,
         wake: Wake,
     ) -> Result<WakeEachKeptThroughHost, WakeThroughError> {
+        // Steer-delivers-prompt (A1): only a user steer carries text to
+        // deliver. Timer / Trigger fan-out (no product ingress) sends none.
+        let prompt = match &wake {
+            Wake::UserQuery { text, .. } => Some(text.clone()),
+            Wake::Timer | Wake::Trigger { .. } => None,
+        };
         let keys: Vec<AgentId> = self.agents.keys().copied().collect();
         let mut owned: Vec<(AgentId, AgentHostWire)> = Vec::with_capacity(keys.len());
         for a in keys {
@@ -260,8 +288,36 @@ impl SessionWires {
         for (a, w) in owned {
             self.agents.insert(a, w);
         }
+        // Steer-delivers-prompt (A1): after admit → classify → gate → remint
+        // → settle → kernel, write one `session/prompt` per Agent the kernel
+        // actually turn_started (`woke`, never `hosts`: a host_wake-admitted
+        // Agent the kernel re-check Waited gets none). Waiting / Err send
+        // nothing. One Agent's send error never skips its peers and never
+        // turns the steer into an error (its TurnStart is already on the
+        // log; the turn closes via end-turn like any Host turn — Soft).
+        if let (Ok(WakeEachKeptThroughHost::Woke { woke, .. }), Some(text)) = (&result, &prompt) {
+            for (agent, _) in woke {
+                if let Some(w) = self.agents.get_mut(agent) {
+                    let _ = w.deliver_prompt(text);
+                }
+            }
+        }
         result
     }
+}
+
+/// ToolResult-shaped `session/prompt` text for a RAP Trigger (DESIGN
+/// Steer-delivers-prompt): one JSON object
+/// `{"type":"tool_result","tool_call_id":<id>,"output":<output>}` serialized
+/// as the single ACP text block. `output` is the Service-folded output
+/// (`[error] …` when `is_error`).
+pub fn tool_result_prompt_text(tool_call_id: &str, output: &str) -> String {
+    serde_json::json!({
+        "type": "tool_result",
+        "tool_call_id": tool_call_id,
+        "output": output,
+    })
+    .to_string()
 }
 
 /// Cross-Session index of per-Session wire locks.
