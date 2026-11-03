@@ -9120,8 +9120,9 @@ mod tests {
 
     /// M2: RAP with a deaf Real A and an unmatched Host ToolCall; a ≥200 KiB
     /// tool-result output returns 200 applied:true within the bound;
-    /// ToolResult + TurnStart on the log; lock free. Kills: (a); bounding
-    /// only the steer path.
+    /// ToolResult + TurnStart on the log; lock free; A's evidence
+    /// TransportError. Kills: (a); bounding only the steer path; RAP send
+    /// error not marking the wire lost.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn http_rap_deaf_cli_large_output_bounded() {
         let st = AppState::new(vec![]);
@@ -9163,6 +9164,11 @@ mod tests {
         assert_eq!(
             st.runtime.classify(sid, a).unwrap(),
             hearth::Liveness::LiveInTurn
+        );
+        let ev = host_old_wire(&st, sid, a);
+        assert!(
+            matches!(ev, hearth_agent_wire::OldWire::TransportError(_)),
+            "RAP send timeout marks A lost, got {ev:?}"
         );
     }
 
