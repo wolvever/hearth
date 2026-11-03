@@ -9000,8 +9000,10 @@ mod tests {
     // the next wake (after end-turn) remints. Real `sh -c` children only:
     // the Fake arm has no pipe and cannot show the wedge.
 
-    /// Floor bound: `STDIN_WRITE_TIMEOUT` (2 s) + 3 s slack.
-    const DPBW_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+    /// Floor bound: `STDIN_WRITE_TIMEOUT` + 3 s slack (5 s literal in the
+    /// floors-only RED commit, before the const existed).
+    const DPBW_BOUND: std::time::Duration =
+        hearth_agent_wire::STDIN_WRITE_TIMEOUT.saturating_add(std::time::Duration::from_secs(3));
 
     /// Real JSONL child that answers `initialize` (id 0), then runs `tail`.
     fn dpbw_real_initialized(tail: &str) -> hearth_agent_wire::AttachRunner {
