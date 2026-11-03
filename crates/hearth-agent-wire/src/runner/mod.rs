@@ -7848,4 +7848,89 @@ mod tests {
         assert!(new.stdin_log().unwrap().is_empty());
         assert_ne!(old.try_wait().unwrap(), Some(9));
     }
+
+    // ---- deliver-prompt-bounded-write (M5 wire floor) ----
+
+    /// Floor bound: `STDIN_WRITE_TIMEOUT` (2 s) + 3 s slack.
+    const DPBW_BOUND: Duration = Duration::from_secs(5);
+
+    fn dpbw_real_initialized(tail: &str) -> AttachRunner {
+        let script = format!(
+            "IFS= read -r l; printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{{\"protocolVersion\":1}}}}'; {tail}"
+        );
+        let mut r = AttachRunner::spawn(LaunchSpec {
+            program: "sh".into(),
+            args: vec!["-c".into(), script],
+            cwd: None,
+            env: Vec::new(),
+            wire: WireKind::JsonlRpc,
+        })
+        .expect("spawn Real CLI");
+        r.initialize_host(&mut transport_for_wire(WireKind::JsonlRpc), &RpcId::Num(0))
+            .expect("initialize Real CLI");
+        r
+    }
+
+    /// Run one Real agent-bound write on a thread; `None` = still blocked
+    /// after `DPBW_BOUND` (the runner and its child are leaked to the thread,
+    /// which ends when the finite-sleep child exits).
+    fn dpbw_write_on_thread(
+        mut r: AttachRunner,
+        bytes: Vec<u8>,
+    ) -> Option<(Result<(), BusError>, Duration, AttachRunner)> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let t0 = std::time::Instant::now();
+            let res = r.write_bytes(&bytes);
+            let _ = tx.send((res, t0.elapsed(), r));
+        });
+        rx.recv_timeout(DPBW_BOUND).ok()
+    }
+
+    /// M5 (wire): a never-reading pipe → agent-bound write returns
+    /// `Transport(.. timed out ..)` within the deadline (not instantly, not
+    /// forever); a pipe drained after ~300 ms completes and the reader gets
+    /// every byte. Kills: (a) blocking write_all; (e) first WouldBlock =
+    /// error / zero deadline; partial-write loss (no short-write loop).
+    #[test]
+    fn write_bounded_times_out_on_deaf_pipe_and_completes_on_slow_reader() {
+        let big: Vec<u8> = {
+            let mut v = vec![b'x'; 256 * 1024];
+            v.push(b'\n');
+            v
+        };
+
+        // Deaf: initialized, never reads stdin again.
+        let deaf = dpbw_real_initialized("exec sleep 10");
+        let (res, elapsed, _deaf) = dpbw_write_on_thread(deaf, big.clone())
+            .unwrap_or_else(|| panic!("deaf write blocked > {DPBW_BOUND:?} (unbounded)"));
+        match &res {
+            Err(BusError::Transport(m)) => assert!(m.contains("timed out"), "msg={m}"),
+            other => panic!("deaf write must be Transport(timed out), got {other:?}"),
+        }
+        assert!(elapsed <= DPBW_BOUND, "elapsed={elapsed:?}");
+
+        // Slow reader: starts draining after ~300 ms.
+        let out = std::env::temp_dir().join(format!("hearth-dpbw-wire-{}", std::process::id()));
+        let _ = std::fs::remove_file(&out);
+        let slow = dpbw_real_initialized(&format!(
+            "sleep 0.3; head -c {} > {}; exec sleep 5",
+            big.len(),
+            out.display()
+        ));
+        let (res, _, _slow) = dpbw_write_on_thread(slow, big.clone())
+            .unwrap_or_else(|| panic!("slow-reader write blocked > {DPBW_BOUND:?}"));
+        res.expect("slow reader: no false timeout");
+        let mut got = Vec::new();
+        for _ in 0..100 {
+            got = std::fs::read(&out).unwrap_or_default();
+            if got.len() >= big.len() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = std::fs::remove_file(&out);
+        assert_eq!(got.len(), big.len(), "every byte reached the reader");
+        assert!(got == big, "bytes exact");
+    }
 }
