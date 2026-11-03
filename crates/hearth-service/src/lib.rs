@@ -8363,4 +8363,632 @@ mod tests {
         let l2 = stl_drain(&mut ws, 400).await;
         stl_assert_exact("M8 end-turn", &st, sid, len1, &l2);
     }
+
+    // ---- Steer-delivers-prompt (A1 deliver-only, M1–M6) ----
+    //
+    // A Host-wired steer / RAP Trigger that opens a kernel turn must also
+    // write exactly one `session/prompt` on that Agent's settled `old`
+    // runner. No drain: turns still close only via POST end-turn.
+
+    /// Parse a Fake runner's stdin JSONL into values (`None` → empty).
+    fn sdp_lines(log: Option<&[u8]>) -> Vec<serde_json::Value> {
+        std::str::from_utf8(log.unwrap_or(&[]))
+            .unwrap()
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    /// `(old lines, new lines, old byte len, new byte len)` for one Agent.
+    fn sdp_wire(
+        st: &AppState,
+        sid: SessionId,
+        agent: hearth::AgentId,
+    ) -> (Vec<serde_json::Value>, Vec<serde_json::Value>, usize, usize) {
+        let sw = session_wires_arc(st, sid);
+        let wires = sw.lock().unwrap();
+        let w = wires.get(agent).unwrap();
+        (
+            sdp_lines(w.old.stdin_log()),
+            sdp_lines(w.new.stdin_log()),
+            w.old.stdin_log().map_or(0, <[u8]>::len),
+            w.new.stdin_log().map_or(0, <[u8]>::len),
+        )
+    }
+
+    fn sdp_methods(lines: &[serde_json::Value]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|v| v["method"].as_str().unwrap_or("").to_string())
+            .collect()
+    }
+
+    fn sdp_prompts(lines: &[serde_json::Value]) -> Vec<serde_json::Value> {
+        lines
+            .iter()
+            .filter(|v| v["method"] == "session/prompt")
+            .cloned()
+            .collect()
+    }
+
+    fn sdp_prompt_text(p: &serde_json::Value) -> String {
+        let blocks = p["params"]["prompt"].as_array().expect("prompt blocks");
+        assert_eq!(blocks.len(), 1, "one text block: {p}");
+        assert_eq!(blocks[0]["type"], "text", "{p}");
+        blocks[0]["text"].as_str().expect("text").to_string()
+    }
+
+    fn sdp_agent_session_id(st: &AppState, sid: SessionId, agent: hearth::AgentId) -> String {
+        let sw = session_wires_arc(st, sid);
+        let wires = sw.lock().unwrap();
+        wires
+            .get(agent)
+            .unwrap()
+            .remint
+            .agent_session_id()
+            .to_string()
+    }
+
+    fn sdp_prompt_count(st: &AppState, sid: SessionId, agent: hearth::AgentId) -> (usize, usize) {
+        let (old, new, _, _) = sdp_wire(st, sid, agent);
+        (sdp_prompts(&old).len(), sdp_prompts(&new).len())
+    }
+
+    fn sdp_count(st: &AppState, sid: SessionId, f: impl Fn(&EventBody) -> bool) -> usize {
+        st.store()
+            .session(sid)
+            .unwrap()
+            .events()
+            .unwrap()
+            .iter()
+            .filter(|e| f(&e.body))
+            .count()
+    }
+
+    async fn sdp_steer(
+        st: &AppState,
+        sid: SessionId,
+        user: &str,
+        text: &str,
+    ) -> (StatusCode, String) {
+        let id = sid.0.to_string();
+        let body = serde_json::json!({ "user": user, "message": text }).to_string();
+        call(
+            router(st.clone()),
+            Request::post(format!("/sessions/{id}/events"))
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+    }
+
+    async fn sdp_tool_result(
+        st: &AppState,
+        sid: SessionId,
+        agent_name: &str,
+        tool_call_id: &str,
+        output: &str,
+    ) -> (StatusCode, String) {
+        let id = sid.0.to_string();
+        let body =
+            serde_json::json!({ "tool_call_id": tool_call_id, "output": output }).to_string();
+        call(
+            router(st.clone()),
+            Request::post(format!("/sessions/{id}/agents/{agent_name}/tool-result"))
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+    }
+
+    async fn sdp_end_turn(st: &AppState, sid: SessionId, agent_name: &str) -> (StatusCode, String) {
+        let id = sid.0.to_string();
+        call(
+            router(st.clone()),
+            Request::post(format!("/sessions/{id}/agents/{agent_name}/end-turn"))
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+    }
+
+    /// The documented ToolResult-shaped prompt text (DESIGN
+    /// Steer-delivers-prompt): one JSON object
+    /// `{"type":"tool_result","tool_call_id":..,"output":..}`.
+    fn sdp_assert_tool_result_prompt(p: &serde_json::Value, tool_call_id: &str, output: &str) {
+        let text = sdp_prompt_text(p);
+        let v: serde_json::Value = serde_json::from_str(&text)
+            .unwrap_or_else(|e| panic!("ToolResult shape JSON: {e}: {text}"));
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "type": "tool_result",
+                "tool_call_id": tool_call_id,
+                "output": output,
+            }),
+            "ToolResult-shaped prompt"
+        );
+    }
+
+    /// M1: ReuseLive steer on two ParallelSafe Host wires → 200, both
+    /// LiveInTurn; each Agent's `old` stdin has exactly one `session/prompt`
+    /// with text == T, after `initialize`; `new` stays empty; A's prompt is
+    /// addressed to A's agent session, never B's.
+    /// Kills: no send (tip); first-woke-only; double send; send on `new`.
+    #[tokio::test]
+    async fn http_steer_reuse_live_delivers_prompt_once_each() {
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let (a, b, _) = install_two_parallel_safe_host_wires(&st, sid, None);
+        let t = "sdp-m1 deliver me";
+        let (code, body) = sdp_steer(&st, sid, "cheng", t).await;
+        assert_eq!(code, StatusCode::OK, "body={body}");
+        for ag in [a, b] {
+            assert_eq!(
+                st.runtime.classify(sid, ag).unwrap(),
+                hearth::Liveness::LiveInTurn
+            );
+        }
+        let (sa, sb) = (
+            sdp_agent_session_id(&st, sid, a),
+            sdp_agent_session_id(&st, sid, b),
+        );
+        for (ag, own, peer) in [(a, &sa, &sb), (b, &sb, &sa)] {
+            let (old, new, _, new_len) = sdp_wire(&st, sid, ag);
+            assert_eq!(
+                sdp_methods(&old),
+                vec!["initialize".to_string(), "session/prompt".to_string()],
+                "Agent {ag:?}: initialize then exactly one prompt: {old:?}"
+            );
+            let prompts = sdp_prompts(&old);
+            assert_eq!(prompts.len(), 1, "Agent {ag:?} exactly one prompt");
+            assert_eq!(sdp_prompt_text(&prompts[0]), t, "text == T");
+            assert_eq!(prompts[0]["params"]["sessionId"], own.as_str());
+            assert!(
+                old.iter()
+                    .all(|l| l["params"]["sessionId"] != peer.as_str()),
+                "Agent {ag:?} never gets the peer's prompt line"
+            );
+            assert!(new.is_empty() && new_len == 0, "new stdin empty: {new:?}");
+        }
+    }
+
+    /// M2: Reminted steer (both lost `Exited(1)`) → 200, both LiveInTurn,
+    /// +1 mint each. On each settled `old` (= resumed runner) the method
+    /// order is exactly `initialize`, `session/resume`, `session/prompt`.
+    /// The killed child (now `new`) has zero `session/prompt`.
+    /// Kills: send pre-settle / before resume; send on both runners; extra remint.
+    #[tokio::test]
+    async fn http_steer_reminted_prompt_after_resume_once() {
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let (a, b, _) = install_two_parallel_safe_host_wires(
+            &st,
+            sid,
+            Some(hearth_agent_wire::OldWire::Exited(1)),
+        );
+        let m0 = count_mints(&st, sid);
+        let t = "sdp-m2 after resume";
+        let (code, body) = sdp_steer(&st, sid, "cheng", t).await;
+        assert_eq!(code, StatusCode::OK, "body={body}");
+        assert_eq!(count_mints(&st, sid), m0 + 2, "one mint each");
+        for ag in [a, b] {
+            assert_eq!(
+                st.runtime.classify(sid, ag).unwrap(),
+                hearth::Liveness::LiveInTurn
+            );
+            assert_eq!(
+                host_old_wire(&st, sid, ag),
+                hearth_agent_wire::OldWire::LiveIdle
+            );
+            let (old, new, _, _) = sdp_wire(&st, sid, ag);
+            assert_eq!(
+                sdp_methods(&old),
+                vec![
+                    "initialize".to_string(),
+                    "session/resume".to_string(),
+                    "session/prompt".to_string()
+                ],
+                "Agent {ag:?}: prompt strictly after resume on the resumed runner"
+            );
+            assert_eq!(sdp_prompt_text(&sdp_prompts(&old)[0]), t);
+            assert!(
+                sdp_prompts(&new).is_empty(),
+                "Agent {ag:?}: killed child got no prompt: {new:?}"
+            );
+        }
+    }
+
+    /// M3 (ReuseLive): yielded Host-wired A with an unmatched Host ToolCall →
+    /// POST tool-result → Applied, A LiveInTurn; A's `old` has exactly one
+    /// ToolResult-shaped `session/prompt` (tool_call_id + output). B none.
+    /// A re-POST (NotApplied) sends no second prompt.
+    /// Kills: RAP path not wired; prompt on NotApplied; plain user-text shape.
+    #[tokio::test]
+    async fn http_rap_trigger_delivers_tool_result_prompt_once() {
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let (a, b, _) = install_two_parallel_safe_host_wires(&st, sid, None);
+        record_host_tool_call(&st, sid, a, "tc-sdp", "sdp_tool");
+        let (code, body) = sdp_tool_result(&st, sid, "alpha", "tc-sdp", "result-payload").await;
+        assert_eq!(code, StatusCode::OK, "body={body}");
+        assert!(body.contains(r#""applied":true"#), "body={body}");
+        assert_eq!(
+            st.runtime.classify(sid, a).unwrap(),
+            hearth::Liveness::LiveInTurn
+        );
+        let (old, new, len_a, _) = sdp_wire(&st, sid, a);
+        assert_eq!(
+            sdp_methods(&old),
+            vec!["initialize".to_string(), "session/prompt".to_string()],
+            "{old:?}"
+        );
+        let prompts = sdp_prompts(&old);
+        sdp_assert_tool_result_prompt(&prompts[0], "tc-sdp", "result-payload");
+        assert_eq!(
+            prompts[0]["params"]["sessionId"],
+            sdp_agent_session_id(&st, sid, a).as_str()
+        );
+        assert!(new.is_empty(), "A new untouched");
+        assert_eq!(sdp_prompt_count(&st, sid, b), (0, 0), "peer B no prompt");
+
+        let (code, body) = sdp_tool_result(&st, sid, "alpha", "tc-sdp", "result-payload").await;
+        assert_eq!(code, StatusCode::OK, "body={body}");
+        assert!(body.contains(r#""applied":false"#), "body={body}");
+        let (_, _, len_a2, _) = sdp_wire(&st, sid, a);
+        assert_eq!(len_a2, len_a, "NotApplied re-POST: zero bytes written");
+        assert_eq!(sdp_prompt_count(&st, sid, a), (1, 0));
+    }
+
+    /// M3 (Reminted twin): lost A → POST tool-result → Applied, +1 mint; the
+    /// resumed `old` reads `initialize`, `session/resume`, then one
+    /// ToolResult-shaped `session/prompt`. Killed child zero. Re-POST zero.
+    #[tokio::test]
+    async fn http_rap_trigger_delivers_tool_result_prompt_once_reminted() {
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let (a, b, _) = install_two_parallel_safe_host_wires(
+            &st,
+            sid,
+            Some(hearth_agent_wire::OldWire::Exited(1)),
+        );
+        record_host_tool_call(&st, sid, a, "tc-sdp-r", "sdp_tool");
+        let m0 = count_mints(&st, sid);
+        let (code, body) = sdp_tool_result(&st, sid, "alpha", "tc-sdp-r", "r-out").await;
+        assert_eq!(code, StatusCode::OK, "body={body}");
+        assert!(body.contains(r#""applied":true"#), "body={body}");
+        assert_eq!(count_mints(&st, sid), m0 + 1, "A reminted once");
+        let (old, new, len_a, _) = sdp_wire(&st, sid, a);
+        assert_eq!(
+            sdp_methods(&old),
+            vec![
+                "initialize".to_string(),
+                "session/resume".to_string(),
+                "session/prompt".to_string()
+            ],
+            "{old:?}"
+        );
+        sdp_assert_tool_result_prompt(&sdp_prompts(&old)[0], "tc-sdp-r", "r-out");
+        assert!(sdp_prompts(&new).is_empty(), "killed child no prompt");
+        assert_eq!(sdp_prompt_count(&st, sid, b), (0, 0), "peer B no prompt");
+
+        let (code, body) = sdp_tool_result(&st, sid, "alpha", "tc-sdp-r", "r-out").await;
+        assert_eq!(code, StatusCode::OK, "body={body}");
+        assert!(body.contains(r#""applied":false"#), "body={body}");
+        assert_eq!(sdp_wire(&st, sid, a).2, len_a, "re-POST zero bytes");
+    }
+
+    /// M4 (a)+(b): zero prompt on every non-woke Agent.
+    /// (a) B `Unknown` → Waiting: A gets one, B zero on old and new. Then
+    /// with B LiveIdle, a second steer skips A at classify (LiveInTurn): A
+    /// still one, B one.
+    /// (b) FailClosed-skip peer (no-resume caps, lost): zero on its old and
+    /// new; the resume-capable peer gets exactly one, after resume.
+    /// Kills: send to every wired Agent; send on Waiting / skipped.
+    #[tokio::test]
+    async fn http_steer_no_prompt_on_skipped_waiting_failclosed() {
+        use hearth_agent_wire::{LiveCaps as WireCaps, OldWire};
+
+        // (a) Unknown → Waiting, then classify-skip LiveInTurn.
+        let st = AppState::new(vec![]);
+        let sid = st.store().create_session().id();
+        let (a, b, _) = install_two_parallel_safe_host_wires(&st, sid, None);
+        st.set_host_old_wire(sid, b, OldWire::Unknown).unwrap();
+        let (code, body) = sdp_steer(&st, sid, "cheng", "sdp-m4a-1").await;
+        assert_eq!(code, StatusCode::OK, "body={body}");
+        assert_eq!(sdp_prompt_count(&st, sid, a), (1, 0), "A woke: one");
+        assert_eq!(sdp_prompt_count(&st, sid, b), (0, 0), "Unknown B: zero");
+        let (_, _, ob, nb) = sdp_wire(&st, sid, b);
+        assert_eq!(nb, 0, "B new untouched");
+
+        st.set_host_old_wire(sid, b, OldWire::LiveIdle).unwrap();
+        let (_, _, oa, _) = sdp_wire(&st, sid, a);
+        let (code, body) = sdp_steer(&st, sid, "cheng", "sdp-m4a-2").await;
+        assert_eq!(code, StatusCode::OK, "body={body}");
+        assert_eq!(sdp_wire(&st, sid, a).2, oa, "LiveInTurn A skipped: 0 bytes");
+        assert_eq!(sdp_prompt_count(&st, sid, a), (1, 0));
+        let (old_b, _, ob2, _) = sdp_wire(&st, sid, b);
+        assert!(ob2 > ob);
+        let pb = sdp_prompts(&old_b);
+        assert_eq!(pb.len(), 1, "B woke on steer #2: one");
+        assert_eq!(sdp_prompt_text(&pb[0]), "sdp-m4a-2");
+
+        // (b) FailClosed-skip peer.
+        let st = AppState::new(vec![]);
+        let sid = st.store().create_session().id();
+        let no_resume = WireCaps {
+            resume: false,
+            load_session: false,
+            cancel: true,
+            close: true,
+        };
+        let (a, b, _) = install_two_parallel_safe_host_wires_with_per_agent_caps(
+            &st,
+            sid,
+            Some(OldWire::Exited(1)),
+            no_resume,
+            resume_capable_caps(),
+        );
+        let (code, body) = sdp_steer(&st, sid, "cheng", "sdp-m4b").await;
+        assert_eq!(code, StatusCode::OK, "body={body}");
+        assert!(count_fail_closed(&st, sid, a) >= 1, "A FailClosed-skipped");
+        assert_eq!(sdp_prompt_count(&st, sid, a), (0, 0), "FailClosed A: zero");
+        let (old_b, new_b, _, _) = sdp_wire(&st, sid, b);
+        assert_eq!(
+            sdp_methods(&old_b),
+            vec![
+                "initialize".to_string(),
+                "session/resume".to_string(),
+                "session/prompt".to_string()
+            ]
+        );
+        assert!(sdp_prompts(&new_b).is_empty());
+    }
+
+    /// M4 (c) hosts ⊋ woke: two non-ParallelSafe idle Agents both pass the
+    /// wire-loop gate and `host_wake`, but the kernel re-check Waitings the
+    /// second. Only the kernel-woke Agent gets a prompt.
+    /// Kills: iterate `hosts` instead of `woke`.
+    #[tokio::test]
+    async fn http_steer_prompt_only_kernel_woke_not_hosts() {
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let caps = resume_capable_caps();
+        let (a, b, _) =
+            install_two_host_wires_with_declare_caps(&st, sid, None, None, None, caps, caps);
+        let (code, body) = sdp_steer(&st, sid, "cheng", "sdp-m4c").await;
+        assert_eq!(code, StatusCode::OK, "body={body}");
+        let in_turn: Vec<_> = [a, b]
+            .into_iter()
+            .filter(|ag| session.current_turn_of(*ag).unwrap().is_some())
+            .collect();
+        assert_eq!(
+            in_turn.len(),
+            1,
+            "kernel woke exactly one non-ParallelSafe Agent"
+        );
+        for ag in [a, b] {
+            let want = usize::from(in_turn.contains(&ag));
+            assert_eq!(
+                sdp_prompt_count(&st, sid, ag),
+                (want, 0),
+                "Agent {ag:?}: prompt iff kernel-woke"
+            );
+        }
+    }
+
+    /// M4 (d): RAP `AppliedWakeWaiting` → zero prompt. Both Agents in their
+    /// steer turn; a Host ToolCall on A then POST tool-result → 409 (ToolResult
+    /// appended, wake Waiting). A's stdin unchanged; re-POST (NotApplied) too.
+    /// Kills: RAP send on AppliedWakeWaiting.
+    #[tokio::test]
+    async fn http_rap_applied_wake_waiting_no_prompt() {
+        let st = AppState::new(vec![]);
+        let sid = st.store().create_session().id();
+        let (a, b, _) = install_two_parallel_safe_host_wires(&st, sid, None);
+        let (code, body) = sdp_steer(&st, sid, "cheng", "sdp-m4d").await;
+        assert_eq!(code, StatusCode::OK, "body={body}");
+        let (len_a, len_b) = (sdp_wire(&st, sid, a).2, sdp_wire(&st, sid, b).2);
+        record_host_tool_call(&st, sid, a, "tc-wait", "x");
+        let (code, body) = sdp_tool_result(&st, sid, "alpha", "tc-wait", "out").await;
+        assert_eq!(
+            code,
+            StatusCode::CONFLICT,
+            "AppliedWakeWaiting; body={body}"
+        );
+        assert_eq!(
+            count_tool_results(&st, sid, "tc-wait"),
+            1,
+            "Result appended"
+        );
+        assert_eq!(sdp_wire(&st, sid, a).2, len_a, "A: zero bytes on Waiting");
+        assert_eq!(sdp_wire(&st, sid, b).2, len_b, "B untouched");
+        let (code, body) = sdp_tool_result(&st, sid, "alpha", "tc-wait", "out").await;
+        assert_eq!(code, StatusCode::OK, "body={body}");
+        assert!(body.contains(r#""applied":false"#), "body={body}");
+        assert_eq!(
+            sdp_wire(&st, sid, a).2,
+            len_a,
+            "A: zero bytes on NotApplied"
+        );
+        assert_eq!(
+            sdp_prompt_count(&st, sid, a),
+            (1, 0),
+            "only the steer prompt"
+        );
+    }
+
+    /// M5: refused steer = zero prompt anywhere. Non-member (member of
+    /// another Session) → 403; all-Waiting gate (both Unknown) → 409; both
+    /// already LiveInTurn → 409. Every wire's old and new byte length is
+    /// unchanged by each refused request.
+    /// Kills: send before admit/gate; send on Err / Waiting.
+    #[tokio::test]
+    async fn http_refused_steer_403_409_zero_prompt() {
+        use hearth_agent_wire::OldWire;
+
+        let st = AppState::new(vec![]);
+        let sid = st.store().create_session().id();
+        let (a, b, _) = install_two_parallel_safe_host_wires(&st, sid, None);
+        wab_join_mallory_elsewhere(&st);
+        let lens = |st: &AppState| {
+            [a, b].map(|ag| {
+                let (_, _, o, n) = sdp_wire(st, sid, ag);
+                (o, n)
+            })
+        };
+        let l0 = lens(&st);
+        let (code, body) = sdp_steer(&st, sid, "mallory", "sdp-m5-403").await;
+        assert_eq!(code, StatusCode::FORBIDDEN, "body={body}");
+        assert_eq!(lens(&st), l0, "403: zero bytes on any wire");
+        for ag in [a, b] {
+            assert_eq!(sdp_prompt_count(&st, sid, ag), (0, 0));
+        }
+
+        for ag in [a, b] {
+            st.set_host_old_wire(sid, ag, OldWire::Unknown).unwrap();
+        }
+        let (code, body) = sdp_steer(&st, sid, "cheng", "sdp-m5-409u").await;
+        assert_eq!(code, StatusCode::CONFLICT, "body={body}");
+        assert_eq!(lens(&st), l0, "409 (all Waiting): zero bytes");
+        for ag in [a, b] {
+            assert_eq!(sdp_prompt_count(&st, sid, ag), (0, 0));
+            st.set_host_old_wire(sid, ag, OldWire::LiveIdle).unwrap();
+        }
+
+        let (code, body) = sdp_steer(&st, sid, "cheng", "sdp-m5-ok").await;
+        assert_eq!(code, StatusCode::OK, "body={body}");
+        let l1 = lens(&st);
+        let (code, body) = sdp_steer(&st, sid, "cheng", "sdp-m5-409t").await;
+        assert_eq!(code, StatusCode::CONFLICT, "both LiveInTurn; body={body}");
+        assert_eq!(lens(&st), l1, "409 (TurnOpen): zero bytes");
+        let (code, body) = sdp_steer(&st, sid, "mallory", "sdp-m5-403b").await;
+        assert_eq!(code, StatusCode::FORBIDDEN, "body={body}");
+        assert_eq!(lens(&st), l1, "403 mid-turn: zero bytes");
+    }
+
+    /// M5 (WS twin): non-member `{"type":"message","user":"mallory"}` →
+    /// `{"error":403}` and zero bytes on every wire.
+    #[tokio::test]
+    async fn ws_non_member_steer_zero_prompt() {
+        let st = AppState::new(vec![]);
+        let sid = st.store().create_session().id();
+        let id = sid.0.to_string();
+        let (a, b, _) = install_two_parallel_safe_host_wires(&st, sid, None);
+        wab_join_mallory_elsewhere(&st);
+        let l0 = [a, b].map(|ag| sdp_wire(&st, sid, ag).2 + sdp_wire(&st, sid, ag).3);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(axum::serve(listener, router(st.clone())).into_future());
+        let url = format!("ws://{addr}/sessions/{id}/stream");
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        ws.send(WsMsg::Text(
+            r#"{"type":"message","user":"mallory","message":"sdp-ws"}"#.into(),
+        ))
+        .await
+        .unwrap();
+        expect_text(&mut ws, r#"{"error":403}"#).await;
+        let l1 = [a, b].map(|ag| sdp_wire(&st, sid, ag).2 + sdp_wire(&st, sid, ag).3);
+        assert_eq!(l1, l0, "WS 403: zero bytes on any wire");
+        for ag in [a, b] {
+            assert_eq!(sdp_prompt_count(&st, sid, ag), (0, 0));
+        }
+        let _ = ws.close(None).await;
+    }
+
+    /// M6: identity + no auto-close. Each prompt's `params.sessionId` is THAT
+    /// wire's agent session id (A ≠ B, never the hearth SessionId); text is
+    /// byte-exact; the JSON-RPC id is present and unique on the wire. After
+    /// delivery both stay LiveInTurn with zero AgentMessage / TurnEnd. POST
+    /// end-turn A → A yields, B still LiveInTurn; a second steer → A exactly
+    /// one more prompt (total 2), B none.
+    /// Kills: hearth/peer session id; mangled text; rpc id not bumped;
+    /// auto-TurnEnd / drain (A2).
+    #[tokio::test]
+    async fn http_steer_prompt_per_agent_session_id_and_end_turn_still_required() {
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let (a, b, _) = install_two_parallel_safe_host_wires(&st, sid, None);
+        let (sa, sb) = (
+            sdp_agent_session_id(&st, sid, a),
+            sdp_agent_session_id(&st, sid, b),
+        );
+        assert_ne!(sa, sb, "helper mints distinct agent session ids");
+        let hearth_sid = sid.0.to_string();
+        let am0 = sdp_count(&st, sid, |b| matches!(b, EventBody::AgentMessage { .. }));
+        let te0 = sdp_count(&st, sid, |b| matches!(b, EventBody::TurnEnd { .. }));
+
+        let t1 = "sdp-m6 \"quoted\" ünïcode\ttab\nnewline {json}";
+        let (code, body) = sdp_steer(&st, sid, "cheng", t1).await;
+        assert_eq!(code, StatusCode::OK, "body={body}");
+        for (ag, own) in [(a, &sa), (b, &sb)] {
+            let (old, _, _, _) = sdp_wire(&st, sid, ag);
+            let p = sdp_prompts(&old);
+            assert_eq!(p.len(), 1);
+            assert_eq!(
+                p[0]["params"]["sessionId"],
+                own.as_str(),
+                "own agent session"
+            );
+            assert_ne!(p[0]["params"]["sessionId"], hearth_sid.as_str());
+            assert_eq!(sdp_prompt_text(&p[0]), t1, "byte-exact text");
+            assert!(
+                p[0]["id"].is_u64(),
+                "prompt is a JSON-RPC request: {}",
+                p[0]
+            );
+            let ids: Vec<_> = old.iter().filter_map(|l| l.get("id")).collect();
+            let uniq: std::collections::HashSet<String> =
+                ids.iter().map(|v| v.to_string()).collect();
+            assert_eq!(uniq.len(), ids.len(), "rpc ids unique on the wire: {ids:?}");
+        }
+        assert_eq!(
+            sdp_count(&st, sid, |b| matches!(b, EventBody::AgentMessage { .. })),
+            am0,
+            "no drain: zero AgentMessage"
+        );
+        assert_eq!(
+            sdp_count(&st, sid, |b| matches!(b, EventBody::TurnEnd { .. })),
+            te0,
+            "no auto-TurnEnd"
+        );
+        for ag in [a, b] {
+            assert_eq!(
+                st.runtime.classify(sid, ag).unwrap(),
+                hearth::Liveness::LiveInTurn,
+                "turn stays open until end-turn"
+            );
+        }
+
+        let (code, body) = sdp_end_turn(&st, sid, "alpha").await;
+        assert_eq!(code, StatusCode::OK, "body={body}");
+        assert_eq!(
+            st.runtime.classify(sid, a).unwrap(),
+            hearth::Liveness::LiveIdle
+        );
+        assert_eq!(
+            st.runtime.classify(sid, b).unwrap(),
+            hearth::Liveness::LiveInTurn
+        );
+
+        let (code, body) = sdp_steer(&st, sid, "cheng", "sdp-m6-two").await;
+        assert_eq!(code, StatusCode::OK, "body={body}");
+        let (old_a, _, _, _) = sdp_wire(&st, sid, a);
+        let pa = sdp_prompts(&old_a);
+        assert_eq!(pa.len(), 2, "A: exactly one more prompt");
+        assert_eq!(sdp_prompt_text(&pa[1]), "sdp-m6-two");
+        assert_ne!(pa[0]["id"], pa[1]["id"], "rpc id bumped");
+        assert_eq!(sdp_prompt_count(&st, sid, b), (1, 0), "B (in turn) none");
+    }
 }
