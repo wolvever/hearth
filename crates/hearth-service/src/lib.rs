@@ -9625,4 +9625,126 @@ mod tests {
             prompts.len()
         );
     }
+
+    // ---- ReuseLive leftover resume_session_state (post-A2) ----
+
+    /// Fake old: answered initialize; unread state_update{running} still on stdout.
+    fn reuse_live_leftover_old_with_unread_running() -> hearth_agent_wire::AttachRunner {
+        use hearth_agent_wire::{transport_for_wire, AttachRunner, JsonlRpcTransport, RpcId, WireKind};
+        let init = serde_json::json!({
+            "jsonrpc": "2.0", "id": 0, "result": { "protocolVersion": 1 }
+        });
+        let state = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "S-a",
+                "update": {
+                    "sessionUpdate": "state_update",
+                    "sessionState": "running",
+                    "background": []
+                }
+            }
+        });
+        let mut bytes = JsonlRpcTransport::encode_jsonl(&init).unwrap();
+        bytes.extend(JsonlRpcTransport::encode_jsonl(&state).unwrap());
+        let mut r = AttachRunner::spawn_fake(WireKind::JsonlRpc, bytes);
+        r.initialize_host(&mut transport_for_wire(WireKind::JsonlRpc), &RpcId::Num(0))
+            .expect("initialize");
+        r
+    }
+
+    /// M1: poll-on-deliver drain captures state_update{running} into
+    /// resume_session_state; after Host end-turn the next steer ReuseLive-settle
+    /// must not apply that leftover → must settle LiveIdle and deliver the
+    /// fresh user prompt. Tip applies leftover → LiveInTurn and skips prompt.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn http_reuse_live_leftover_running_still_prompts_after_end_turn() {
+        use hearth_agent_wire::{OldWire, ResumeSessionState};
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let (a, b, _) = install_two_parallel_safe_host_wires(&st, sid, None);
+        dpbw_swap_old(&st, sid, a, reuse_live_leftover_old_with_unread_running());
+
+        let (c1, b1) = sdp_steer(&st, sid, "cheng", "probe-p1").await;
+        assert_eq!(c1, StatusCode::OK, "steer1 body={b1}");
+        let (pa1, _) = sdp_prompt_count(&st, sid, a);
+        assert_eq!(pa1, 1, "first steer delivers prompt (drain happens after settle)");
+        // Drain during deliver must have captured running into resume_session_state.
+        {
+            let sw = session_wires_arc(&st, sid);
+            let mut wires = sw.lock().unwrap();
+            let stt = wires.get_mut(a).unwrap().old.resume_session_state();
+            assert_eq!(
+                stt,
+                Some(ResumeSessionState::Running),
+                "drain leftover must sit on resume_session_state; got {stt:?}"
+            );
+        }
+        let (ce, be) = sdp_end_turn(&st, sid, "alpha").await;
+        assert_eq!(ce, StatusCode::OK, "end-turn alpha body={be}");
+        let (ce, be) = sdp_end_turn(&st, sid, "beta").await;
+        assert_eq!(ce, StatusCode::OK, "end-turn beta body={be}");
+
+        let (c2, b2) = sdp_steer(&st, sid, "cheng", "probe-p2").await;
+        assert_eq!(c2, StatusCode::OK, "steer2 body={b2}");
+        let ev = host_old_wire(&st, sid, a);
+        let (old_a, _, _, _) = sdp_wire(&st, sid, a);
+        let prompts = sdp_prompts(&old_a);
+        let texts: Vec<String> = prompts.iter().map(sdp_prompt_text).collect();
+        eprintln!(
+            "M1: evidence={ev:?} prompts={texts:?} B={:?}",
+            sdp_prompt_count(&st, sid, b)
+        );
+        assert_eq!(
+            ev,
+            OldWire::LiveIdle,
+            "Must: ReuseLive after end-turn must settle LiveIdle (not leftover running); tip got {ev:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t == "probe-p2"),
+            "Must: second steer must deliver probe-p2; tip skipped. prompts={texts:?}"
+        );
+    }
+
+    /// M2: after end-turn, inject leftover Running on LiveIdle old; next
+    /// steer must still prompt (same Must as M1 without Fake stdout dependency).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn http_reuse_live_injected_leftover_running_still_prompts() {
+        use hearth_agent_wire::{OldWire, ResumeSessionState};
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let (a, _b, _) = install_two_parallel_safe_host_wires(&st, sid, None);
+        let (c1, _) = sdp_steer(&st, sid, "cheng", "inj-p1").await;
+        assert_eq!(c1, StatusCode::OK);
+        let (ce, _) = sdp_end_turn(&st, sid, "alpha").await;
+        assert_eq!(ce, StatusCode::OK);
+        let (ce, _) = sdp_end_turn(&st, sid, "beta").await;
+        assert_eq!(ce, StatusCode::OK);
+        {
+            let sw = session_wires_arc(&st, sid);
+            let mut wires = sw.lock().unwrap();
+            let w = wires.get_mut(a).unwrap();
+            assert_eq!(w.old_wire, OldWire::LiveIdle);
+            w.old
+                .set_resume_session_state(Some(ResumeSessionState::Running));
+        }
+        let (c2, b2) = sdp_steer(&st, sid, "cheng", "inj-p2").await;
+        assert_eq!(c2, StatusCode::OK, "body={b2}");
+        let ev = host_old_wire(&st, sid, a);
+        let (old_a, _, _, _) = sdp_wire(&st, sid, a);
+        let texts: Vec<String> = sdp_prompts(&old_a).iter().map(sdp_prompt_text).collect();
+        eprintln!("M2: evidence={ev:?} prompts={texts:?}");
+        assert_eq!(
+            ev,
+            OldWire::LiveIdle,
+            "tip leftover ⇒ LiveInTurn; Must LiveIdle; got {ev:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t == "inj-p2"),
+            "Must deliver inj-p2; tip skipped. prompts={texts:?}"
+        );
+    }
 }

@@ -8341,4 +8341,34 @@ mod tests {
             "{evidence:?}"
         );
     }
+
+    /// M3: ReuseLive settle must ignore leftover resume_session_state
+    /// (drain-captured mid-turn) and settle LiveIdle, consuming the leftover.
+    /// Tip A2 settle applies leftover → LiveInTurn (RED).
+    #[test]
+    fn reuse_live_ignores_leftover_resume_state_unit() {
+        let mut old = AttachRunner::spawn_fake(WireKind::JsonlRpc, Vec::new());
+        let mut new = AttachRunner::spawn_fake(WireKind::JsonlRpc, Vec::new());
+        let mut old_rpc = 10u64;
+        let mut new_rpc = 2u64;
+        let mut evidence = OldWire::LiveIdle;
+        old.set_resume_session_state(Some(ResumeSessionState::Running));
+        settle_host_wire_after_wake(
+            &HostWake::ReuseLive,
+            &mut evidence,
+            &mut old,
+            &mut new,
+            &mut old_rpc,
+            &mut new_rpc,
+        );
+        assert_eq!(
+            evidence,
+            OldWire::LiveIdle,
+            "Must: ReuseLive ignores leftover resume state; tip got {evidence:?}"
+        );
+        assert!(
+            old.resume_session_state().is_none(),
+            "Must: leftover resume_session_state consumed/cleared"
+        );
+    }
 }
