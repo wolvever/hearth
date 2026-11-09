@@ -1677,9 +1677,10 @@ pub struct KeptWakeWire<'a> {
     /// Host-wire-remint-settle: the Host's stored `OldWire` evidence for this
     /// Agent. When `Some`, the fan-out settles it **at remint/reuse time**
     /// (right after this Agent's [`host_wake`] returns Ok, before any peer
-    /// runs) via [`settle_host_wire_after_wake`]: evidence → LiveIdle, and on
-    /// Reminted `old`/`new` runners (+ rpc counters) swap. Survives a later
-    /// peer abort. Skipped / Waiting / FailClosed Agents keep their evidence.
+    /// runs) via [`settle_host_wire_after_wake`]: ReuseLive → LiveIdle
+    /// (clear leftover resume state); Reminted → resume-time state_update
+    /// map + `old`/`new` runner (+ rpc) swap. Survives a later peer abort.
+    /// Skipped / Waiting / FailClosed Agents keep their evidence.
     /// `None` keeps the wire-level behaviour (caller settles nothing).
     pub settle: Option<&'a mut OldWire>,
 }
@@ -1687,13 +1688,17 @@ pub struct KeptWakeWire<'a> {
 /// Host-wire-remint-settle: settle a Host wire after [`host_wake`] returned
 /// `Reminted` / `ReuseLive` for it.
 ///
-/// - `Reminted` / `ReuseLive` → settle from the runner's resume-time ACP v2
+/// - `Reminted` → settle from the **new** runner's resume-time ACP v2
 ///   `state_update` (`idle`/absent → [`OldWire::LiveIdle`]; `running` /
-///   `requires_action` → [`OldWire::LiveInTurn`]). Consumes the stored state.
-/// - `Reminted` only → swap `old`/`new` runners and their next rpc ids, so
-///   `old` is the live resumed child and `new` is the reaped one. A later
-///   genuine loss then kills the live child (one live child per Agent) and
-///   never re-initializes the resumed runner as a "new" wire.
+///   `requires_action` → [`OldWire::LiveInTurn`]). Consumes the stored state,
+///   then swaps `old`/`new` runners and their next rpc ids so `old` is the
+///   live resumed child and `new` is the reaped one. A later genuine loss
+///   then kills the live child (one live child per Agent) and never
+///   re-initializes the resumed runner as a "new" wire.
+/// - `ReuseLive` → always [`OldWire::LiveIdle`], and clear/consume any
+///   leftover `resume_session_state` on `old`. Drain-captured mid-turn
+///   `state_update` (poll-on-deliver) must not flip Host turn truth after
+///   an honest `end-turn` — resume-time state applies on Reminted only.
 /// - `Waiting` → no-op (no wire action happened; evidence unchanged).
 pub fn settle_host_wire_after_wake(
     host: &HostWake,
@@ -1715,12 +1720,11 @@ pub fn settle_host_wire_after_wake(
             std::mem::swap(old_next_rpc_id, new_next_rpc_id);
         }
         HostWake::ReuseLive => {
-            // Reuse path: consume any injected/observed state on `old`
-            // (wire unit / rare); default LiveIdle when none.
-            *old_wire = old
-                .take_resume_session_state()
-                .map(ResumeSessionState::to_old_wire)
-                .unwrap_or(OldWire::LiveIdle);
+            // Reuse path: always LiveIdle. Clear leftover resume_session_state
+            // (may have been filled by post-settle poll-on-deliver drain);
+            // Reminted-only applies resume-time state_update.
+            *old_wire = OldWire::LiveIdle;
+            let _ = old.take_resume_session_state();
         }
         HostWake::Waiting(_) => {}
     }
@@ -8271,8 +8275,10 @@ mod tests {
 
     // ---- A2 bounded-stdout-reader + resume state_update (floors-only RED) ----
 
-    /// M6 settle: tip `settle_host_wire_after_wake` hardcodes LiveIdle on
-    /// Reminted/ReuseLive — never consults a post-resume ACP v2 state_update.
+    /// A2 M6 settle (retargeted post ReuseLive-leftover cut): Reminted
+    /// consults resume-time state_update on `new` → LiveInTurn when Running.
+    /// ReuseLive leftover behaviour is covered by
+    /// `reuse_live_ignores_leftover_resume_state_unit`.
     #[test]
     fn settle_uses_resume_state_update_unit() {
         let mut old = AttachRunner::spawn_fake(WireKind::JsonlRpc, Vec::new());
@@ -8280,9 +8286,35 @@ mod tests {
         let mut old_rpc = 10u64;
         let mut new_rpc = 2u64;
         let mut evidence = OldWire::StdoutEof;
-        old.set_resume_session_state(Some(ResumeSessionState::Running));
+        // Resume ran on `new`; Reminted consumes that state then swaps.
+        new.set_resume_session_state(Some(ResumeSessionState::Running));
+        // Payload is unused by settle (match on discriminant only).
+        let reminted = HostWake::Reminted(Box::new(HostRemintFullPath {
+            outcome: RemintOutcome {
+                session_id: "S-test".into(),
+                binding_id: "B-test".into(),
+                agent_session_id: "S-a".into(),
+                wire_actions: Vec::new(),
+                resumed: true,
+                agent_context_restored: true,
+                event_count: 0,
+                permission_resurfaced: false,
+                tools_finalized: 0,
+                resynced_from_host: false,
+                turn_interrupted: false,
+                old_wire_replies: Vec::new(),
+            },
+            wires: HostRemintWires {
+                flush: OldWireFlush {
+                    dropped: 0,
+                    needs_attach_resume: true,
+                    teardown_failed: Vec::new(),
+                },
+                live_caps: None,
+            },
+        }));
         settle_host_wire_after_wake(
-            &HostWake::ReuseLive,
+            &reminted,
             &mut evidence,
             &mut old,
             &mut new,
@@ -8291,10 +8323,13 @@ mod tests {
         );
         assert!(
             !matches!(evidence, OldWire::LiveIdle),
-            "A2: settle must not hardcode LiveIdle when resume state_update is running; got {evidence:?}"
+            "A2: Reminted settle must not hardcode LiveIdle when resume state_update is running; got {evidence:?}"
         );
         assert_eq!(evidence, OldWire::LiveInTurn);
+        // After swap, live `old` holds the resumed runner; state consumed.
         assert!(old.resume_session_state().is_none(), "state consumed");
+        assert_eq!(old_rpc, 2, "rpc counters swapped with runners");
+        assert_eq!(new_rpc, 10);
     }
 
     /// M6: queue bound N + N+1 notifications ⇒ overflow TransportError.
@@ -8339,6 +8374,36 @@ mod tests {
         assert!(
             matches!(evidence, OldWire::TransportError(ref s) if s.contains("overflow")),
             "{evidence:?}"
+        );
+    }
+
+    /// M3: ReuseLive settle must ignore leftover resume_session_state
+    /// (drain-captured mid-turn) and settle LiveIdle, consuming the leftover.
+    /// Tip A2 settle applies leftover → LiveInTurn (RED).
+    #[test]
+    fn reuse_live_ignores_leftover_resume_state_unit() {
+        let mut old = AttachRunner::spawn_fake(WireKind::JsonlRpc, Vec::new());
+        let mut new = AttachRunner::spawn_fake(WireKind::JsonlRpc, Vec::new());
+        let mut old_rpc = 10u64;
+        let mut new_rpc = 2u64;
+        let mut evidence = OldWire::LiveIdle;
+        old.set_resume_session_state(Some(ResumeSessionState::Running));
+        settle_host_wire_after_wake(
+            &HostWake::ReuseLive,
+            &mut evidence,
+            &mut old,
+            &mut new,
+            &mut old_rpc,
+            &mut new_rpc,
+        );
+        assert_eq!(
+            evidence,
+            OldWire::LiveIdle,
+            "Must: ReuseLive ignores leftover resume state; tip got {evidence:?}"
+        );
+        assert!(
+            old.resume_session_state().is_none(),
+            "Must: leftover resume_session_state consumed/cleared"
         );
     }
 }
