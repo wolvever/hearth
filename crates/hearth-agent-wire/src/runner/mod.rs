@@ -12,6 +12,7 @@
 
 pub mod remint;
 
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -39,9 +40,46 @@ const READ_STDOUT_TIMEOUT: Duration = Duration::from_millis(200);
 /// [`READ_STDOUT_TIMEOUT`] (~51s) for a real child.
 const WAIT_RPC_RESULT_TIMEOUT: Duration = Duration::from_millis(256 * 200);
 
+/// Default bound on the Host-wire stdout NDJSON notification queue (A2).
+/// Overflow of this queue marks THAT wire [`OldWire::TransportError`]
+/// (peer: acp-go-sdk #50). Config Soft.
+pub const STDOUT_NOTIF_QUEUE_BOUND: usize = 256;
+
 /// JSON-RPC "method not found" — answer for agent->client requests that
 /// arrive while the handshake owns the wire.
 const METHOD_NOT_FOUND: i64 = -32601;
+
+/// Encode a Fake NEW-wire stdout stream: `initialize` result + idle ACP v2
+/// `state_update` + `session/resume` result (`resume_rpc_id`). A2
+/// [`AttachRunner::attach_resume_on_new_wire`] waits for the resume result;
+/// idle keeps remint floors LiveIdle-compatible.
+pub fn encode_fake_new_wire_stdout(
+    init_result: &serde_json::Value,
+    resume_rpc_id: u64,
+    agent_session_id: &str,
+) -> Vec<u8> {
+    let state = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": agent_session_id,
+            "update": {
+                "sessionUpdate": "state_update",
+                "sessionState": "idle",
+                "background": []
+            }
+        }
+    });
+    let resume_ok = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": resume_rpc_id,
+        "result": { "sessionId": agent_session_id }
+    });
+    let mut bytes = JsonlRpcTransport::encode_jsonl(init_result).expect("encode init");
+    bytes.extend(JsonlRpcTransport::encode_jsonl(&state).expect("encode state"));
+    bytes.extend(JsonlRpcTransport::encode_jsonl(&resume_ok).expect("encode resume"));
+    bytes
+}
 
 /// Build the transport matching a [`LaunchSpec`] wire.
 ///
@@ -99,6 +137,44 @@ enum ChildIo {
     },
 }
 
+/// ACP v2 `session/update` `state_update.sessionState` values the Host
+/// consults at remint settle (A2). `running` / `requires_action` map to
+/// [`OldWire::LiveInTurn`] (non-idle; no fresh user `session/prompt`);
+/// `idle` (and absent) map to [`OldWire::LiveIdle`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeSessionState {
+    Idle,
+    Running,
+    RequiresAction,
+}
+
+impl ResumeSessionState {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "idle" => Some(Self::Idle),
+            "running" => Some(Self::Running),
+            "requires_action" => Some(Self::RequiresAction),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Running => "running",
+            Self::RequiresAction => "requires_action",
+        }
+    }
+
+    /// Host-wire settle mapping (A2 DESIGN).
+    pub fn to_old_wire(self) -> OldWire {
+        match self {
+            Self::Idle => OldWire::LiveIdle,
+            Self::Running | Self::RequiresAction => OldWire::LiveInTurn,
+        }
+    }
+}
+
 /// Spawn / pump framed agent stdio. Does not remint Binding.
 pub struct AttachRunner {
     io: ChildIo,
@@ -106,6 +182,17 @@ pub struct AttachRunner {
     /// Set only when [`Self::initialize_host`] returns Ok. Agent-bound
     /// writes fail with [`BusError::NotInitialized`] until then.
     initialized: bool,
+    /// A2: runner-owned NDJSON notification queue (session/update, …).
+    notif_queue: VecDeque<serde_json::Value>,
+    /// Bound on [`Self::notif_queue`]. Default [`STDOUT_NOTIF_QUEUE_BOUND`].
+    notif_bound: usize,
+    /// Set when an enqueue would exceed [`Self::notif_bound`].
+    notif_overflow: bool,
+    /// Partial stdout bytes awaiting NDJSON frame boundaries (post-settle drain).
+    stdout_parse: JsonlRpcTransport,
+    /// ACP v2 resume-time `state_update.sessionState` observed while waiting
+    /// for `session/resume` (or set by tests). Consumed by settle.
+    resume_session_state: Option<ResumeSessionState>,
 }
 
 impl AttachRunner {
@@ -144,6 +231,11 @@ impl AttachRunner {
             },
             wire: spec.wire,
             initialized: false,
+            notif_queue: VecDeque::new(),
+            notif_bound: STDOUT_NOTIF_QUEUE_BOUND,
+            notif_overflow: false,
+            stdout_parse: JsonlRpcTransport::without_rpc_chunks(),
+            resume_session_state: None,
         })
     }
 
@@ -171,6 +263,11 @@ impl AttachRunner {
             },
             wire,
             initialized: false,
+            notif_queue: VecDeque::new(),
+            notif_bound: STDOUT_NOTIF_QUEUE_BOUND,
+            notif_overflow: false,
+            stdout_parse: JsonlRpcTransport::without_rpc_chunks(),
+            resume_session_state: None,
         }
     }
 
@@ -182,20 +279,113 @@ impl AttachRunner {
         self.wire
     }
 
+    /// A2: current stdout notification queue depth (test spy / observability).
+    pub fn stdout_notif_len(&self) -> usize {
+        self.notif_queue.len()
+    }
+
+    /// A2: whether the notification queue has overflowed.
+    pub fn stdout_notif_overflowed(&self) -> bool {
+        self.notif_overflow
+    }
+
+    /// A2: test/config seam — shrink or raise the notification queue bound.
+    pub fn set_stdout_notif_bound(&mut self, bound: usize) {
+        self.notif_bound = bound.max(1);
+    }
+
+    /// A2: observe / inject resume-time session state (consumed by settle).
+    pub fn resume_session_state(&self) -> Option<ResumeSessionState> {
+        self.resume_session_state
+    }
+
+    pub fn set_resume_session_state(&mut self, state: Option<ResumeSessionState>) {
+        self.resume_session_state = state;
+    }
+
+    pub fn take_resume_session_state(&mut self) -> Option<ResumeSessionState> {
+        self.resume_session_state.take()
+    }
+
+    /// Enqueue one agent→client notification. On overflow sets the flag and
+    /// returns [`BusError::Transport`] with an "overflow" message so callers
+    /// can mark [`OldWire::TransportError`].
+    pub fn enqueue_stdout_notification(
+        &mut self,
+        frame: serde_json::Value,
+    ) -> Result<(), BusError> {
+        if self.notif_overflow {
+            return Err(BusError::Transport(
+                "stdout notification queue overflow".into(),
+            ));
+        }
+        if self.notif_queue.len() >= self.notif_bound {
+            self.notif_overflow = true;
+            return Err(BusError::Transport(
+                "stdout notification queue overflow".into(),
+            ));
+        }
+        // Capture ACP v2 state_update while enqueueing (resume wait + drain).
+        if let Some(state) = session_state_from_notification(&frame) {
+            self.resume_session_state = Some(state);
+        }
+        self.notif_queue.push_back(frame);
+        Ok(())
+    }
+
+    /// Pump available stdout into the runner-owned parser and enqueue
+    /// notifications. Returns frames enqueued. Overflow → Err.
+    /// WouldBlock / Empty ends the pump (not loss).
+    pub fn drain_stdout_notifications(&mut self) -> Result<usize, BusError> {
+        if self.notif_overflow {
+            return Err(BusError::Transport(
+                "stdout notification queue overflow".into(),
+            ));
+        }
+        let mut enqueued = 0usize;
+        while let StdoutRead::Bytes(chunk) = self.read_stdout()? {
+            self.stdout_parse.push_bytes(&chunk);
+            while let Some(frame) = self.stdout_parse.try_recv_frame()? {
+                let Some(v) = frame.as_json() else {
+                    continue;
+                };
+                // Notifications (method, no result pairing here).
+                if v.get("method").is_some() {
+                    self.enqueue_stdout_notification(v.clone())?;
+                    enqueued += 1;
+                }
+                // Orphan RPC responses post-settle: drop (Soft).
+            }
+        }
+        Ok(enqueued)
+    }
+
     /// Read available stdout bytes into a JSONL transport.
     ///
     /// [`StdoutRead::Eof`] yields `Ok(0)` here (no frames to push). Wake
     /// callers that need the loss proof must use [`Self::probe_stdout`]
     /// or map [`Self::read_stdout`] via [`old_wire_from_stdout`].
     pub fn pump_jsonl(&mut self, t: &mut JsonlRpcTransport) -> Result<usize, BusError> {
-        match self.read_stdout()? {
+        // A2: all Jsonl bytes go through the runner-owned parser so wait_rpc /
+        // drain / HostAttach pump share one line buffer. Completed frames are
+        // forwarded to `t` (and notifications also enqueue).
+        let n = match self.read_stdout()? {
             StdoutRead::Bytes(chunk) => {
                 let n = chunk.len();
-                t.push_bytes(&chunk);
-                Ok(n)
+                self.stdout_parse.push_bytes(&chunk);
+                n
             }
-            StdoutRead::Empty | StdoutRead::Eof => Ok(0),
+            StdoutRead::Empty | StdoutRead::Eof => 0,
+        };
+        while let Some(item) = self.stdout_parse.try_recv_result() {
+            let v = item?;
+            if v.get("method").is_some() && v.get("id").is_none() {
+                // Best-effort enqueue; overflow surfaces on drain/deliver.
+                let _ = self.enqueue_stdout_notification(v.clone());
+            }
+            t.push_decoded(v);
         }
+        Ok(n)
     }
 
     /// Read available stdout bytes into a Content-Length JSON-RPC transport.
@@ -505,6 +695,8 @@ impl AttachRunner {
         let caps = self
             .initialize_host(transport, init_rpc_id)
             .map_err(|e| RemintError::NewWire(format!("initialize_host: {e}")))?;
+        // Resume RPC id is the current next_rpc_id (bumped inside write).
+        let resume_id = RpcId::Num(i64::try_from(*next_rpc_id).unwrap_or(i64::MAX));
         remint::write_new_wire_attach_resume(
             session,
             agent_session_id,
@@ -514,10 +706,21 @@ impl AttachRunner {
             |rpc| self.write_value(&rpc),
             next_rpc_id,
         )?;
+        // A2: wait for resume result + required ACP v2 state_update (and
+        // in-flight tool updates) that precede / accompany it. Notifications
+        // land in the bounded queue via wait_rpc_result; sessionState is
+        // captured on self.resume_session_state. Missing state_update ⇒
+        // idle-compatible settle (None).
+        self.wait_rpc_result(transport, &resume_id)
+            .map_err(|e| RemintError::NewWire(format!("session/resume wait: {e}")))?;
         Ok(caps)
     }
 
     /// Pump until a JSON-RPC response (result or error) with `rpc_id` arrives.
+    ///
+    /// Jsonl bytes always feed [`Self::stdout_parse`] (A2) so initialize /
+    /// resume / post-settle drain share one line buffer — a frame must not
+    /// be split across two transports.
     fn wait_rpc_result(
         &mut self,
         transport: &mut RunnerTransport,
@@ -527,17 +730,30 @@ impl AttachRunner {
         // by READ_STDOUT_TIMEOUT per pump.
         let max_pumps =
             (WAIT_RPC_RESULT_TIMEOUT.as_millis() / READ_STDOUT_TIMEOUT.as_millis()) as usize;
+        let use_runner_parse = matches!(transport, RunnerTransport::Jsonl(_));
         for _ in 0..max_pumps {
-            self.pump(transport)?;
+            if use_runner_parse {
+                // Pump into the runner-owned parser (shared with drain).
+                match self.read_stdout()? {
+                    StdoutRead::Bytes(chunk) => self.stdout_parse.push_bytes(&chunk),
+                    StdoutRead::Empty | StdoutRead::Eof => {}
+                }
+            } else {
+                self.pump(transport)?;
+            }
             loop {
-                let frame = match transport {
-                    RunnerTransport::Jsonl(t) => t.try_recv_frame()?,
-                    RunnerTransport::JsonRpc(t) => t.try_recv_frame()?,
-                    RunnerTransport::Unsupported(w) => {
-                        return Err(BusError::Transport(format!(
-                            "AttachRunner does not pump {} yet",
-                            w.as_str()
-                        )));
+                let frame = if use_runner_parse {
+                    self.stdout_parse.try_recv_frame()?
+                } else {
+                    match transport {
+                        RunnerTransport::JsonRpc(t) => t.try_recv_frame()?,
+                        RunnerTransport::Jsonl(_) => unreachable!(),
+                        RunnerTransport::Unsupported(w) => {
+                            return Err(BusError::Transport(format!(
+                                "AttachRunner does not pump {} yet",
+                                w.as_str()
+                            )));
+                        }
                     }
                 };
                 let Some(frame) = frame else {
@@ -548,7 +764,8 @@ impl AttachRunner {
                 };
                 if v.get("method").is_some() {
                     // Agent->client request mid-wait: answer -32601 so the
-                    // agent is never left hanging. Notifications are skipped.
+                    // agent is never left hanging. Notifications (no id) go
+                    // into the A2 bounded stdout queue (state_update captured).
                     if let Some(id) = v.get("id") {
                         let reply = serde_json::json!({
                             "jsonrpc": "2.0",
@@ -559,6 +776,9 @@ impl AttachRunner {
                             }
                         });
                         self.write_value_ungated(&reply)?;
+                    } else {
+                        // Notification — enqueue (overflow fails the wait).
+                        self.enqueue_stdout_notification(v.clone())?;
                     }
                     continue;
                 }
@@ -750,6 +970,18 @@ pub enum StdoutRead {
     Empty,
     /// `read` returned `Ok(0)` after poll reported readable (or POLLHUP).
     Eof,
+}
+
+/// Pull ACP v2 `state_update.sessionState` from a `session/update` notification.
+fn session_state_from_notification(v: &serde_json::Value) -> Option<ResumeSessionState> {
+    if v.get("method").and_then(|m| m.as_str()) != Some("session/update") {
+        return None;
+    }
+    let update = v.get("params")?.get("update")?;
+    if update.get("sessionUpdate").and_then(|s| s.as_str()) != Some("state_update") {
+        return None;
+    }
+    ResumeSessionState::parse(update.get("sessionState")?.as_str()?)
 }
 
 /// Map a stdout read to an [`OldWire`] hint for [`host_wake`].
@@ -1455,8 +1687,9 @@ pub struct KeptWakeWire<'a> {
 /// Host-wire-remint-settle: settle a Host wire after [`host_wake`] returned
 /// `Reminted` / `ReuseLive` for it.
 ///
-/// - `Reminted` / `ReuseLive` → `*old_wire = LiveIdle`, so the next wake
-///   reuses the live Binding instead of reminting a healthy Agent again.
+/// - `Reminted` / `ReuseLive` → settle from the runner's resume-time ACP v2
+///   `state_update` (`idle`/absent → [`OldWire::LiveIdle`]; `running` /
+///   `requires_action` → [`OldWire::LiveInTurn`]). Consumes the stored state.
 /// - `Reminted` only → swap `old`/`new` runners and their next rpc ids, so
 ///   `old` is the live resumed child and `new` is the reaped one. A later
 ///   genuine loss then kills the live child (one live child per Agent) and
@@ -1472,11 +1705,23 @@ pub fn settle_host_wire_after_wake(
 ) {
     match host {
         HostWake::Reminted(_) => {
-            *old_wire = OldWire::LiveIdle;
+            // Resume ran on `new`; consume its resume-time state_update.
+            // idle / None → LiveIdle; running / requires_action → LiveInTurn.
+            *old_wire = new
+                .take_resume_session_state()
+                .map(ResumeSessionState::to_old_wire)
+                .unwrap_or(OldWire::LiveIdle);
             std::mem::swap(old, new);
             std::mem::swap(old_next_rpc_id, new_next_rpc_id);
         }
-        HostWake::ReuseLive => *old_wire = OldWire::LiveIdle,
+        HostWake::ReuseLive => {
+            // Reuse path: consume any injected/observed state on `old`
+            // (wire unit / rare); default LiveIdle when none.
+            *old_wire = old
+                .take_resume_session_state()
+                .map(ResumeSessionState::to_old_wire)
+                .unwrap_or(OldWire::LiveIdle);
+        }
         HostWake::Waiting(_) => {}
     }
 }
@@ -2899,7 +3144,7 @@ mod tests {
         });
         let mut new_runner = AttachRunner::spawn_fake(
             WireKind::JsonlRpc,
-            JsonlRpcTransport::encode_jsonl(&init_result).unwrap(),
+            encode_fake_new_wire_stdout(&init_result, 2, "S-stable"),
         );
         let mut transport = transport_for_wire(WireKind::JsonlRpc);
         let mut new_next = 2u64;
@@ -2987,7 +3232,7 @@ mod tests {
         });
         let mut new_runner = AttachRunner::spawn_fake(
             WireKind::JsonlRpc,
-            JsonlRpcTransport::encode_jsonl(&init_result).unwrap(),
+            encode_fake_new_wire_stdout(&init_result, 2, "S-stable"),
         );
         let mut transport = transport_for_wire(WireKind::JsonlRpc);
         let mut new_next = 2u64;
@@ -3061,7 +3306,7 @@ mod tests {
         });
         let mut new_runner = AttachRunner::spawn_fake(
             WireKind::JsonlRpc,
-            JsonlRpcTransport::encode_jsonl(&init_result).unwrap(),
+            encode_fake_new_wire_stdout(&init_result, 2, "S-stable"),
         );
         let mut transport = transport_for_wire(WireKind::JsonlRpc);
         let mut new_next = 5u64;
@@ -3189,7 +3434,7 @@ mod tests {
         });
         let mut new_runner = AttachRunner::spawn_fake(
             WireKind::JsonlRpc,
-            JsonlRpcTransport::encode_jsonl(&init_result).unwrap(),
+            encode_fake_new_wire_stdout(&init_result, 2, "S-stable"),
         );
         let mut transport = transport_for_wire(WireKind::JsonlRpc);
         let mut old_next = 10u64;
@@ -3279,7 +3524,7 @@ mod tests {
         });
         let mut new_runner = AttachRunner::spawn_fake(
             WireKind::JsonlRpc,
-            JsonlRpcTransport::encode_jsonl(&init_result).unwrap(),
+            encode_fake_new_wire_stdout(&init_result, 2, "S-stable"),
         );
         let mut transport = transport_for_wire(WireKind::JsonlRpc);
         let mut old_next = 1u64;
@@ -3343,7 +3588,7 @@ mod tests {
         });
         let mut new_runner = AttachRunner::spawn_fake(
             WireKind::JsonlRpc,
-            JsonlRpcTransport::encode_jsonl(&init_result).unwrap(),
+            encode_fake_new_wire_stdout(&init_result, 2, "S-stable"),
         );
         let mut transport = transport_for_wire(WireKind::JsonlRpc);
         let mut old_next = 1u64;
@@ -3401,7 +3646,7 @@ mod tests {
         });
         let mut new_runner = AttachRunner::spawn_fake(
             WireKind::JsonlRpc,
-            JsonlRpcTransport::encode_jsonl(&init_result).unwrap(),
+            encode_fake_new_wire_stdout(&init_result, 2, "S-stable"),
         );
         let mut transport = transport_for_wire(WireKind::JsonlRpc);
         let mut old_next = 10u64;
@@ -3584,7 +3829,7 @@ mod tests {
         });
         AttachRunner::spawn_fake(
             WireKind::JsonlRpc,
-            JsonlRpcTransport::encode_jsonl(&init).unwrap(),
+            encode_fake_new_wire_stdout(&init, 2, "S-stable"),
         )
     }
 
@@ -4728,7 +4973,7 @@ mod tests {
         });
         AttachRunner::spawn_fake_with_stdin_failures(
             WireKind::JsonlRpc,
-            JsonlRpcTransport::encode_jsonl(&init).expect("encode"),
+            encode_fake_new_wire_stdout(&init, 2, "S-stable"),
             fail_stdin_writes,
         )
     }
@@ -8022,5 +8267,78 @@ mod tests {
         let _ = std::fs::remove_file(&out);
         assert_eq!(got.len(), big.len(), "every byte reached the reader");
         assert!(got == big, "bytes exact");
+    }
+
+    // ---- A2 bounded-stdout-reader + resume state_update (floors-only RED) ----
+
+    /// M6 settle: tip `settle_host_wire_after_wake` hardcodes LiveIdle on
+    /// Reminted/ReuseLive — never consults a post-resume ACP v2 state_update.
+    #[test]
+    fn settle_uses_resume_state_update_unit() {
+        let mut old = AttachRunner::spawn_fake(WireKind::JsonlRpc, Vec::new());
+        let mut new = AttachRunner::spawn_fake(WireKind::JsonlRpc, Vec::new());
+        let mut old_rpc = 10u64;
+        let mut new_rpc = 2u64;
+        let mut evidence = OldWire::StdoutEof;
+        old.set_resume_session_state(Some(ResumeSessionState::Running));
+        settle_host_wire_after_wake(
+            &HostWake::ReuseLive,
+            &mut evidence,
+            &mut old,
+            &mut new,
+            &mut old_rpc,
+            &mut new_rpc,
+        );
+        assert!(
+            !matches!(evidence, OldWire::LiveIdle),
+            "A2: settle must not hardcode LiveIdle when resume state_update is running; got {evidence:?}"
+        );
+        assert_eq!(evidence, OldWire::LiveInTurn);
+        assert!(old.resume_session_state().is_none(), "state consumed");
+    }
+
+    /// M6: queue bound N + N+1 notifications ⇒ overflow TransportError.
+    #[test]
+    fn stdout_queue_overflow_unit() {
+        let mut runner = AttachRunner::spawn_fake(WireKind::JsonlRpc, Vec::new());
+        runner.set_stdout_notif_bound(3);
+        for i in 0..3 {
+            let frame = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": "s",
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": { "type": "text", "text": format!("n{i}") }
+                    }
+                }
+            });
+            runner.enqueue_stdout_notification(frame).unwrap();
+        }
+        assert_eq!(runner.stdout_notif_len(), 3);
+        let overflow = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "s",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": "overflow" }
+                }
+            }
+        });
+        let err = runner.enqueue_stdout_notification(overflow).unwrap_err();
+        assert!(
+            err.to_string().contains("overflow"),
+            "overflow err text, got {err}"
+        );
+        assert!(runner.stdout_notif_overflowed());
+        // Mapping used by Service: overflow ⇒ TransportError evidence.
+        let evidence = OldWire::TransportError(err.to_string());
+        assert!(
+            matches!(evidence, OldWire::TransportError(ref s) if s.contains("overflow")),
+            "{evidence:?}"
+        );
     }
 }

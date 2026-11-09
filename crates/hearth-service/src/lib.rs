@@ -7268,7 +7268,7 @@ mod tests {
         });
         hearth_agent_wire::AttachRunner::spawn_fake_with_stdin_failures(
             hearth_agent_wire::WireKind::JsonlRpc,
-            hearth_agent_wire::JsonlRpcTransport::encode_jsonl(&init).unwrap(),
+            hearth_agent_wire::encode_fake_new_wire_stdout(&init, 2, "native"),
             fail,
         )
     }
@@ -9343,6 +9343,286 @@ mod tests {
             host_old_wire(&st, sid, a),
             hearth_agent_wire::OldWire::LiveIdle,
             "no false timeout"
+        );
+    }
+
+    // ---- A2 bounded-stdout-reader + resume state_update (floors-only RED) ----
+
+    /// Real CLI that answers `initialize` then floods stdout with many
+    /// `session/update` frames (>> 64 KiB pipe) without reading stdin again.
+    fn a2_flood_after_init(secs: u32) -> hearth_agent_wire::AttachRunner {
+        use hearth_agent_wire::{transport_for_wire, AttachRunner, LaunchSpec, RpcId, WireKind};
+        let chunk = "x".repeat(360);
+        let frame = format!(
+            r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"s","update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"{chunk}"}}}}}}}}"#
+        );
+        let mut script = String::from(
+            r#"IFS= read -r l; printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1}}'; "#,
+        );
+        script.push_str("i=0; while [ \"$i\" -lt 220 ]; do printf '%s\\n' '");
+        script.push_str(&frame);
+        script.push_str("'; i=$((i+1)); done; exec sleep ");
+        script.push_str(&secs.to_string());
+        let mut r = AttachRunner::spawn(LaunchSpec {
+            program: "sh".into(),
+            args: vec!["-c".into(), script],
+            cwd: None,
+            env: Vec::new(),
+            wire: WireKind::JsonlRpc,
+        })
+        .expect("spawn flood CLI");
+        r.initialize_host(&mut transport_for_wire(WireKind::JsonlRpc), &RpcId::Num(0))
+            .expect("initialize flood CLI");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        r
+    }
+
+    /// M1: Real CLI floods unread-scale session/update after init; with the
+    /// reader a small follow-up steer returns 200 without TransportError
+    /// while under queue capacity; drained frames observed (spy > 0 in GREEN).
+    /// Tip: flood → stdin timeout TransportError (RED).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn http_stdout_reader_drains_under_bound_no_false_lost() {
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let (a, b, _) = install_two_parallel_safe_host_wires(&st, sid, None);
+        dpbw_swap_old(&st, sid, a, a2_flood_after_init(12));
+        // Small steer: fits the stdin pipe buffer even if the CLI never reads
+        // again (flood child ends in `sleep`). Tip without a reader still
+        // accepts the small write but learns nothing (spy depth 0 / no queue).
+        // With the reader, drain under capacity leaves evidence live and
+        // queue depth > 0. (Large-write false-lost is covered by M2 overflow
+        // and #92 deaf floors.)
+        let (r, elapsed) = dpbw_steer(&st, sid, "a2-m1-small".into()).await;
+        let (code, body) =
+            r.unwrap_or_else(|| panic!("steer wedged > {DPBW_BOUND:?} behind flooded stdout"));
+        assert_eq!(code, StatusCode::OK, "body len={}", body.len());
+        let ev = host_old_wire(&st, sid, a);
+        eprintln!(
+            "A2-M1: elapsed={elapsed:?} A_evidence={ev:?} B_prompts={:?}",
+            sdp_prompt_count(&st, sid, b)
+        );
+        assert!(
+            !matches!(ev, hearth_agent_wire::OldWire::TransportError(_)),
+            "A2 M1: reader must drain under bound — no false TransportError; tip got {ev:?}"
+        );
+        assert!(
+            matches!(
+                ev,
+                hearth_agent_wire::OldWire::LiveIdle | hearth_agent_wire::OldWire::LiveInTurn
+            ),
+            "A2 M1: wire stays live under bound; got {ev:?}"
+        );
+        let depth = {
+            let sw = session_wires_arc(&st, sid);
+            let mut wires = sw.lock().unwrap();
+            wires.get_mut(a).unwrap().old.stdout_notif_len()
+        };
+        assert!(
+            depth > 0,
+            "A2 M1: reader must observe drained frames; depth={depth}"
+        );
+    }
+
+    /// M2: Queue overflow ⇒ THAT Agent's old_wire = TransportError (overflow);
+    /// peers continue; Session lock free; 200. Tip: no queue — flood forces
+    /// stdin-timeout TransportError instead; assert overflow-specific mark.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn http_stdout_queue_overflow_marks_wire_lost_peers_ok() {
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let (a, b, _) = install_two_parallel_safe_host_wires(&st, sid, None);
+        let mut flooded = a2_flood_after_init(12);
+        // Tiny bound so the ~220-frame flood overflows the notification queue
+        // during deliver-time drain (marks TransportError; peers continue).
+        flooded.set_stdout_notif_bound(16);
+        dpbw_swap_old(&st, sid, a, flooded);
+        let (r, _) = dpbw_steer(&st, sid, "a2-m2".into()).await;
+        let (code, body) = r.unwrap_or_else(|| panic!("steer wedged > {DPBW_BOUND:?}"));
+        assert_eq!(code, StatusCode::OK, "body len={}", body.len());
+        assert!(dpbw_lock_free(&st, sid), "Session wire lock free");
+        let ev = host_old_wire(&st, sid, a);
+        eprintln!(
+            "A2-M2: A_evidence={ev:?} B_prompts={:?}",
+            sdp_prompt_count(&st, sid, b)
+        );
+        match &ev {
+            hearth_agent_wire::OldWire::TransportError(msg) => {
+                assert!(
+                    msg.contains("overflow") || msg.contains("notification queue"),
+                    "A2 M2: overflow must mark TransportError with overflow/queue text; tip got {msg:?}"
+                );
+            }
+            other => panic!("A2 M2: overflow ⇒ TransportError on A; got {other:?}"),
+        }
+        // Peer B still prompted (same as #92 peers-continue).
+        assert_eq!(sdp_prompt_count(&st, sid, b).0, 1, "peer B still prompted");
+    }
+
+    /// Build Fake `new` stdout: init + state_update{sessionState} + optional
+    /// tool_call_update + resume result (id 2).
+    fn a2_fake_new_with_state(
+        session_state: &str,
+        with_tool: bool,
+    ) -> hearth_agent_wire::AttachRunner {
+        use hearth_agent_wire::{AttachRunner, JsonlRpcTransport, WireKind};
+        let init = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": { "protocolVersion": 1,
+                "agentCapabilities": { "session": { "resume": true, "cancel": true, "close": true } } }
+        });
+        let state = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "native-a",
+                "update": {
+                    "sessionUpdate": "state_update",
+                    "sessionState": session_state,
+                    "background": []
+                }
+            }
+        });
+        let resume_ok = serde_json::json!({
+            "jsonrpc": "2.0", "id": 2,
+            "result": { "sessionId": "native-a" }
+        });
+        let mut bytes = JsonlRpcTransport::encode_jsonl(&init).unwrap();
+        bytes.extend(JsonlRpcTransport::encode_jsonl(&state).unwrap());
+        if with_tool {
+            let tool = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": "native-a",
+                    "update": {
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": "tc-inflight",
+                        "status": "in_progress",
+                        "title": "read"
+                    }
+                }
+            });
+            bytes.extend(JsonlRpcTransport::encode_jsonl(&tool).unwrap());
+        }
+        bytes.extend(JsonlRpcTransport::encode_jsonl(&resume_ok).unwrap());
+        AttachRunner::spawn_fake(WireKind::JsonlRpc, bytes)
+    }
+
+    /// M3: Remint with state_update{running} (+ in-flight tool) → not idle;
+    /// zero fresh user session/prompt. Tip: LiveIdle + 1 prompt (RED).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn http_remint_running_state_update_no_idle_prompt() {
+        use hearth_agent_wire::OldWire;
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let (a, _b, _) = install_two_parallel_safe_host_wires(&st, sid, None);
+        {
+            let sw = session_wires_arc(&st, sid);
+            let mut wires = sw.lock().unwrap();
+            let w = wires.get_mut(a).unwrap();
+            w.new = a2_fake_new_with_state("running", true);
+            w.new_next_rpc_id = 2;
+            w.old_wire = OldWire::StdoutEof;
+        }
+        let m0 = count_mints(&st, sid);
+        let (code, body) = sdp_steer(&st, sid, "cheng", "a2-m3").await;
+        assert_eq!(code, StatusCode::OK, "body={body}");
+        assert!(count_mints(&st, sid) > m0, "A reminted");
+        let ev = host_old_wire(&st, sid, a);
+        let (old_a, _, _, _) = sdp_wire(&st, sid, a);
+        let prompts = sdp_prompts(&old_a);
+        eprintln!(
+            "A2-M3: evidence={ev:?} methods={:?} prompts={}",
+            sdp_methods(&old_a),
+            prompts.len()
+        );
+        assert!(
+            !matches!(ev, OldWire::LiveIdle),
+            "A2 M3: remint settle must use resume state_update (running), not hardcode LiveIdle; got {ev:?}"
+        );
+        assert!(
+            prompts.is_empty(),
+            "A2 M3: do not deliver a fresh session/prompt when state_update=running; got {} prompts",
+            prompts.len()
+        );
+    }
+
+    /// M4: Remint with state_update{idle} → idle-compatible settle; a
+    /// subsequent/this steer may deliver one prompt (contrast to M3).
+    /// Tip already LiveIdle+prompt → contrast green on tip.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn http_remint_idle_state_update_allows_prompt() {
+        use hearth_agent_wire::OldWire;
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let (a, _b, _) = install_two_parallel_safe_host_wires(&st, sid, None);
+        {
+            let sw = session_wires_arc(&st, sid);
+            let mut wires = sw.lock().unwrap();
+            let w = wires.get_mut(a).unwrap();
+            w.new = a2_fake_new_with_state("idle", false);
+            w.new_next_rpc_id = 2;
+            w.old_wire = OldWire::StdoutEof;
+        }
+        let m0 = count_mints(&st, sid);
+        let (code, body) = sdp_steer(&st, sid, "cheng", "a2-m4").await;
+        assert_eq!(code, StatusCode::OK, "body={body}");
+        assert!(count_mints(&st, sid) > m0, "A reminted");
+        let ev = host_old_wire(&st, sid, a);
+        let (old_a, _, _, _) = sdp_wire(&st, sid, a);
+        let prompts = sdp_prompts(&old_a);
+        eprintln!(
+            "A2-M4: evidence={ev:?} methods={:?} prompts={}",
+            sdp_methods(&old_a),
+            prompts.len()
+        );
+        assert_eq!(ev, OldWire::LiveIdle, "A2 M4: idle state_update ⇒ LiveIdle");
+        assert_eq!(prompts.len(), 1, "A2 M4: idle ⇒ one prompt allowed");
+        assert_eq!(sdp_prompt_text(&prompts[0]), "a2-m4");
+    }
+
+    /// M5: Remint with state_update{requires_action} → non-idle; no fresh
+    /// user prompt. Tip: LiveIdle + 1 prompt (RED).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn http_remint_requires_action_state_update_no_idle_prompt() {
+        use hearth_agent_wire::OldWire;
+        let st = AppState::new(vec![]);
+        let session = st.store().create_session();
+        let sid = session.id();
+        let (a, _b, _) = install_two_parallel_safe_host_wires(&st, sid, None);
+        {
+            let sw = session_wires_arc(&st, sid);
+            let mut wires = sw.lock().unwrap();
+            let w = wires.get_mut(a).unwrap();
+            w.new = a2_fake_new_with_state("requires_action", true);
+            w.new_next_rpc_id = 2;
+            w.old_wire = OldWire::StdoutEof;
+        }
+        let m0 = count_mints(&st, sid);
+        let (code, body) = sdp_steer(&st, sid, "cheng", "a2-m5").await;
+        assert_eq!(code, StatusCode::OK, "body={body}");
+        assert!(count_mints(&st, sid) > m0, "A reminted");
+        let ev = host_old_wire(&st, sid, a);
+        let (old_a, _, _, _) = sdp_wire(&st, sid, a);
+        let prompts = sdp_prompts(&old_a);
+        eprintln!(
+            "A2-M5: evidence={ev:?} methods={:?} prompts={}",
+            sdp_methods(&old_a),
+            prompts.len()
+        );
+        assert!(
+            !matches!(ev, OldWire::LiveIdle),
+            "A2 M5: requires_action must not settle LiveIdle; got {ev:?}"
+        );
+        assert!(
+            prompts.is_empty(),
+            "A2 M5: no fresh user prompt under requires_action; got {} prompts",
+            prompts.len()
         );
     }
 }

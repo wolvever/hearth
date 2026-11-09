@@ -138,6 +138,18 @@ impl JsonlRpcTransport {
         self.inbound.pop_front()
     }
 
+    /// Move pending inbound frames + partial line buffer from `other` into
+    /// `self` (A2: after wait_rpc on the runner-owned parser, hand leftovers
+    /// back to the caller's transport so post-handshake pumps still see them).
+    pub fn absorb_from(&mut self, other: &mut Self) {
+        while let Some(item) = other.inbound.pop_front() {
+            self.inbound.push_back(item);
+        }
+        if !other.line_buf.is_empty() {
+            self.line_buf.append(&mut other.line_buf);
+        }
+    }
+
     fn consume_line(&mut self, line: &str) {
         let parsed: Result<Value, _> = serde_json::from_str(line);
         let Ok(v) = parsed else {
