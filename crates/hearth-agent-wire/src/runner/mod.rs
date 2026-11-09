@@ -8023,4 +8023,34 @@ mod tests {
         assert_eq!(got.len(), big.len(), "every byte reached the reader");
         assert!(got == big, "bytes exact");
     }
+
+    // ---- A2 bounded-stdout-reader + resume state_update (floors-only RED) ----
+
+    /// M6 settle: tip `settle_host_wire_after_wake` hardcodes LiveIdle on
+    /// Reminted/ReuseLive — never consults a post-resume ACP v2 state_update.
+    #[test]
+    fn settle_uses_resume_state_update_unit() {
+        let mut old = AttachRunner::spawn_fake(WireKind::JsonlRpc, Vec::new());
+        let mut new = AttachRunner::spawn_fake(WireKind::JsonlRpc, Vec::new());
+        let mut old_rpc = 10u64;
+        let mut new_rpc = 2u64;
+        let mut evidence = OldWire::StdoutEof;
+        // Simulate the resume-time snapshot a fixed AttachRunner would hold
+        // after waiting for session/resume (GREEN sets this on the runner).
+        let post_resume_session_state = "running";
+        settle_host_wire_after_wake(
+            &HostWake::ReuseLive,
+            &mut evidence,
+            &mut old,
+            &mut new,
+            &mut old_rpc,
+            &mut new_rpc,
+        );
+        assert_eq!(post_resume_session_state, "running");
+        assert!(
+            !matches!(evidence, OldWire::LiveIdle),
+            "A2: settle must not hardcode LiveIdle when resume state_update is running; tip got {evidence:?}"
+        );
+    }
+
 }
