@@ -7268,7 +7268,7 @@ mod tests {
         });
         hearth_agent_wire::AttachRunner::spawn_fake_with_stdin_failures(
             hearth_agent_wire::WireKind::JsonlRpc,
-            hearth_agent_wire::JsonlRpcTransport::encode_jsonl(&init).unwrap(),
+            hearth_agent_wire::encode_fake_new_wire_stdout(&init, 2, "native"),
             fail,
         )
     }
@@ -9388,23 +9388,40 @@ mod tests {
         let sid = session.id();
         let (a, b, _) = install_two_parallel_safe_host_wires(&st, sid, None);
         dpbw_swap_old(&st, sid, a, a2_flood_after_init(12));
-        // Large steer: tip fills unread stdout → stdin timeout TransportError.
-        // With the reader (GREEN), the pipe is drained under capacity first so
-        // the write succeeds and evidence stays live; queue spy > 0 (GREEN).
-        let big = "x".repeat(256 * 1024);
-        let (r, elapsed) = dpbw_steer(&st, sid, big).await;
+        // Small steer: fits the stdin pipe buffer even if the CLI never reads
+        // again (flood child ends in `sleep`). Tip without a reader still
+        // accepts the small write but learns nothing (spy depth 0 / no queue).
+        // With the reader, drain under capacity leaves evidence live and
+        // queue depth > 0. (Large-write false-lost is covered by M2 overflow
+        // and #92 deaf floors.)
+        let (r, elapsed) = dpbw_steer(&st, sid, "a2-m1-small".into()).await;
         let (code, body) =
             r.unwrap_or_else(|| panic!("steer wedged > {DPBW_BOUND:?} behind flooded stdout"));
         assert_eq!(code, StatusCode::OK, "body len={}", body.len());
         let ev = host_old_wire(&st, sid, a);
-        eprintln!("A2-M1: elapsed={elapsed:?} A_evidence={ev:?} B_prompts={:?}", sdp_prompt_count(&st, sid, b));
+        eprintln!(
+            "A2-M1: elapsed={elapsed:?} A_evidence={ev:?} B_prompts={:?}",
+            sdp_prompt_count(&st, sid, b)
+        );
         assert!(
             !matches!(ev, hearth_agent_wire::OldWire::TransportError(_)),
             "A2 M1: reader must drain under bound — no false TransportError; tip got {ev:?}"
         );
         assert!(
-            matches!(ev, hearth_agent_wire::OldWire::LiveIdle | hearth_agent_wire::OldWire::LiveInTurn),
+            matches!(
+                ev,
+                hearth_agent_wire::OldWire::LiveIdle | hearth_agent_wire::OldWire::LiveInTurn
+            ),
             "A2 M1: wire stays live under bound; got {ev:?}"
+        );
+        let depth = {
+            let sw = session_wires_arc(&st, sid);
+            let mut wires = sw.lock().unwrap();
+            wires.get_mut(a).unwrap().old.stdout_notif_len()
+        };
+        assert!(
+            depth > 0,
+            "A2 M1: reader must observe drained frames; depth={depth}"
         );
     }
 
@@ -9417,17 +9434,20 @@ mod tests {
         let session = st.store().create_session();
         let sid = session.id();
         let (a, b, _) = install_two_parallel_safe_host_wires(&st, sid, None);
-        // GREEN sets a tiny queue bound on A before the flood; RED on tip
-        // has no bound setter — flood still fills the pipe → stdin timeout
-        // (message lacks "overflow") so the overflow-specific assert is RED.
-        dpbw_swap_old(&st, sid, a, a2_flood_after_init(12));
+        let mut flooded = a2_flood_after_init(12);
+        // Tiny bound so the ~220-frame flood overflows the notification queue
+        // during deliver-time drain (marks TransportError; peers continue).
+        flooded.set_stdout_notif_bound(16);
+        dpbw_swap_old(&st, sid, a, flooded);
         let (r, _) = dpbw_steer(&st, sid, "a2-m2".into()).await;
-        let (code, body) =
-            r.unwrap_or_else(|| panic!("steer wedged > {DPBW_BOUND:?}"));
+        let (code, body) = r.unwrap_or_else(|| panic!("steer wedged > {DPBW_BOUND:?}"));
         assert_eq!(code, StatusCode::OK, "body len={}", body.len());
         assert!(dpbw_lock_free(&st, sid), "Session wire lock free");
         let ev = host_old_wire(&st, sid, a);
-        eprintln!("A2-M2: A_evidence={ev:?} B_prompts={:?}", sdp_prompt_count(&st, sid, b));
+        eprintln!(
+            "A2-M2: A_evidence={ev:?} B_prompts={:?}",
+            sdp_prompt_count(&st, sid, b)
+        );
         match &ev {
             hearth_agent_wire::OldWire::TransportError(msg) => {
                 assert!(
@@ -9443,7 +9463,10 @@ mod tests {
 
     /// Build Fake `new` stdout: init + state_update{sessionState} + optional
     /// tool_call_update + resume result (id 2).
-    fn a2_fake_new_with_state(session_state: &str, with_tool: bool) -> hearth_agent_wire::AttachRunner {
+    fn a2_fake_new_with_state(
+        session_state: &str,
+        with_tool: bool,
+    ) -> hearth_agent_wire::AttachRunner {
         use hearth_agent_wire::{AttachRunner, JsonlRpcTransport, WireKind};
         let init = serde_json::json!({
             "jsonrpc": "2.0", "id": 1,
@@ -9508,11 +9531,15 @@ mod tests {
         let m0 = count_mints(&st, sid);
         let (code, body) = sdp_steer(&st, sid, "cheng", "a2-m3").await;
         assert_eq!(code, StatusCode::OK, "body={body}");
-        assert!(count_mints(&st, sid) >= m0 + 1, "A reminted");
+        assert!(count_mints(&st, sid) > m0, "A reminted");
         let ev = host_old_wire(&st, sid, a);
         let (old_a, _, _, _) = sdp_wire(&st, sid, a);
         let prompts = sdp_prompts(&old_a);
-        eprintln!("A2-M3: evidence={ev:?} methods={:?} prompts={}", sdp_methods(&old_a), prompts.len());
+        eprintln!(
+            "A2-M3: evidence={ev:?} methods={:?} prompts={}",
+            sdp_methods(&old_a),
+            prompts.len()
+        );
         assert!(
             !matches!(ev, OldWire::LiveIdle),
             "A2 M3: remint settle must use resume state_update (running), not hardcode LiveIdle; got {ev:?}"
@@ -9545,11 +9572,15 @@ mod tests {
         let m0 = count_mints(&st, sid);
         let (code, body) = sdp_steer(&st, sid, "cheng", "a2-m4").await;
         assert_eq!(code, StatusCode::OK, "body={body}");
-        assert!(count_mints(&st, sid) >= m0 + 1, "A reminted");
+        assert!(count_mints(&st, sid) > m0, "A reminted");
         let ev = host_old_wire(&st, sid, a);
         let (old_a, _, _, _) = sdp_wire(&st, sid, a);
         let prompts = sdp_prompts(&old_a);
-        eprintln!("A2-M4: evidence={ev:?} methods={:?} prompts={}", sdp_methods(&old_a), prompts.len());
+        eprintln!(
+            "A2-M4: evidence={ev:?} methods={:?} prompts={}",
+            sdp_methods(&old_a),
+            prompts.len()
+        );
         assert_eq!(ev, OldWire::LiveIdle, "A2 M4: idle state_update ⇒ LiveIdle");
         assert_eq!(prompts.len(), 1, "A2 M4: idle ⇒ one prompt allowed");
         assert_eq!(sdp_prompt_text(&prompts[0]), "a2-m4");
@@ -9575,11 +9606,15 @@ mod tests {
         let m0 = count_mints(&st, sid);
         let (code, body) = sdp_steer(&st, sid, "cheng", "a2-m5").await;
         assert_eq!(code, StatusCode::OK, "body={body}");
-        assert!(count_mints(&st, sid) >= m0 + 1, "A reminted");
+        assert!(count_mints(&st, sid) > m0, "A reminted");
         let ev = host_old_wire(&st, sid, a);
         let (old_a, _, _, _) = sdp_wire(&st, sid, a);
         let prompts = sdp_prompts(&old_a);
-        eprintln!("A2-M5: evidence={ev:?} methods={:?} prompts={}", sdp_methods(&old_a), prompts.len());
+        eprintln!(
+            "A2-M5: evidence={ev:?} methods={:?} prompts={}",
+            sdp_methods(&old_a),
+            prompts.len()
+        );
         assert!(
             !matches!(ev, OldWire::LiveIdle),
             "A2 M5: requires_action must not settle LiveIdle; got {ev:?}"

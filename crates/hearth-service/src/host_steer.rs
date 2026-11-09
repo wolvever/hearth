@@ -145,6 +145,13 @@ impl AgentHostWire {
         &mut self,
         text: &str,
     ) -> Result<u64, hearth_agent_wire::BusError> {
+        // A2: drain stdout into the bounded queue before writing so a
+        // streaming CLI cannot fill the pipe and false-timeout the stdin
+        // write. Overflow ⇒ mark THIS wire lost (peers continue).
+        if let Err(e) = self.old.drain_stdout_notifications() {
+            self.old_wire = OldWire::TransportError(e.to_string());
+            return Err(e);
+        }
         let r = self.deliver_prompt(text);
         if let Err(e) = &r {
             if !matches!(e, hearth_agent_wire::BusError::NotInitialized) {
@@ -152,6 +159,13 @@ impl AgentHostWire {
             }
         }
         r
+    }
+
+    /// A2: drain old stdout before wake I/O; overflow marks TransportError.
+    pub fn drain_stdout_or_mark_lost(&mut self) {
+        if let Err(e) = self.old.drain_stdout_notifications() {
+            self.old_wire = OldWire::TransportError(e.to_string());
+        }
     }
 }
 
@@ -237,8 +251,12 @@ impl SessionWires {
             // NotApplied / Err send nothing. No drain. A send error marks
             // this wire lost (deliver-prompt-bounded-write); the response
             // stays Applied (the Trigger TurnStart is already on the log).
-            let _ =
-                wire.deliver_prompt_or_mark_lost(&tool_result_prompt_text(tool_call_id, output));
+            // A2: skip fresh prompt when settle left LiveInTurn (running /
+            // requires_action). Idle / LiveIdle still deliver.
+            if !matches!(wire.old_wire, OldWire::LiveInTurn) {
+                let _ = wire
+                    .deliver_prompt_or_mark_lost(&tool_result_prompt_text(tool_call_id, output));
+            }
         }
         self.agents.insert(agent, wire);
         result
@@ -323,6 +341,11 @@ impl SessionWires {
         if let (Ok(WakeEachKeptThroughHost::Woke { woke, .. }), Some(text)) = (&result, &prompt) {
             for (agent, _) in woke {
                 if let Some(w) = self.agents.get_mut(agent) {
+                    // A2: running / requires_action settle → LiveInTurn;
+                    // do NOT deliver a fresh user session/prompt as if idle.
+                    if matches!(w.old_wire, OldWire::LiveInTurn) {
+                        continue;
+                    }
                     let _ = w.deliver_prompt_or_mark_lost(text);
                 }
             }
@@ -637,7 +660,8 @@ fn initialized_fake(rest: Vec<u8>) -> AttachRunner {
     runner
 }
 
-/// New wire Fake that answers initialize with resume caps.
+/// New wire Fake that answers initialize with resume caps, then an idle
+/// ACP v2 state_update + session/resume result (id 2).
 fn new_wire_fake() -> AttachRunner {
     let init = serde_json::json!({
         "jsonrpc": "2.0", "id": 1,
@@ -646,6 +670,6 @@ fn new_wire_fake() -> AttachRunner {
     });
     AttachRunner::spawn_fake(
         WireKind::JsonlRpc,
-        hearth_agent_wire::JsonlRpcTransport::encode_jsonl(&init).expect("encode"),
+        hearth_agent_wire::encode_fake_new_wire_stdout(&init, 2, "native"),
     )
 }
