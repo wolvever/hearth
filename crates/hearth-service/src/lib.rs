@@ -9630,7 +9630,9 @@ mod tests {
 
     /// Fake old: answered initialize; unread state_update{running} still on stdout.
     fn reuse_live_leftover_old_with_unread_running() -> hearth_agent_wire::AttachRunner {
-        use hearth_agent_wire::{transport_for_wire, AttachRunner, JsonlRpcTransport, RpcId, WireKind};
+        use hearth_agent_wire::{
+            transport_for_wire, AttachRunner, JsonlRpcTransport, RpcId, WireKind,
+        };
         let init = serde_json::json!({
             "jsonrpc": "2.0", "id": 0, "result": { "protocolVersion": 1 }
         });
@@ -9670,7 +9672,10 @@ mod tests {
         let (c1, b1) = sdp_steer(&st, sid, "cheng", "probe-p1").await;
         assert_eq!(c1, StatusCode::OK, "steer1 body={b1}");
         let (pa1, _) = sdp_prompt_count(&st, sid, a);
-        assert_eq!(pa1, 1, "first steer delivers prompt (drain happens after settle)");
+        assert_eq!(
+            pa1, 1,
+            "first steer delivers prompt (drain happens after settle)"
+        );
         // Drain during deliver must have captured running into resume_session_state.
         {
             let sw = session_wires_arc(&st, sid);
